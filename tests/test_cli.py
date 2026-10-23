@@ -18,6 +18,15 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     """Independent reports reach publication through files, without prices in feedback."""
     # Bind the CLI to a synthetic repository and isolated artifact directory.
     server = Server()
+    server.linked_issues = [
+        {
+            "url": "https://github.com/owner/repo/issues/2",
+            "title": "Keep history",
+            "body": "Retain prior edits.",
+            "state": "OPEN",
+        }
+    ]
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
     monkeypatch.setattr(cli, "GitHub", lambda token: server.gh)
     for key, value in {
         "GH_TOKEN": "test",
@@ -54,6 +63,7 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     # Verify identical reviewer input, the published verdict and log-only accounting.
     assert payloads["claude"] == payloads["openai"]
     assert payloads["claude"]["head"] == "a" * 40
+    assert payloads["claude"]["issues"][0]["description"] == "Retain prior edits."
     assert [r["summary"] for r in payloads["consolidate"]["reviews"]] == [
         "claude completed",
         "openai completed",

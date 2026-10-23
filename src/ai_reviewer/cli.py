@@ -6,8 +6,9 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from ai_reviewer.context import prepare
 from ai_reviewer.contracts import Consolidation, Review, ReviewContext, reconcile, source_findings
-from ai_reviewer.github import GitHub, prepare, publish, validate_anchors
+from ai_reviewer.github import GitHub, publish, validate_anchors
 from ai_reviewer.models import call_model, print_costs
 
 
@@ -50,6 +51,7 @@ def main() -> None:
                 os.environ["GITHUB_REPOSITORY"],
                 int(os.environ["PR_NUMBER"]),
                 identity,
+                linear_token=os.environ.get("LINEAR_API_KEY"),
             )
             # Persist the collected packet for both independent reviewers.
             context_path.write_text(context.model_dump_json())

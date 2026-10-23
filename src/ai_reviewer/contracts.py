@@ -117,6 +117,24 @@ class PriorComment(Contract):
     author: str | None
 
 
+class IssueContext(Contract):
+    """Carry untrusted issue requirements and their source, without provider metadata.
+
+    Attributes:
+        provider: Service that supplied the issue.
+        url: Canonical issue URL for attribution and deduplication.
+        title: Issue title.
+        description: Full issue body, or None when absent.
+        state: Provider's issue state label.
+    """
+
+    provider: Literal["github", "linear"]
+    url: str = Field(min_length=1)
+    title: str
+    description: str | None
+    state: str
+
+
 class ReviewContext(Contract):
     """Bind minimal review evidence to an immutable PR revision pair.
 
@@ -131,6 +149,7 @@ class ReviewContext(Contract):
         description: PR body, or None when absent.
         files: Complete bounded list of changed-file evidence.
         previous_comments: Minimal prior inline discussion records.
+        issues: Linked or explicitly referenced issue requirements from both providers.
     """
 
     repo: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -143,6 +162,7 @@ class ReviewContext(Contract):
     description: str | None
     files: list[ChangedFile] = Field(max_length=80)
     previous_comments: list[PriorComment]
+    issues: list[IssueContext] = Field(default_factory=list, max_length=40)
 
 
 def source_findings(reviews: list[Review]) -> dict[str, Finding]:

@@ -14,9 +14,7 @@ from typing import Any
 import httpx
 
 from ai_reviewer.contracts import (
-    ChangedFile,
     Consolidation,
-    PriorComment,
     Review,
     ReviewContext,
     reconcile,
@@ -49,7 +47,7 @@ class GitHub:
         )
 
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
-        """Send one request and decode a nonempty response as JSON.
+        """Send a request, following at most five same-host redirects for reads.
 
         Args:
             method: HTTP method, including mutating methods for publication.
@@ -60,12 +58,28 @@ class GitHub:
             Decoded JSON, or None when the response has no body.
 
         Raises:
-            RuntimeError: GitHub returns a 4xx or 5xx status; the message omits bodies.
+            RuntimeError: GitHub fails, redirects a write, exceeds five redirects,
+                or redirects outside its HTTPS API host. Messages omit response bodies.
             httpx.HTTPError: A transport or timeout failure prevents completion.
             ValueError: A nonempty response cannot be decoded as JSON.
         """
-        # Perform the request once; retrying a write could duplicate a review.
-        response = self.client.request(method, path, **kwargs)
+        # Follow moved read resources without forwarding credentials outside GitHub.
+        for redirect in range(6):
+            response = self.client.request(method, path, **kwargs)
+            if not response.is_redirect:
+                break
+            if method != "GET" or redirect == 5 or "location" not in response.headers:
+                raise RuntimeError("GitHub redirect cannot be followed safely")
+            target = response.url.join(response.headers["location"])
+            if (
+                target.scheme != "https"
+                or target.host != "api.github.com"
+                or target.port not in (None, 443)
+                or target.username
+                or target.password
+            ):
+                raise RuntimeError("GitHub redirect leaves the trusted API host")
+            path = str(target)
         # Reject HTTP failures without exposing GitHub response content.
         if response.is_error:
             raise RuntimeError(f"GitHub {method} failed: HTTP {response.status_code}")
@@ -272,110 +286,6 @@ def validate_anchors(context: ReviewContext, reviews: list[Review]) -> None:
         for finding in review.findings:
             if (finding.side, finding.line) not in anchors.get(finding.path, set()):
                 raise ValueError("Finding is outside the captured diff")
-
-
-def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> ReviewContext:
-    """Capture the diff, changed file contents and earlier review discussion.
-
-    Reads GitHub content and requests the reviewer only after collection succeeds.
-    It never executes repository code or inspects unchanged dependency files.
-
-    Args:
-        gh: Client authorized to read the repository and request reviewers.
-        repo: Owner/repository pair accepted by pr_path.
-        number: Positive pull request number.
-        reviewer: Login to request; must differ from the PR author.
-
-    Returns:
-        Validated context model containing revisions, PR metadata, discussion and
-        changed-file evidence. Serialize it with model_dump_json for job handoff.
-
-    Raises:
-        ValueError: Identifiers or PR state are invalid, context is incomplete or
-            oversized, or head/base changes during collection. Invalid text
-            decoding also fails rather than returning partial context.
-        RuntimeError: GitHub rejects a request; transport errors also propagate.
-    """
-    # Establish eligibility before collecting potentially expensive context.
-    path = pr_path(repo, number)
-    pr = gh.request("GET", path)
-    if pr["state"] != "open" or pr["draft"] or pr["user"]["login"] == reviewer:
-        raise ValueError("PR is closed, draft, or authored by the reviewer account")
-    # Require a complete, bounded file list and resolve the diff's merge base.
-    files = gh.pages(f"{path}/files")
-    if len(files) != pr["changed_files"] or len(files) > 80:
-        raise ValueError("PR exceeds complete-context file limit")
-    comparison = gh.request(
-        "GET", f"/repos/{repo}/compare/{pr['base']['sha']}...{pr['head']['sha']}"
-    )
-    # Resolve immutable roots once; tree reads are shared across changed paths.
-    head, base = pr["head"]["sha"], pr["base"]["sha"]
-    diff_base = comparison["merge_base_commit"]["sha"]
-    roots = {
-        ref: gh.request("GET", f"/repos/{repo}/git/commits/{ref}")["tree"]["sha"]
-        for ref in (diff_base, head)
-    }
-    cache: dict[str, Any] = {}
-    evidence = []
-    # Read actual Git objects, retaining mode changes and symlink text.
-    for file in files:
-        before, before_mode = (
-            ("", None)
-            if file["status"] == "added"
-            else read_version(
-                gh, repo, roots[diff_base], file.get("previous_filename", file["filename"]), cache
-            )
-        )
-        after, after_mode = (
-            ("", None)
-            if file["status"] == "removed"
-            else read_version(gh, repo, roots[head], file["filename"], cache)
-        )
-        evidence.append(
-            ChangedFile(
-                filename=file["filename"],
-                previous_filename=file.get("previous_filename"),
-                status=file["status"],
-                patch=file["patch"] if "patch" in file else rebuild_patch(before, after),
-                before=before,
-                after=after,
-                before_mode=before_mode,
-                after_mode=after_mode,
-            )
-        )
-    # Project discussion into a bounded, explicit contract without repeated diff hunks.
-    comments = [
-        PriorComment(
-            path=c["path"],
-            line=c.get("line"),
-            side=c.get("side"),
-            body=c["body"],
-            author=(c.get("user") or {}).get("login"),
-        )
-        for c in gh.pages(f"{path}/comments")
-    ]
-    context = ReviewContext(
-        repo=repo,
-        number=number,
-        head=head,
-        base=base,
-        diff_base=diff_base,
-        reviewer=reviewer,
-        title=pr["title"],
-        description=pr["body"],
-        files=evidence,
-        previous_comments=comments,
-    )
-    # Budget only the evidence that will actually reach the providers.
-    if len(context.model_dump_json().encode()) > 600_000:
-        raise ValueError("PR context exceeds 600 KB; split the change")
-    # Reject a collection that raced a head or base update.
-    latest = gh.request("GET", path)
-    if latest["head"]["sha"] != context.head or latest["base"]["sha"] != context.base:
-        raise ValueError("PR changed during context collection")
-    # Make the reviewer request only after the packet passes validation.
-    gh.request("POST", f"{path}/requested_reviewers", json={"reviewers": [reviewer]})
-    return context
 
 
 def publish(

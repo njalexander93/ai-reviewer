@@ -29,6 +29,7 @@ flowchart LR
    | `ANTHROPIC_API_KEY` | Anthropic API key with access to both Claude models |
    | `OPENAI_API_KEY` | OpenAI API key with access to GPT-6.1 Sol |
    | `AI_REVIEWER_TOKEN` | Reviewer's GitHub personal access token |
+   | `LINEAR_API_KEY` (optional) | Linear personal API key with read access to relevant issues |
 
 3. Copy [the caller workflow](examples/ai-review.yml) into the target repository
    as `.github/workflows/ai-review.yml`. Replace both `REVIEWER_RELEASE_COMMIT_SHA` placeholders with the same reviewed,
@@ -82,7 +83,7 @@ even when publication detects an existing review.
   **Run workflow** and enter the PR number. Draft, closed and reviewer-authored
   PRs are rejected. Requests serialize per repository and PR.
 - Each model receives the same diff, complete before/after versions of changed
-  text files, PR description and previous inline discussion. Before versions
+  text files, PR description, linked issue requirements and previous inline discussion. Before versions
   come from the merge base, matching the PR diff.
 - Context uses validated file/comment records and omits repeated GitHub diff hunks
   and URL/user metadata. Symlinks retain their actual link text and Git mode.
@@ -99,6 +100,50 @@ even when publication detects an existing review.
   verdict. Both head and base commits are rechecked immediately before posting.
 - Re-running the same head/base pair does not duplicate a published review.
   Model calls still incur charges on reruns.
+
+## Issue context
+
+Each preparation collects issue titles, descriptions, states and source URLs once
+and passes the same snapshot to both reviewers. Neither provider needs an issue:
+GitHub only, Linear only, both and neither are supported. Duplicate references
+within a provider produce one issue record.
+
+- **GitHub:** uses the existing `GH_TOKEN`, with `issues: read` in the caller and
+  reusable workflow. Reads linked issues (including manual Development links),
+  plus `owner/repo#123` and `https://github.com/owner/repo/issues/123`
+  references in the PR title/body. Local references require an issue keyword,
+  such as `Fixes #123`, `Refs #123`, `Issue #123` or `Related to #123`, so colours
+  and numeric URL fragments are not mistaken for tickets. Other PRs are excluded.
+  GitHub authentication remains required for the review itself.
+- **Linear:** add `LINEAR_API_KEY` to the target repository's Actions secrets.
+  Missing or empty means no Linear lookup. With a key, reads Linear attachments
+  matching the PR URL and ticket IDs such as `ENG-123` in the PR title, body or
+  branch name, including Linear issue URLs and lowercase branch IDs. IDs must
+  match a team visible to the key, so ordinary terms such as `UTF-8` are ignored.
+  Team discovery is bounded to 100 teams and fails if the list is incomplete.
+- **Failures:** configured-provider errors, inaccessible referenced issues and
+  truncated results fail preparation. They never silently mean "no issue."
+  Collection allows at most 20 issues and 20 explicit references per provider;
+  issue text counts toward the existing 600 KB context limit.
+- **Scope:** refreshes on review runs, not on issue edits alone. Does not crawl
+  project boards, infer tickets from similar wording, or read issue comments.
+  A GitHub token must have access to every referenced repository; the default
+  workflow token may not access issues in another private repository.
+
+Issue contents are untrusted requirements, not reviewer instructions. Linear
+content is sent to both model providers and saved in the calling repository's
+review artifacts. Use a key scoped to data appropriate for that repository;
+review feedback may quote issue requirements.
+
+API contracts: [GitHub linked issues](https://docs.github.com/en/graphql/reference/pulls),
+[Linear attachments by URL](https://linear.app/developers/attachments), and
+[Linear issue lookup and personal API keys](https://linear.app/developers/graphql).
+
+The Linear attachment query uses `attachmentsForURL(url: String!, first: Int)`
+returning `AttachmentConnection!`, with `nodes` and `pageInfo`. This is verified
+against Linear's [published SDK schema](https://github.com/linear/linear/blob/618a737a4e6aa279b7853c650f79f209a5142bbc/packages/sdk/src/schema.graphql#L39017-L39046),
+not a flat attachment list. Mock fixtures preserve that provider contract;
+authenticated live validation remains deferred.
 
 ## Security and limits
 
@@ -130,7 +175,7 @@ approval dismissal as described above. A failed subsequent run does not retract
 older reviews by itself.
 
 Review context and model reports are Actions artifacts retained for one day.
-They contain source and discussion. Treat their access as part of the calling
+They contain source, discussion and issue context. Treat their access as part of the calling
 repository's trust boundary. Public review text and Actions logs must not contain
 secrets. The CLI deliberately suppresses provider exception bodies.
 

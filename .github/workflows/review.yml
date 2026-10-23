@@ -19,8 +19,11 @@ on:
         required: true
       AI_REVIEWER_TOKEN:
         required: true
+      LINEAR_API_KEY:
+        required: false
 permissions:
   contents: read
+  issues: read
   pull-requests: write
 concurrency:
   group: ai-review-${{ github.repository }}-${{ inputs.pr-number }}
@@ -50,6 +53,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           AI_REVIEWER_TOKEN: ${{ secrets.AI_REVIEWER_TOKEN }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           PR_NUMBER: ${{ inputs.pr-number }}
       - name: Review with Claude and OpenAI in parallel
         run: poetry run python -m ai_reviewer.cli review

@@ -6,12 +6,12 @@ import json
 import httpx
 import pytest
 
+from ai_reviewer.context import prepare
 from ai_reviewer.contracts import Consolidation, Finding, Group, Review, ReviewContext
 from ai_reviewer.github import (
     GitHub,
     diff_lines,
     pr_path,
-    prepare,
     publish,
     read_version,
     rebuild_patch,
@@ -32,6 +32,7 @@ class Server:
         content: Base64 blob response returned for either version.
         mode: Git file mode supplied by tree entries.
         comments: Raw prior discussion records for context projection tests.
+        linked_issues: GraphQL issue records linked to the PR.
         login: Identity returned by the authenticated-user endpoint.
         gh: Production adapter bound to this server's synthetic HTTP transport.
     """
@@ -43,7 +44,7 @@ class Server:
             "state": "open",
             "draft": False,
             "user": {"login": "author"},
-            "head": {"sha": "a" * 40},
+            "head": {"sha": "a" * 40, "ref": "feature/save"},
             "base": {"sha": "b" * 40},
             "changed_files": 1,
             "title": "Fix",
@@ -62,6 +63,7 @@ class Server:
         self.login = "reviewer"
         self.mode = "100644"
         self.comments: list[dict] = []
+        self.linked_issues: list[dict] = []
         # Replace the HTTP boundary before any production method can make a request.
         self.gh = GitHub("test-token")
         self.gh.client = httpx.Client(
@@ -80,6 +82,22 @@ class Server:
         """
         # Record writes separately from fixture reads.
         path = request.url.path
+        if path == "/graphql":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "closingIssuesReferences": {
+                                    "nodes": self.linked_issues,
+                                    "pageInfo": {"hasNextPage": False},
+                                }
+                            }
+                        }
+                    }
+                },
+            )
         if request.method == "POST":
             self.writes.append((path, json.loads(request.content)))
             return httpx.Response(200, json={})
@@ -326,6 +344,45 @@ def test_http_errors_hide_response_contents() -> None:
     with pytest.raises(RuntimeError, match="HTTP 403") as error:
         gh.request("GET", "/user")
     assert "sensitive-token" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://evil.example/steal",
+        "http://api.github.com/repos/new/repo/issues/1",
+        "https://api.github.com:8443/steal",
+        "https://user@api.github.com/steal",
+    ],
+)
+def test_redirects_cannot_expose_credentials(location: str) -> None:
+    """Untrusted redirect destinations must never receive a request."""
+    gh = GitHub("test-secret")
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Only the original trusted request is permitted to reach the transport."""
+        assert str(request.url) == "https://api.github.com/original"
+        return httpx.Response(301, headers={"Location": location})
+
+    gh.client = httpx.Client(
+        base_url="https://api.github.com", transport=httpx.MockTransport(handle)
+    )
+    with pytest.raises(RuntimeError, match="trusted API host"):
+        gh.request("GET", "/original")
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_redirect_loops_and_writes_are_rejected(method: str) -> None:
+    """Redirect loops terminate; writes are never replayed at a new endpoint."""
+    gh = GitHub("test-secret")
+    gh.client = httpx.Client(
+        base_url="https://api.github.com",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(301, headers={"Location": "/again"})
+        ),
+    )
+    with pytest.raises(RuntimeError, match="redirect cannot be followed"):
+        gh.request(method, "/original")
 
 
 def test_pagination_collects_all_pages_and_refuses_overflow() -> None:
