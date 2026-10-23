@@ -73,7 +73,7 @@ def github_issues(gh: GitHub, repo: str, number: int, text: str) -> list[IssueCo
     }
     shorthand = re.sub(r"https?://[^\s<>]+", "", text)
     references.update(
-        ((match[0] or repo).lower(), int(match[1]))
+        (match[0].lower(), int(match[1]))
         for match in re.findall(
             r"(?<![\w/.:#])([A-Za-z0-9-]+/[A-Za-z0-9_-][A-Za-z0-9_.-]*)"
             r"#([1-9][0-9]*)\b",
@@ -81,8 +81,8 @@ def github_issues(gh: GitHub, repo: str, number: int, text: str) -> list[IssueCo
         )
     )
     references.update(
-        (repo.lower(), int(number))
-        for number in re.findall(
+        (repo.lower(), int(issue_number))
+        for issue_number in re.findall(
             r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|issue|related to)"
             r"\s+#([1-9][0-9]*)\b",
             shorthand,
@@ -99,7 +99,7 @@ def github_issues(gh: GitHub, repo: str, number: int, text: str) -> list[IssueCo
         # GitHub's Issues endpoint also returns PRs; they are not issue requirements.
         if "pull_request" in node:
             continue
-        issues[url] = IssueContext(
+        issues[node["html_url"].lower()] = IssueContext(
             provider="github",
             url=node["html_url"],
             title=node["title"],

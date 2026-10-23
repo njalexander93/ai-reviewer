@@ -346,6 +346,45 @@ def test_http_errors_hide_response_contents() -> None:
     assert "sensitive-token" not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://evil.example/steal",
+        "http://api.github.com/repos/new/repo/issues/1",
+        "https://api.github.com:8443/steal",
+        "https://user@api.github.com/steal",
+    ],
+)
+def test_redirects_cannot_expose_credentials(location: str) -> None:
+    """Untrusted redirect destinations must never receive a request."""
+    gh = GitHub("test-secret")
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Only the original trusted request is permitted to reach the transport."""
+        assert str(request.url) == "https://api.github.com/original"
+        return httpx.Response(301, headers={"Location": location})
+
+    gh.client = httpx.Client(
+        base_url="https://api.github.com", transport=httpx.MockTransport(handle)
+    )
+    with pytest.raises(RuntimeError, match="trusted API host"):
+        gh.request("GET", "/original")
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_redirect_loops_and_writes_are_rejected(method: str) -> None:
+    """Redirect loops terminate; writes are never replayed at a new endpoint."""
+    gh = GitHub("test-secret")
+    gh.client = httpx.Client(
+        base_url="https://api.github.com",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(301, headers={"Location": "/again"})
+        ),
+    )
+    with pytest.raises(RuntimeError, match="redirect cannot be followed"):
+        gh.request(method, "/original")
+
+
 def test_pagination_collects_all_pages_and_refuses_overflow() -> None:
     """A truncated review/file list must not masquerade as complete context."""
     # Provide one full page followed by a final partial page.

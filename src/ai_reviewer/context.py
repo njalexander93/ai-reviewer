@@ -14,7 +14,7 @@ from ai_reviewer.issues import github_issues, linear_issues
 def prepare(
     gh: GitHub, repo: str, number: int, reviewer: str, linear_token: str | None = None
 ) -> ReviewContext:
-    """Capture the diff, changed file contents and earlier review discussion.
+    """Capture changed files, review discussion and optional issue requirements.
 
     Reads GitHub content and requests the reviewer only after collection succeeds.
     It never executes repository code or inspects unchanged dependency files.
@@ -27,14 +27,15 @@ def prepare(
         linear_token: Optional Linear personal API key for issue requirements.
 
     Returns:
-        Validated context model containing revisions, PR metadata, discussion and
-        changed-file evidence. Serialize it with model_dump_json for job handoff.
+        Validated context containing revisions, PR metadata, discussion, changed
+        files and issue evidence. Serialize with model_dump_json for job handoff.
 
     Raises:
         ValueError: Identifiers or PR state are invalid, context is incomplete or
             oversized, or head/base changes during collection. Invalid text
             decoding also fails rather than returning partial context.
-        RuntimeError: GitHub rejects a request; transport errors also propagate.
+        RuntimeError: Either issue provider rejects a query, a referenced issue is
+            unavailable, or a GitHub redirect is unsafe. Transport failures propagate.
     """
     # Establish eligibility before collecting potentially expensive context.
     path = pr_path(repo, number)

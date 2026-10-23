@@ -47,7 +47,7 @@ class GitHub:
         )
 
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
-        """Send one request and decode a nonempty response as JSON.
+        """Send a request, following at most five same-host redirects for reads.
 
         Args:
             method: HTTP method, including mutating methods for publication.
@@ -58,12 +58,28 @@ class GitHub:
             Decoded JSON, or None when the response has no body.
 
         Raises:
-            RuntimeError: GitHub returns a 4xx or 5xx status; the message omits bodies.
+            RuntimeError: GitHub fails, redirects a write, exceeds five redirects,
+                or redirects outside its HTTPS API host. Messages omit response bodies.
             httpx.HTTPError: A transport or timeout failure prevents completion.
             ValueError: A nonempty response cannot be decoded as JSON.
         """
-        # Perform the request once; retrying a write could duplicate a review.
-        response = self.client.request(method, path, **kwargs)
+        # Follow moved read resources without forwarding credentials outside GitHub.
+        for redirect in range(6):
+            response = self.client.request(method, path, **kwargs)
+            if not response.is_redirect:
+                break
+            if method != "GET" or redirect == 5 or "location" not in response.headers:
+                raise RuntimeError("GitHub redirect cannot be followed safely")
+            target = response.url.join(response.headers["location"])
+            if (
+                target.scheme != "https"
+                or target.host != "api.github.com"
+                or target.port not in (None, 443)
+                or target.username
+                or target.password
+            ):
+                raise RuntimeError("GitHub redirect leaves the trusted API host")
+            path = str(target)
         # Reject HTTP failures without exposing GitHub response content.
         if response.is_error:
             raise RuntimeError(f"GitHub {method} failed: HTTP {response.status_code}")

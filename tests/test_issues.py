@@ -358,6 +358,39 @@ def test_linear_enabled_without_tickets(monkeypatch: pytest.MonkeyPatch) -> None
     )
 
 
+def test_transferred_issue_resolves_and_deduplicates() -> None:
+    """Old and new issue references contribute one canonical requirements record."""
+    server = Server()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Redirect the transferred issue to GitHub's canonical issue endpoint."""
+        assert request.url.host == "api.github.com"
+        if request.url.path == "/repos/old/repo/issues/2":
+            return httpx.Response(
+                301, headers={"Location": "https://api.github.com/repos/new/repo/issues/7"}
+            )
+        if request.url.path == "/repos/new/repo/issues/7":
+            return httpx.Response(
+                200,
+                json={
+                    "html_url": "https://github.com/new/repo/issues/7",
+                    "title": "Transferred",
+                    "body": "Preserve the requirement",
+                    "state": "open",
+                },
+            )
+        assert request.url.path == "/graphql"
+        return server.handle(request)
+
+    server.gh.client = httpx.Client(
+        base_url="https://api.github.com", transport=httpx.MockTransport(handle)
+    )
+    issues = github_issues(server.gh, "owner/repo", 1, "old/repo#2 new/repo#7")
+    assert [(i.url, i.description) for i in issues] == [
+        ("https://github.com/new/repo/issues/7", "Preserve the requirement")
+    ]
+
+
 @pytest.mark.parametrize("provider", ["github", "linear"])
 def test_reference_budget_rejects_before_issue_fetches(
     monkeypatch: pytest.MonkeyPatch, provider: str
