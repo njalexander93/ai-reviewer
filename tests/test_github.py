@@ -32,6 +32,7 @@ class Server:
         content: Base64 blob response returned for either version.
         mode: Git file mode supplied by tree entries.
         comments: Raw prior discussion records for context projection tests.
+        linked_issues: GraphQL issue records linked to the PR.
         login: Identity returned by the authenticated-user endpoint.
         gh: Production adapter bound to this server's synthetic HTTP transport.
     """
@@ -62,6 +63,7 @@ class Server:
         self.login = "reviewer"
         self.mode = "100644"
         self.comments: list[dict] = []
+        self.linked_issues: list[dict] = []
         # Replace the HTTP boundary before any production method can make a request.
         self.gh = GitHub("test-token")
         self.gh.client = httpx.Client(
@@ -80,6 +82,22 @@ class Server:
         """
         # Record writes separately from fixture reads.
         path = request.url.path
+        if path == "/graphql":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "closingIssuesReferences": {
+                                    "nodes": self.linked_issues,
+                                    "pageInfo": {"hasNextPage": False},
+                                }
+                            }
+                        }
+                    }
+                },
+            )
         if request.method == "POST":
             self.writes.append((path, json.loads(request.content)))
             return httpx.Response(200, json={})

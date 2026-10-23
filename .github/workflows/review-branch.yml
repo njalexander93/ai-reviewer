@@ -5,6 +5,7 @@ on:
     types: [opened, reopened, ready_for_review, synchronize]
 permissions:
   contents: read
+  issues: read
   pull-requests: write
 jobs:
   review:
@@ -25,3 +26,4 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       AI_REVIEWER_TOKEN: ${{ secrets.AI_REVIEWER_TOKEN }}
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}

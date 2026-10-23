@@ -21,6 +21,7 @@ from ai_reviewer.contracts import (
     ReviewContext,
     reconcile,
 )
+from ai_reviewer.issues import github_issues, linear_issues
 
 
 class GitHub:
@@ -274,7 +275,9 @@ def validate_anchors(context: ReviewContext, reviews: list[Review]) -> None:
                 raise ValueError("Finding is outside the captured diff")
 
 
-def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> ReviewContext:
+def prepare(
+    gh: GitHub, repo: str, number: int, reviewer: str, linear_token: str | None = None
+) -> ReviewContext:
     """Capture the diff, changed file contents and earlier review discussion.
 
     Reads GitHub content and requests the reviewer only after collection succeeds.
@@ -285,6 +288,7 @@ def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> ReviewContext:
         repo: Owner/repository pair accepted by pr_path.
         number: Positive pull request number.
         reviewer: Login to request; must differ from the PR author.
+        linear_token: Optional Linear personal API key for issue requirements.
 
     Returns:
         Validated context model containing revisions, PR metadata, discussion and
@@ -354,6 +358,16 @@ def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> ReviewContext:
         )
         for c in gh.pages(f"{path}/comments")
     ]
+    # Share one issue snapshot with both reviewers, under the existing packet budget.
+    reference_text = f"{pr['title']}\n{pr['body'] or ''}"
+    issues = github_issues(gh, repo, number, reference_text)
+    issues.extend(
+        linear_issues(
+            linear_token,
+            f"https://github.com/{repo}/pull/{number}",
+            f"{reference_text}\n{pr['head'].get('ref', '')}",
+        )
+    )
     context = ReviewContext(
         repo=repo,
         number=number,
@@ -365,6 +379,7 @@ def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> ReviewContext:
         description=pr["body"],
         files=evidence,
         previous_comments=comments,
+        issues=issues,
     )
     # Budget only the evidence that will actually reach the providers.
     if len(context.model_dump_json().encode()) > 600_000:

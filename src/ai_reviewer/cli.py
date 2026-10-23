@@ -50,6 +50,7 @@ def main() -> None:
                 os.environ["GITHUB_REPOSITORY"],
                 int(os.environ["PR_NUMBER"]),
                 identity,
+                linear_token=os.environ.get("LINEAR_API_KEY"),
             )
             # Persist the collected packet for both independent reviewers.
             context_path.write_text(context.model_dump_json())
