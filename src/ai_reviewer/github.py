@@ -5,6 +5,7 @@ fixed GitHub API host; untrusted paths are encoded, not interpolated as URLs.
 """
 
 import base64
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from ai_reviewer.chunking import MAX_BLOB_BYTES
 from ai_reviewer.contracts import (
     Consolidation,
     Review,
@@ -25,6 +27,7 @@ class GitHub:
     """Make bounded GitHub REST requests without automatic write retries.
 
     Attributes:
+        requests_remaining: Per-client cap on requests, including pagination and redirects.
         client: Authenticated HTTP client with a 60-second timeout and redirects
             disabled. Callers must supply GitHub-relative paths to its methods.
     """
@@ -35,6 +38,7 @@ class GitHub:
         Args:
             token: GitHub credential for the operations this job performs.
         """
+        self.requests_remaining = 10_000
         # Keep credentials on the configured host when callers use relative paths.
         self.client = httpx.Client(
             base_url="https://api.github.com",
@@ -65,6 +69,9 @@ class GitHub:
         """
         # Follow moved read resources without forwarding credentials outside GitHub.
         for redirect in range(6):
+            if self.requests_remaining <= 0:
+                raise ValueError("GitHub collection request budget exceeded")
+            self.requests_remaining -= 1
             response = self.client.request(method, path, **kwargs)
             if not response.is_redirect:
                 break
@@ -210,12 +217,15 @@ def read_version(
         # Bound and classify the object before requesting its bytes.
         if entry["type"] != "blob" or entry["mode"] not in ("100644", "100755", "120000"):
             raise ValueError("Unsupported Git object")
-        if entry["size"] > 150_000:
+        if entry["size"] > MAX_BLOB_BYTES:
             raise ValueError("Changed file exceeds context limit")
         blob = gh.request("GET", f"/repos/{repo}/git/blobs/{entry['sha']}")
-        if blob.get("encoding") != "base64" or blob["size"] > 150_000:
+        if blob.get("encoding") != "base64" or blob["size"] > MAX_BLOB_BYTES:
             raise ValueError("Unavailable or oversized Git blob")
-        text = base64.b64decode(blob["content"]).decode("utf-8")
+        raw = base64.b64decode(blob["content"])
+        if len(raw) > MAX_BLOB_BYTES:
+            raise ValueError("Decoded blob exceeds collection budget")
+        text = raw.decode("utf-8")
         if "\0" in text:
             raise ValueError("Binary file; automatic approval prohibited")
         return text, entry["mode"]
@@ -289,7 +299,12 @@ def validate_anchors(context: ReviewContext, reviews: list[Review]) -> None:
 
 
 def publish(
-    gh: GitHub, context: ReviewContext, reviews: list[Review], result: Consolidation
+    gh: GitHub,
+    context: ReviewContext,
+    reviews: list[Review],
+    result: Consolidation,
+    *,
+    directory: Path | None = None,
 ) -> bool:
     """Submit a consolidated review after checking evidence and current PR state.
 
@@ -300,8 +315,9 @@ def publish(
     Args:
         gh: Client authenticated as the reviewer recorded in context.
         context: Packet from prepare, including repository, PR and revision IDs.
-        reviews: Exactly two complete reports, ordered Claude then OpenAI.
+        reviews: Complete reports in validated assignment/provider order.
         result: Consolidated summary and an exact partition of source findings.
+        directory: Required coverage artifacts for a chunked run; revalidated before posting.
 
     Returns:
         False if this revision was already published; True after a new submission.
@@ -311,7 +327,26 @@ def publish(
         RuntimeError: GitHub rejects a request; transport errors also propagate.
     """
     # Validate both reports and ensure the publishing credential owns the request.
-    groups = reconcile(reviews, result)
+    expected_count = 2
+    coverage = ""
+    if directory is not None:
+        # Revalidate artifacts here too; CLI validation alone cannot authorize approval.
+        from ai_reviewer.work import load_reviews
+
+        loaded, manifest = load_reviews(context, directory)
+        if loaded != reviews:
+            raise ValueError("Publication reports differ from covered work")
+        expected_count = len(loaded)
+        coverage = (
+            f"{len(manifest.plan.chunks)} chunks; "
+            f"{len(manifest.assignments)} local/integration assignments completed by both "
+            f"providers. Snapshot `{manifest.plan.snapshot}`. Exact section ownership and "
+            "follow-up evidence are in the workflow coverage manifest. "
+            "Completion does not establish model understanding."
+        )
+    elif len(context.model_dump_json().encode()) > 600_000:
+        raise ValueError("Large review requires a validated coverage manifest")
+    groups = reconcile(reviews, result, expected_count)
     repo, number = context.repo, context.number
     path = pr_path(repo, number)
     login = gh.request("GET", "/user")["login"]
@@ -354,8 +389,18 @@ def publish(
             comments.append({"path": filename, "side": side, "line": line, "body": body})
     # Attach both independent summaries beneath the consolidated overview.
     body = f"{marker}\n## AI review\n\n{result.summary}\n\n"
-    for name, review in zip(["Claude Opus 5.5", "GPT-6.1 Sol"], reviews, strict=True):
-        body += f"<details><summary>{name}</summary>\n\n{review.summary}\n\n</details>\n"
+    if directory is not None:
+        body += coverage
+    else:
+        for name, review in zip(["Claude Opus 5.5", "GPT-6.1 Sol"], reviews, strict=True):
+            body += f"<details><summary>{name}</summary>\n\n{review.summary}\n\n</details>\n"
+    # Reject oversized publication atomically; never publish a partial approval.
+    if (
+        len(body.encode()) > 60_000
+        or len(comments) > 1000
+        or len(json.dumps(comments, ensure_ascii=False).encode()) > 8_000_000
+    ):
+        raise ValueError("Publication exceeds bounded payload; manual review required")
     # Derive the verdict from original findings, never from Sonnet's prose.
     blocking = any(f.blocking for review in reviews for f in review.findings)
     # Recheck immediately before the one write. GitHub has no conditional-review API.

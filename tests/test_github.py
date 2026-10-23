@@ -105,7 +105,9 @@ class Server:
         if path == "/user":
             data = {"login": self.login}
         elif path.endswith("/files"):
-            data = self.files
+            page = int(request.url.params.get("page", "1"))
+            size = int(request.url.params.get("per_page", "100"))
+            data = self.files[(page - 1) * size : page * size]
         elif path.endswith("/reviews"):
             data = self.reviews
         elif path.endswith("/comments"):
@@ -124,13 +126,18 @@ class Server:
                         "path": "app.py",
                         "type": "blob",
                         "mode": self.mode,
-                        "sha": "d" * 40,
+                        "sha": ("e" if path.endswith("c" * 40) else "d") * 40,
                         "size": self.content["size"],
                     }
                 ],
             }
         elif "/git/blobs/" in path:
             data = self.content
+            if (
+                path.endswith("e" * 40)
+                and self.content["content"] == base64.b64encode(b"first\nnew\n").decode()
+            ):
+                data = {**self.content, "content": base64.b64encode(b"first\nold\n").decode()}
         else:
             data = self.pr
         # Use HTTPX serialization so callers exercise real response decoding.
@@ -266,7 +273,7 @@ def test_prepare_requests_reviewer_and_collects_context() -> None:
     server = Server()
     result = prepare(server.gh, "owner/repo", 1, "reviewer").model_dump()
     # Check revision-pinned contents and the requested reviewer identity.
-    assert result["files"][0]["before"] == "first\nnew\n"
+    assert result["files"][0]["before"] == "first\nold\n"
     assert result["files"][0]["after"] == "first\nnew\n"
     assert result["head"] == "a" * 40
     assert server.content_refs == ["c" * 40, "a" * 40]
@@ -288,7 +295,7 @@ def test_prepare_refuses_incomplete_context(invalid: str) -> None:
     elif invalid == "count":
         server.pr["changed_files"] = 2
     elif invalid == "bigfile":
-        server.content["size"] = 150001
+        server.content["size"] = 8000001
     elif invalid == "encoding":
         server.content["encoding"] = "none"
     elif invalid == "draft":
@@ -311,6 +318,7 @@ def test_added_and_removed_files_have_one_empty_version(status: str, empty: str)
     # Represent a file with one nonexistent version.
     server = Server()
     server.files[0]["status"] = status
+    server.files[0].pop("patch", None)
     # Require preparation to leave that version empty rather than fetching it.
     assert prepare(server.gh, "owner/repo", 1, "reviewer").model_dump()["files"][0][empty] == ""
 
@@ -586,3 +594,42 @@ def test_repetitive_blob_diff_does_not_invent_changed_lines() -> None:
     assert "@@ -1,3 +1,4 @@" in patch
     assert ("RIGHT", 200) not in diff_lines(patch)
     assert ("RIGHT", 1) in diff_lines(patch)
+
+
+def test_preparation_accepts_text_blob_above_old_per_version_limit() -> None:
+    """A 200 KB added text blob reaches planning rather than the old 150 KB rejection."""
+    server = Server()
+    content = (b"x" * 99 + b"\n") * 2000
+    server.content = {
+        "size": len(content),
+        "encoding": "base64",
+        "content": base64.b64encode(content).decode(),
+    }
+    server.files[0] = {"filename": "app.py", "status": "added"}
+    context = prepare(server.gh, "owner/repo", 1, "reviewer")
+    assert context.files[0].after.encode() == content
+    assert context.files[0].before == ""
+
+
+def test_preparation_accepts_more_than_eighty_changed_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The previous 80-file restriction no longer rejects a complete 125-file snapshot."""
+    from ai_reviewer import context as collection
+
+    server = Server()
+    server.pr["changed_files"] = 125
+    server.files = [
+        {"filename": f"file-{i}.py", "status": "modified", "patch": PATCH} for i in range(125)
+    ]
+    monkeypatch.setattr(
+        collection,
+        "read_version",
+        lambda gh, repo, tree, filename, cache: (
+            "first\nold\n" if tree == "c" * 40 else "first\nnew\n",
+            "100644",
+        ),
+    )
+    context = prepare(server.gh, "owner/repo", 1, "reviewer")
+    assert len(context.files) == 125
+    assert {f.filename for f in context.files} == {f"file-{i}.py" for i in range(125)}

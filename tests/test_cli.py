@@ -164,3 +164,25 @@ def test_invalid_anchor_stops_before_consolidator_purchase(
     assert error.value.code == 1
     assert calls == []
     assert (tmp_path / "claude.json").exists()
+
+
+def test_chunked_cli_handoff_uses_manifest_and_large_consolidation_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The deployed stage commands validate chunk coverage before the single review write."""
+    from ai_reviewer import work
+    from tests.test_work import fake_model, large_context
+
+    context = large_context()
+    (tmp_path / "context.json").write_text(context.model_dump_json())
+    server = Server()
+    server.files = [{"filename": f.filename, "patch": f.patch} for f in context.files]
+    monkeypatch.setattr(work, "call_model", fake_model)
+    monkeypatch.setattr(cli, "GitHub", lambda token: server.gh)
+    monkeypatch.setenv("AI_REVIEWER_TOKEN", "fixture-token")
+    for stage in ("review", "consolidate", "publish"):
+        monkeypatch.setattr(sys, "argv", ["review", stage, "--directory", str(tmp_path)])
+        cli.main()
+    assert len(server.writes) == 1
+    assert server.writes[0][1]["event"] == "APPROVE"
+    assert (tmp_path / "manifest.json").exists()

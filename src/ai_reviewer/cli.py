@@ -6,10 +6,19 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from ai_reviewer.chunking import plan
 from ai_reviewer.context import prepare
-from ai_reviewer.contracts import Consolidation, Review, ReviewContext, reconcile, source_findings
+from ai_reviewer.contracts import (
+    Consolidation,
+    FinalConsolidation,
+    Review,
+    ReviewContext,
+    reconcile,
+    source_findings,
+)
 from ai_reviewer.github import GitHub, publish, validate_anchors
 from ai_reviewer.models import call_model, print_costs
+from ai_reviewer.work import consolidate_chunks, load_reviews, review_chunks
 
 
 def main() -> None:
@@ -57,7 +66,11 @@ def main() -> None:
             context_path.write_text(context.model_dump_json())
         # Start both paid calls before waiting; a failure still waits for the other usage record.
         elif args.stage == "review":
-            payload = ReviewContext.model_validate_json(context_path.read_text()).model_dump_json()
+            context = ReviewContext.model_validate_json(context_path.read_text())
+            if plan(context).whole is None:
+                review_chunks(context, directory)
+                return
+            payload = context.model_dump_json()
             with ThreadPoolExecutor(max_workers=2) as pool:
                 futures = [
                     pool.submit(call_model, role, payload, directory)
@@ -67,6 +80,22 @@ def main() -> None:
                 for future in futures:
                     future.result()
         else:
+            context = ReviewContext.model_validate_json(context_path.read_text())
+            if plan(context).whole is None:
+                if args.stage == "consolidate":
+                    consolidate_chunks(context, directory)
+                else:
+                    reviews, _ = load_reviews(context, directory)
+                    publish(
+                        GitHub(os.environ["AI_REVIEWER_TOKEN"]),
+                        context,
+                        reviews,
+                        FinalConsolidation.model_validate_json(
+                            (directory / "consolidate.json").read_text()
+                        ),
+                        directory=directory,
+                    )
+                return
             # Downstream stages require both validated independent reports.
             reviews = [
                 Review.model_validate_json((directory / f"{role}.json").read_text())

@@ -6,6 +6,7 @@ check. It requests a reviewer only after all provider context is validated.
 
 from typing import Any
 
+from ai_reviewer.chunking import MAX_SNAPSHOT_BYTES, plan, validate_patch
 from ai_reviewer.contracts import ChangedFile, PriorComment, ReviewContext
 from ai_reviewer.github import GitHub, pr_path, read_version, rebuild_patch
 from ai_reviewer.issues import github_issues, linear_issues
@@ -44,7 +45,7 @@ def prepare(
         raise ValueError("PR is closed, draft, or authored by the reviewer account")
     # Require a complete, bounded file list and resolve the diff's merge base.
     files = gh.pages(f"{path}/files")
-    if len(files) != pr["changed_files"] or len(files) > 80:
+    if len(files) != pr["changed_files"] or len(files) > 3000:
         raise ValueError("PR exceeds complete-context file limit")
     comparison = gh.request(
         "GET", f"/repos/{repo}/compare/{pr['base']['sha']}...{pr['head']['sha']}"
@@ -58,6 +59,7 @@ def prepare(
     }
     cache: dict[str, Any] = {}
     evidence = []
+    collected_bytes = 0
     # Read actual Git objects, retaining mode changes and symlink text.
     for file in files:
         before, before_mode = (
@@ -72,6 +74,9 @@ def prepare(
             if file["status"] == "removed"
             else read_version(gh, repo, roots[head], file["filename"], cache)
         )
+        collected_bytes += len(before.encode()) + len(after.encode())
+        if collected_bytes > MAX_SNAPSHOT_BYTES:
+            raise ValueError("Snapshot exceeds collection budget")
         evidence.append(
             ChangedFile(
                 filename=file["filename"],
@@ -84,6 +89,7 @@ def prepare(
                 after_mode=after_mode,
             )
         )
+        validate_patch(evidence[-1])
     # Project discussion into a bounded, explicit contract without repeated diff hunks.
     comments = [
         PriorComment(
@@ -95,7 +101,7 @@ def prepare(
         )
         for c in gh.pages(f"{path}/comments")
     ]
-    # Share one issue snapshot with both reviewers, under the existing packet budget.
+    # Share one issue snapshot across every local, follow-up and integration review.
     reference_text = f"{pr['title']}\n{pr['body'] or ''}"
     issues = github_issues(gh, repo, number, reference_text)
     issues.extend(
@@ -119,8 +125,7 @@ def prepare(
         issues=issues,
     )
     # Budget only the evidence that will actually reach the providers.
-    if len(context.model_dump_json().encode()) > 600_000:
-        raise ValueError("PR context exceeds 600 KB; split the change")
+    plan(context)
     # Reject a collection that raced a head or base update.
     latest = gh.request("GET", path)
     if latest["head"]["sha"] != context.head or latest["base"]["sha"] != context.base:

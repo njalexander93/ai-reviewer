@@ -1,3 +1,5 @@
+# Large PRs use bounded chunk/follow-up/integration calls in the same review job.
+# Costs scale with required work; configure provider project spending limits.
 name: AI review
 on:
   pull_request_target:

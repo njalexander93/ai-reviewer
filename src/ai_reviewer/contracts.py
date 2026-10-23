@@ -1,6 +1,6 @@
 """Define model-output contracts and preserve findings through consolidation.
 
-Pydantic rejects extra fields and type coercion. Reconciliation checks the two
+Pydantic rejects extra fields and type coercion. Reconciliation checks required
 reports and source-ID partition without performing I/O or changing findings.
 Class docstrings also become descriptions in provider-facing JSON schemas.
 """
@@ -51,6 +51,28 @@ class Review(Contract):
     findings: list[Finding] = Field(max_length=40)
 
 
+class SourceRequest(Contract):
+    """Request inclusive Git lines from a captured changed-file version only."""
+
+    path: str
+    side: Literal["LEFT", "RIGHT"]
+    start: int = Field(ge=1)
+    end: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class ChunkReview(Review):
+    """Review assigned sections; required missing evidence must be requested explicitly."""
+
+    requests: list[SourceRequest] = Field(max_length=8)
+
+
+class CompletedReview(Review):
+    """Preserve findings from up to three attempts of one assigned provider review."""
+
+    findings: list[Finding] = Field(max_length=120)
+
+
 class Group(Contract):
     """Identify duplicate findings without granting permission to delete them.
 
@@ -73,6 +95,12 @@ class Consolidation(Contract):
 
     summary: str = Field(min_length=1, max_length=6000)
     groups: list[Group] = Field(max_length=80)
+
+
+class FinalConsolidation(Consolidation):
+    """Hold bounded batches after each Sonnet response preserves its source partition."""
+
+    groups: list[Group] = Field(max_length=61440)
 
 
 class ChangedFile(Contract):
@@ -160,25 +188,30 @@ class ReviewContext(Contract):
     reviewer: str = Field(min_length=1)
     title: str
     description: str | None
-    files: list[ChangedFile] = Field(max_length=80)
+    files: list[ChangedFile] = Field(max_length=3000)
     previous_comments: list[PriorComment]
     issues: list[IssueContext] = Field(default_factory=list, max_length=40)
 
 
-def source_findings(reviews: list[Review]) -> dict[str, Finding]:
-    """Validate the independent pair and assign stable source IDs.
+def source_findings(reviews: list[Review], expected_count: int = 2) -> dict[str, Finding]:
+    """Validate the required complete reports and assign stable source IDs.
 
     Args:
-        reviews: Exactly two complete reports, ordered Claude then OpenAI.
+        reviews: Complete reports in deterministic assignment/provider order.
+        expected_count: Required report count from validated coverage; two for whole packets.
 
     Returns:
         Original findings keyed by zero-based review:finding IDs.
 
     Raises:
-        ValueError: The pair is missing or either report is incomplete.
+        ValueError: The required report count is wrong or a report is incomplete.
     """
     # Enforce the same completeness boundary before consolidation and publication.
-    if len(reviews) != 2 or not all(review.complete for review in reviews):
+    if (
+        expected_count < 2
+        or len(reviews) != expected_count
+        or not all(review.complete for review in reviews)
+    ):
         raise ValueError("Incomplete review; approval prohibited")
     # Index original objects once for both the payload and reconciliation contract.
     return {
@@ -188,22 +221,25 @@ def source_findings(reviews: list[Review]) -> dict[str, Finding]:
     }
 
 
-def reconcile(reviews: list[Review], result: Consolidation) -> list[list[Finding]]:
+def reconcile(
+    reviews: list[Review], result: Consolidation, expected_count: int = 2
+) -> list[list[Finding]]:
     """Require complete reviews and an exact partition of all source findings.
 
     Args:
-        reviews: Exactly two complete reports, ordered Claude then OpenAI.
+        reviews: Complete reports in deterministic assignment/provider order.
         result: Proposed duplicate groups from Sonnet.
+        expected_count: Required report count from validated coverage; two for whole packets.
 
     Returns:
         Original findings grouped for publication, with their severity unchanged.
 
     Raises:
-        ValueError: There are not two complete reports, or a source is missing,
+        ValueError: Required complete reports are absent, or a source is missing,
             repeated or invented.
     """
     # Reuse the canonical completeness check and source-index contract.
-    sources = source_findings(reviews)
+    sources = source_findings(reviews, expected_count)
     # Require an exact partition so grouping cannot discard or invent evidence.
     ids = [source for group in result.groups for source in group.source_ids]
     if Counter(ids) != Counter({key: 1 for key in sources}):

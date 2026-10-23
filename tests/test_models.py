@@ -53,7 +53,13 @@ def test_model_completion_and_usage_artifacts(
 
     # Replace client construction so no API key or network request is needed.
     client = SimpleNamespace(
-        responses=SimpleNamespace(parse=parse), messages=SimpleNamespace(parse=parse)
+        responses=SimpleNamespace(
+            parse=parse,
+            input_tokens=SimpleNamespace(count=lambda **kwargs: SimpleNamespace(input_tokens=1000)),
+        ),
+        messages=SimpleNamespace(
+            parse=parse, count_tokens=lambda **kwargs: SimpleNamespace(input_tokens=1000)
+        ),
     )
     monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
     monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
@@ -84,9 +90,9 @@ def test_model_completion_and_usage_artifacts(
 def test_failed_call_records_unknown_cost(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A failed network call must never be reported as free."""
 
-    # Replace the provider boundary with a deterministic transport failure.
+    # Fail generation after a successful token-count preflight.
     def fail(**kwargs: object) -> None:
-        """Reject provider construction with a deterministic transport failure.
+        """Reject generation with a deterministic transport failure.
 
         Args:
             **kwargs: Ignored SDK constructor options.
@@ -96,7 +102,13 @@ def test_failed_call_records_unknown_cost(monkeypatch: pytest.MonkeyPatch, tmp_p
         """
         raise TimeoutError("request interrupted")
 
-    monkeypatch.setattr(models.openai, "OpenAI", fail)
+    client = SimpleNamespace(
+        responses=SimpleNamespace(
+            parse=fail,
+            input_tokens=SimpleNamespace(count=lambda **kwargs: SimpleNamespace(input_tokens=1000)),
+        )
+    )
+    monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
     # Require failed calls to leave an explicitly unknown usage record.
     with pytest.raises(TimeoutError):
         call_model("openai", "context", tmp_path)
@@ -149,3 +161,51 @@ def test_unattempted_calls_cost_zero(tmp_path: Path, capsys: pytest.CaptureFixtu
     assert "consolidate: not run ($0)" in output
     assert "Estimated API total: $0.0000\n" in output
     assert "unknown" not in output
+
+
+@pytest.mark.parametrize("role", ["claude", "openai"])
+def test_provider_count_blocks_generation_before_capacity_overflow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str
+) -> None:
+    """A provider count above 250k blocks generation even for a tiny byte payload."""
+    generated = []
+    client = SimpleNamespace(
+        responses=SimpleNamespace(
+            parse=lambda **kwargs: generated.append(kwargs),
+            input_tokens=SimpleNamespace(
+                count=lambda **kwargs: SimpleNamespace(input_tokens=250_001)
+            ),
+        ),
+        messages=SimpleNamespace(
+            parse=lambda **kwargs: generated.append(kwargs),
+            count_tokens=lambda **kwargs: SimpleNamespace(input_tokens=250_001),
+        ),
+    )
+    monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
+    monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
+    with pytest.raises(ValueError, match="capacity"):
+        call_model(role, "tiny", tmp_path, chunked=True)
+    assert generated == []
+    assert not (tmp_path / f"{role}.json").exists()
+    assert not (tmp_path / f"{role}.usage.json").exists()
+
+
+def test_costs_include_every_isolated_attempt(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Three Opus attempts at $0.40 and two Sol attempts at $0.20 total $1.60."""
+    for role, count in (("claude", 3), ("openai", 2)):
+        for index in range(count):
+            target = tmp_path / "work" / str(index) / role
+            target.mkdir(parents=True)
+            (target / f"{role}.usage.json").write_text(
+                Usage(input=100_000, output=0, cached=0, cache_write=0).model_dump_json()
+            )
+    failed = tmp_path / "work" / "failed"
+    failed.mkdir()
+    (failed / "claude.usage.json").write_text("null")
+    print_costs(tmp_path)
+    output = capsys.readouterr().out
+    assert "Claude subtotal: $1.2000 + unknown" in output
+    assert "OpenAI subtotal: $0.4000" in output
+    assert "Estimated API total: $1.6000 + unknown" in output
