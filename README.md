@@ -104,7 +104,8 @@ review incomplete. Model judgment can still be wrong or affected by malicious
 instructions in source; structured output does not eliminate that risk.
 
 Limits are 80 changed files, 150 KB per file version and 600 KB of total serialized
-context. Binary files, unavailable content and oversized changes fail without
+context. Missing text patches are reconstructed from the captured file versions.
+Binary files, unavailable content and oversized changes fail without
 approval. Each model may return up to 40 findings. Output is capped at 16,000
 tokens per call. No automatic provider retries are performed.
 

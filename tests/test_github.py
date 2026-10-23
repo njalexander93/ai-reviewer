@@ -227,6 +227,7 @@ def test_prepare_refuses_incomplete_context(invalid: str) -> None:
     server = Server()
     if invalid == "binary":
         del server.files[0]["patch"]
+        server.content["content"] = base64.b64encode(b"binary\0data").decode()
     elif invalid == "count":
         server.pr["changed_files"] = 2
     elif invalid == "bigfile":
@@ -309,3 +310,19 @@ def test_pagination_collects_all_pages_and_refuses_overflow() -> None:
     )
     with pytest.raises(ValueError, match="pagination"):
         gh.pages("/list")
+
+
+def test_omitted_text_patch_is_rebuilt_and_can_anchor_review() -> None:
+    """An omitted generated-file patch still permits review of complete text content."""
+    # Simulate GitHub omitting an added text file's patch while serving its bytes.
+    server = Server()
+    del server.files[0]["patch"]
+    server.files[0]["status"] = "added"
+    context = prepare(server.gh, "owner/repo", 1, "reviewer")
+    assert ("RIGHT", 2) in diff_lines(context["files"][0]["patch"])
+    # A new API response still omits the patch; publication uses the captured revision.
+    server.files = [{"filename": "app.py", "status": "added"}]
+    _, reviews, result = bundle(server, blocking=True)
+    assert publish(server.gh, context, reviews, result) is True
+    assert server.writes[-1][1]["event"] == "REQUEST_CHANGES"
+    assert server.writes[-1][1]["comments"][0]["line"] == 2

@@ -6,6 +6,7 @@ fixed GitHub API host; untrusted paths are encoded, not interpolated as URLs.
 
 import base64
 import re
+from difflib import unified_diff
 from typing import Any
 from urllib.parse import quote
 
@@ -196,9 +197,6 @@ def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> dict[str, Any]
     }
     # Include complete changed-file versions, so findings can inspect surrounding logic.
     for file in files:
-        # Missing patches cannot support a complete automatic review.
-        if "patch" not in file:
-            raise ValueError("Binary or unavailable diff; automatic approval prohibited")
         # Read each existing version at its immutable commit, respecting renames.
         for side, ref, filename in [
             ("before", context["diff_base"], file.get("previous_filename", file["filename"])),
@@ -217,6 +215,14 @@ def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> dict[str, Any]
             if data.get("encoding") != "base64" or data["size"] > 150_000:
                 raise ValueError("Changed file exceeds context limit")
             file[side] = base64.b64decode(data["content"]).decode("utf-8")
+            # NUL-containing files are binary even when their bytes decode as UTF-8.
+            if "\0" in file[side]:
+                raise ValueError("Binary file; automatic approval prohibited")
+        # GitHub can omit text patches, including generated lockfiles; rebuild from exact refs.
+        if "patch" not in file:
+            file["patch"] = "\n".join(
+                unified_diff(file["before"].splitlines(), file["after"].splitlines(), lineterm="")
+            )
     import json
 
     # Bound the entire packet, including description and prior discussion.
@@ -267,7 +273,11 @@ def publish(
         return False
     # Use fresh GitHub diff anchors, never trust locations carried by the model.
     files = gh.pages(f"{path}/files")
-    anchors = {f["filename"]: diff_lines(f.get("patch", "")) for f in files}
+    # Reuse reconstructed patches only from the trusted packet for the checked revision pair.
+    captured = {f["filename"]: f["patch"] for f in context.get("files", [])}
+    anchors = {
+        f["filename"]: diff_lines(f.get("patch", captured.get(f["filename"], ""))) for f in files
+    }
     for review in reviews:
         for finding in review.findings:
             if (finding.side, finding.line) not in anchors.get(finding.path, set()):
