@@ -1,0 +1,27 @@
+# Exercise the candidate implementation on its own PR before it reaches main.
+name: Branch review test
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    # Bootstrap only against the initial main commit; merging makes this job ineligible.
+    # Restrict candidate execution to this explicitly authorized same-repository branch.
+    if: >-
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'feat/automated-pr-review' &&
+      github.event.pull_request.base.sha == '01a7a031a2762b35bcbec7c0280ed1a60eee3469'
+    # Local reusable workflows come from this caller's commit, including the PR merge ref.
+    uses: ./.github/workflows/review.yml
+    with:
+      pr-number: ${{ github.event.pull_request.number }}
+      implementation-ref: ${{ github.sha }}
+      implementation-repository: ${{ github.repository }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      AI_REVIEWER_TOKEN: ${{ secrets.AI_REVIEWER_TOKEN }}

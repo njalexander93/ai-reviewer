@@ -1,0 +1,29 @@
+name: AI review
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: PR number to review (including an authorized fork PR)
+        required: true
+        type: number
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (!github.event.pull_request.draft &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    # Use the same trusted revision for the workflow and its implementation.
+    uses: ./.github/workflows/review.yml
+    with:
+      pr-number: ${{ github.event.pull_request.number || inputs.pr-number }}
+      implementation-ref: ${{ github.sha }}
+      implementation-repository: ${{ github.repository }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      AI_REVIEWER_TOKEN: ${{ secrets.AI_REVIEWER_TOKEN }}

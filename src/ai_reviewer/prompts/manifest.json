@@ -1,0 +1,23 @@
+{
+  "prompts": [
+    {
+      "file": "review.md",
+      "name": "thermo-nuclear-code-quality-review",
+      "source": {
+        "repository": "https://github.com/cursor/plugins",
+        "path": "cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
+        "commit": "6e3d2ea56d7d446b955eaae6ac4c8eef8bf504cf",
+        "url": "https://github.com/cursor/plugins/blob/6e3d2ea56d7d446b955eaae6ac4c8eef8bf504cf/cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
+        "raw_url": "https://raw.githubusercontent.com/cursor/plugins/6e3d2ea56d7d446b955eaae6ac4c8eef8bf504cf/cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
+        "sha256": "7faca08b51b643b2ddd0836f92af15574444024685dcc1e677dbbb39ae8c9e8f"
+      },
+      "sha256": "3fe9fb20c10a3aeffc059c4c9e0624e2cc5972b02811ded56334daedec4186b2",
+      "license": "MIT",
+      "license_file": "LICENSE.cursor",
+      "provenance": "Imported from the supplied local skill; verified against this upstream revision on 2026-10-23.",
+      "modifications": [
+        "Removed the frontmatter line: disable-model-invocation: true. No other byte differences."
+      ]
+    }
+  ]
+}

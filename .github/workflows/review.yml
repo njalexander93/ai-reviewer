@@ -1,0 +1,78 @@
+name: AI review
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        type: number
+        required: true
+      implementation-ref:
+        description: Full commit SHA of the reviewer implementation (same as workflow pin)
+        type: string
+        required: true
+      implementation-repository:
+        type: string
+        default: njalexander93/ai-reviewer
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      OPENAI_API_KEY:
+        required: true
+      AI_REVIEWER_TOKEN:
+        required: true
+permissions:
+  contents: read
+  pull-requests: write
+concurrency:
+  group: ai-review-${{ github.repository }}-${{ inputs.pr-number }}
+  cancel-in-progress: false
+jobs:
+  review:
+    name: AI review
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate implementation pin
+        env:
+          IMPLEMENTATION_REF: ${{ inputs.implementation-ref }}
+        run: '[[ "$IMPLEMENTATION_REF" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ inputs.implementation-repository }}
+          ref: ${{ inputs.implementation-ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.14.8'
+      - run: pip install poetry==2.4.2
+      - run: poetry sync --only main
+      - name: Prepare PR context
+        run: poetry run python -m ai_reviewer.cli prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AI_REVIEWER_TOKEN: ${{ secrets.AI_REVIEWER_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+      - name: Review with Claude and OpenAI in parallel
+        run: poetry run python -m ai_reviewer.cli review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      - name: Consolidate with Sonnet
+        run: poetry run python -m ai_reviewer.cli consolidate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Publish GitHub review
+        run: poetry run python -m ai_reviewer.cli publish
+        env:
+          AI_REVIEWER_TOKEN: ${{ secrets.AI_REVIEWER_TOKEN }}
+      - name: Report API costs
+        if: always()
+        run: poetry run python -m ai_reviewer.cli costs
+      - name: Save review evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ai-review-results
+          path: results/*.json
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore
