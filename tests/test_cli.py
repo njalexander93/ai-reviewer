@@ -15,6 +15,7 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
     """Independent reports reach publication through files, without prices in feedback."""
+    # Bind the CLI to a synthetic repository and isolated artifact directory.
     server = Server()
     monkeypatch.setattr(cli, "GitHub", lambda token: server.gh)
     for key, value in {
@@ -27,19 +28,29 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     payloads: dict[str, dict] = {}
 
     def model(role: str, payload: str, directory: Path) -> None:
-        """Replace only the paid provider call with independently specified reports."""
+        """Write deterministic reports at the paid-provider boundary.
+
+        Args:
+            role: Reviewer or consolidator selected by the CLI stage.
+            payload: JSON context or review pair, retained for assertions.
+            directory: Isolated stage directory receiving the synthetic report.
+        """
+        # Retain the actual stage input before selecting its response contract.
         payloads[role] = json.loads(payload)
         report = (
             Consolidation(summary="Both reviewers found no blockers.", groups=[])
             if role == "consolidate"
             else Review(complete=True, summary=f"{role} completed", findings=[])
         )
+        # Match the artifact interface consumed by the next real CLI stage.
         (directory / f"{role}.json").write_text(report.model_dump_json())
 
+    # Run the real stage dispatcher with only external boundaries replaced.
     monkeypatch.setattr(cli, "call_model", model)
     for stage in ["prepare", "claude", "openai", "consolidate", "publish", "costs"]:
         monkeypatch.setattr(sys, "argv", ["review", stage, "--directory", str(tmp_path)])
         cli.main()
+    # Verify identical reviewer input, the published verdict and log-only accounting.
     assert payloads["claude"] == payloads["openai"]
     assert payloads["claude"]["head"] == "a" * 40
     assert [r["summary"] for r in payloads["consolidate"]["reviews"]] == [
@@ -62,6 +73,7 @@ def test_incomplete_report_blocks_later_stages(
     capsys: pytest.CaptureFixture,
 ) -> None:
     """Insufficient context cannot turn into a clean review in either downstream stage."""
+    # Write one complete report and one report declaring insufficient context.
     for role in ("claude", "openai"):
         (tmp_path / f"{role}.json").write_text(
             Review(
@@ -69,6 +81,7 @@ def test_incomplete_report_blocks_later_stages(
             ).model_dump_json()
         )
     monkeypatch.setattr(sys, "argv", ["review", stage, "--directory", str(tmp_path)])
+    # Require a failed stage without exposing report text or creating consolidation.
     with pytest.raises(SystemExit) as error:
         cli.main()
     assert error.value.code == 1

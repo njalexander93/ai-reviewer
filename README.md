@@ -142,6 +142,26 @@ handoff, approval guards, stale revisions, inline anchors, consolidation fidelit
 and cost calculations without paid API calls. CI runs formatting, linting,
 typing and tests, with an 80% branch-aware coverage floor.
 
+### Source documentation
+
+Follow the source-documentation pattern used in nplet and plainspoken across
+production code, scripts and tests:
+
+- Begin each module with its responsibility, boundary and relevant side effects.
+- Give every named class, function and method a meaningful Google-style docstring.
+  Use `Args`, `Returns`, `Raises` and `Attributes` where the contract needs them.
+  Document constraints and failure conditions rather than repeating type hints.
+- Introduce each logical phase of a multi-step routine with a concise comment.
+  Together, the comments should explain the flow: input selection, validation,
+  transformation, I/O, state changes and failure handling. Group related statements;
+  do not narrate each assignment. Single-operation helpers need only a docstring.
+- Describe what the code actually does, including limitations. Preserve vendored
+  prompts and licenses rather than restyling third-party material.
+- Review documentation manually as well as running Ruff. For documentation-only
+  Python edits, compare syntax trees with docstrings removed and inspect runtime
+  consumers of documentation. Here, argparse uses the CLI module docstring and
+  Pydantic includes contract class docstrings in provider-facing schema descriptions.
+
 ## License and attribution
 
 [MIT](LICENSE). The vendored review prompt is copied from the supplied local

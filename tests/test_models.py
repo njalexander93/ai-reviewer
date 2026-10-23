@@ -17,6 +17,7 @@ def test_model_completion_and_usage_artifacts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str, complete: bool
 ) -> None:
     """Only completed parsed responses become reports; partial calls still report usage."""
+    # Choose the role-specific report and provider completion state.
     calls: list[dict] = []
     report = (
         Consolidation(summary="Clean", groups=[])
@@ -25,8 +26,17 @@ def test_model_completion_and_usage_artifacts(
     )
 
     def parse(**kwargs: object) -> SimpleNamespace:
-        """Simulate documented SDK response fields, retaining request parameters."""
+        """Return a synthetic provider response and record the outgoing request.
+
+        Args:
+            **kwargs: Parameters sent by the production provider adapter.
+
+        Returns:
+            SDK-shaped response with the chosen completion status and fixed usage.
+        """
+        # Capture the request independently of the response fixture.
         calls.append(kwargs)
+        # Expose both SDK response shapes through one deterministic fixture.
         return SimpleNamespace(
             status="completed" if complete else "incomplete",
             output_parsed=report,
@@ -41,11 +51,13 @@ def test_model_completion_and_usage_artifacts(
             ),
         )
 
+    # Replace client construction so no API key or network request is needed.
     client = SimpleNamespace(
         responses=SimpleNamespace(parse=parse), messages=SimpleNamespace(parse=parse)
     )
     monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
     monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
+    # Completed responses produce reports; truncated responses retain only usage.
     if complete:
         call_model(role, "untrusted context", tmp_path)
         assert json.loads((tmp_path / f"{role}.json").read_text())["summary"] == "Clean"
@@ -53,7 +65,9 @@ def test_model_completion_and_usage_artifacts(
         with pytest.raises(ValueError, match="incomplete"):
             call_model(role, "untrusted context", tmp_path)
         assert not (tmp_path / f"{role}.json").exists()
+    # Check provider-specific normalization and the requested model identity.
     usage = json.loads((tmp_path / f"{role}.usage.json").read_text())
+    # Exercise completion or truncation, then inspect saved output and usage.
     assert usage["output"] == 200
     assert usage["input"] == (900 if role == "openai" else 1000)
     assert "tools" not in calls[0]
@@ -70,11 +84,20 @@ def test_model_completion_and_usage_artifacts(
 def test_failed_call_records_unknown_cost(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A failed network call must never be reported as free."""
 
+    # Replace the provider boundary with a deterministic transport failure.
     def fail(**kwargs: object) -> None:
-        """Raise a synthetic transport error at the provider boundary."""
+        """Reject provider construction with a deterministic transport failure.
+
+        Args:
+            **kwargs: Ignored SDK constructor options.
+
+        Raises:
+            TimeoutError: Always, simulating an interrupted provider request.
+        """
         raise TimeoutError("request interrupted")
 
     monkeypatch.setattr(models.openai, "OpenAI", fail)
+    # Require failed calls to leave an explicitly unknown usage record.
     with pytest.raises(TimeoutError):
         call_model("openai", "context", tmp_path)
     assert (tmp_path / "openai.usage.json").read_text() == "null"
@@ -84,6 +107,7 @@ def test_cost_example_matches_hand_calculation(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
     """100k/20k reviewer tokens plus 30k/5k Sonnet tokens cost $1.31 at stated rates."""
+    # Write fixed token counts with independently calculated expected costs.
     for role, count in [
         ("claude", (100000, 20000)),
         ("openai", (100000, 20000)),
@@ -92,8 +116,10 @@ def test_cost_example_matches_hand_calculation(
         (tmp_path / f"{role}.usage.json").write_text(
             Usage(input=count[0], output=count[1], cached=0, cache_write=0).model_dump_json()
         )
+    # Exercise the real formatter over the synthetic usage artifacts.
     print_costs(tmp_path)
     output = capsys.readouterr().out
+    # Compare logged subtotals and the total against the hand calculation.
     assert "Claude subtotal: $0.9100" in output
     assert "OpenAI subtotal: $0.4000" in output
     assert "Estimated API total: $1.3100" in output
@@ -101,8 +127,10 @@ def test_cost_example_matches_hand_calculation(
 
 def test_unknown_usage_is_not_zero(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     """Absent artifacts leave both provider totals explicitly incomplete."""
+    # Report costs from an empty artifact directory.
     print_costs(tmp_path)
     output = capsys.readouterr().out
+    # Require both provider subtotals to disclose unavailable usage.
     assert "Claude subtotal: $0.0000 + unknown" in output
     assert "OpenAI subtotal: $0.0000 + unknown" in output
 
