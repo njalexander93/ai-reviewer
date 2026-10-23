@@ -184,3 +184,6 @@ production code, scripts and tests:
 `thermo-nuclear-code-quality-review` skill, based on the
 [Cursor team kit skill](https://github.com/cursor/plugins/blob/main/cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md).
 Its upstream [MIT license](src/ai_reviewer/prompts/LICENSE.cursor) is included.
+
+The [prompt manifest](src/ai_reviewer/prompts/manifest.json) records the verified
+upstream commit, immutable source URLs, SHA-256 hashes and local modifications.
