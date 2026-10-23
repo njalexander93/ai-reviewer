@@ -5,7 +5,7 @@ import json
 import httpx
 import pytest
 
-from ai_reviewer.github import prepare
+from ai_reviewer.context import prepare
 from ai_reviewer.issues import github_issues, linear_issues
 from tests.test_github import Server
 
@@ -52,7 +52,7 @@ def test_linked_github_issue_reaches_review_context() -> None:
             "url": "https://github.com/owner/repo/issues/2",
             "title": "Retain history",
             "description": "Never delete saved edits.",
-            "state": "OPEN",
+            "state": "open",
         }
     ]
 
@@ -275,6 +275,57 @@ def test_github_references_exclude_prs_and_foreign_hosts() -> None:
     assert [(i.title, i.description) for i in issues] == [("Linked", "Requirement")]
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Use CSS colours #333 and #123456.",
+        "See https://docs.example.com/page#3 and docs.example.com/page#4.",
+        "https://docs.example.com/page?next=other/repo#5",
+    ],
+)
+def test_prose_numbers_and_url_fragments_are_not_issue_references(text: str) -> None:
+    """Ordinary prose must not fetch unrelated issues or abort a review."""
+    server = Server()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Allow the authoritative linked-issue lookup, but no guessed issue fetch."""
+        assert request.url.path == "/graphql"
+        return server.handle(request)
+
+    server.gh.client = httpx.Client(
+        base_url="https://api.github.com", transport=httpx.MockTransport(handle)
+    )
+    assert github_issues(server.gh, "owner/repo", 1, text) == []
+
+
+@pytest.mark.parametrize("text", ["Fixes #2", "Related to #2", "issue #2", "owner/repo#2"])
+def test_explicit_issue_references_still_resolve(text: str) -> None:
+    """Tightened parsing preserves intentional issue references and normalizes state."""
+    server = Server()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Return a real issue only for the expected repository and number."""
+        if request.url.path == "/repos/owner/repo/issues/2":
+            return httpx.Response(
+                200,
+                json={
+                    "html_url": "https://github.com/owner/repo/issues/2",
+                    "title": "Preserve edits",
+                    "body": "Keep history",
+                    "state": "open",
+                },
+            )
+        assert request.url.path == "/graphql"
+        return server.handle(request)
+
+    server.gh.client = httpx.Client(
+        base_url="https://api.github.com", transport=httpx.MockTransport(handle)
+    )
+    assert [(i.title, i.state) for i in github_issues(server.gh, "owner/repo", 1, text)] == [
+        ("Preserve edits", "open")
+    ]
+
+
 def test_linear_enabled_without_tickets(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unrelated hyphenated terms do not invent Linear tickets."""
     client_type = httpx.Client
@@ -333,6 +384,6 @@ def test_reference_budget_rejects_before_issue_fetches(
     )
     with pytest.raises(ValueError, match="20 references"):
         if provider == "github":
-            github_issues(server.gh, "owner/repo", 1, " ".join(f"#{i}" for i in range(2, 23)))
+            github_issues(server.gh, "owner/repo", 1, " ".join(f"refs #{i}" for i in range(2, 23)))
         else:
             linear_issues("test", "unused", " ".join(f"ENG-{i}" for i in range(1, 22)))

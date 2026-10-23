@@ -6,12 +6,12 @@ import json
 import httpx
 import pytest
 
+from ai_reviewer.context import prepare
 from ai_reviewer.contracts import Consolidation, Finding, Group, Review, ReviewContext
 from ai_reviewer.github import (
     GitHub,
     diff_lines,
     pr_path,
-    prepare,
     publish,
     read_version,
     rebuild_patch,
@@ -44,7 +44,7 @@ class Server:
             "state": "open",
             "draft": False,
             "user": {"login": "author"},
-            "head": {"sha": "a" * 40},
+            "head": {"sha": "a" * 40, "ref": "feature/save"},
             "base": {"sha": "b" * 40},
             "changed_files": 1,
             "title": "Fix",

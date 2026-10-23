@@ -110,8 +110,10 @@ within a provider produce one issue record.
 
 - **GitHub:** uses the existing `GH_TOKEN`, with `issues: read` in the caller and
   reusable workflow. Reads linked issues (including manual Development links),
-  plus `#123`, `owner/repo#123` and `https://github.com/owner/repo/issues/123`
-  references in the PR title/body. References to other PRs are excluded.
+  plus `owner/repo#123` and `https://github.com/owner/repo/issues/123`
+  references in the PR title/body. Local references require an issue keyword,
+  such as `Fixes #123`, `Refs #123`, `Issue #123` or `Related to #123`, so colours
+  and numeric URL fragments are not mistaken for tickets. Other PRs are excluded.
   GitHub authentication remains required for the review itself.
 - **Linear:** add `LINEAR_API_KEY` to the target repository's Actions secrets.
   Missing or empty means no Linear lookup. With a key, reads Linear attachments
@@ -136,6 +138,12 @@ review feedback may quote issue requirements.
 API contracts: [GitHub linked issues](https://docs.github.com/en/graphql/reference/pulls),
 [Linear attachments by URL](https://linear.app/developers/attachments), and
 [Linear issue lookup and personal API keys](https://linear.app/developers/graphql).
+
+The Linear attachment query uses `attachmentsForURL(url: String!, first: Int)`
+returning `AttachmentConnection!`, with `nodes` and `pageInfo`. This is verified
+against Linear's [published SDK schema](https://github.com/linear/linear/blob/618a737a4e6aa279b7853c650f79f209a5142bbc/packages/sdk/src/schema.graphql#L39017-L39046),
+not a flat attachment list. Mock fixtures preserve that provider contract;
+authenticated live validation remains deferred.
 
 ## Security and limits
 

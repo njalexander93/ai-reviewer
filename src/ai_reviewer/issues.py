@@ -6,18 +6,16 @@ Issue bodies are evidence, never instructions. Project boards are not traversed.
 """
 
 import re
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import httpx
 
 from ai_reviewer.contracts import IssueContext
-
-if TYPE_CHECKING:
-    from ai_reviewer.github import GitHub
+from ai_reviewer.github import GitHub
 
 
 def github_issues(gh: GitHub, repo: str, number: int, text: str) -> list[IssueContext]:
-    """Read linked issues and #N, owner/repo#N or GitHub issue URL references.
+    """Read linked issues, keyword-qualified #N, owner/repo#N and issue URLs.
 
     Args:
         gh: Existing authenticated GitHub client, used only for reads here.
@@ -61,7 +59,7 @@ def github_issues(gh: GitHub, repo: str, number: int, text: str) -> list[IssueCo
             url=node["url"],
             title=node["title"],
             description=node["body"],
-            state=node["state"],
+            state=node["state"].lower(),
         )
         for node in linked["nodes"]
     }
@@ -73,11 +71,22 @@ def github_issues(gh: GitHub, repo: str, number: int, text: str) -> list[IssueCo
             text,
         )
     }
+    shorthand = re.sub(r"https?://[^\s<>]+", "", text)
     references.update(
         ((match[0] or repo).lower(), int(match[1]))
         for match in re.findall(
-            r"(?<![\w/#])(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#([1-9][0-9]*)\b",
-            text,
+            r"(?<![\w/.:#])([A-Za-z0-9-]+/[A-Za-z0-9_-][A-Za-z0-9_.-]*)"
+            r"#([1-9][0-9]*)\b",
+            shorthand,
+        )
+    )
+    references.update(
+        (repo.lower(), int(number))
+        for number in re.findall(
+            r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|issue|related to)"
+            r"\s+#([1-9][0-9]*)\b",
+            shorthand,
+            re.IGNORECASE,
         )
     )
     if len(references) > 20:
@@ -95,7 +104,7 @@ def github_issues(gh: GitHub, repo: str, number: int, text: str) -> list[IssueCo
             url=node["html_url"],
             title=node["title"],
             description=node["body"],
-            state=node["state"],
+            state=node["state"].lower(),
         )
         if len(issues) > 20:
             raise ValueError("GitHub issue context exceeds 20 issues")
@@ -152,6 +161,8 @@ def linear_issues(token: str | None, pr_url: str, text: str) -> list[IssueContex
             identifiers = [item for item in identifiers if item.rsplit("-", 1)[0] in keys]
             if len(identifiers) > 20:
                 raise ValueError("Linear issue context exceeds 20 references")
+        # Linear's SDK schema defines first: Int and returns AttachmentConnection:
+        # https://github.com/linear/linear/blob/master/packages/sdk/src/schema.graphql
         attached = query(
             "query($url: String!) { attachmentsForURL(url: $url, first: 21) { "
             f"nodes {{ issue {{ {fields} }} }} pageInfo {{ hasNextPage }} }} }}",
