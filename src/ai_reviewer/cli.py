@@ -6,7 +6,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from ai_reviewer.contracts import Consolidation, Review, reconcile
+from ai_reviewer.contracts import Consolidation, Review, ReviewContext, reconcile, source_findings
 from ai_reviewer.github import GitHub, prepare, publish
 from ai_reviewer.models import call_model, print_costs
 
@@ -27,7 +27,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "stage",
-        choices=["prepare", "review", "claude", "openai", "consolidate", "publish", "costs"],
+        choices=["prepare", "review", "consolidate", "publish", "costs"],
     )
     parser.add_argument("--directory", type=Path, default=Path("results"))
     args = parser.parse_args()
@@ -52,10 +52,10 @@ def main() -> None:
                 identity,
             )
             # Persist the collected packet for both independent reviewers.
-            context_path.write_text(json.dumps(context))
+            context_path.write_text(context.model_dump_json())
         # Start both paid calls before waiting; a failure still waits for the other usage record.
         elif args.stage == "review":
-            payload = context_path.read_text()
+            payload = ReviewContext.model_validate_json(context_path.read_text()).model_dump_json()
             with ThreadPoolExecutor(max_workers=2) as pool:
                 futures = [
                     pool.submit(call_model, role, payload, directory)
@@ -64,29 +64,20 @@ def main() -> None:
                 # Propagate failures only after the executor has allowed both calls to finish.
                 for future in futures:
                     future.result()
-        # Independent reviewers read the same packet without seeing each other.
-        elif args.stage in ("claude", "openai"):
-            call_model(args.stage, context_path.read_text(), directory)
         else:
             # Downstream stages require both validated independent reports.
             reviews = [
                 Review.model_validate_json((directory / f"{role}.json").read_text())
                 for role in ("claude", "openai")
             ]
-            # Never consolidate or publish a report declaring insufficient context.
-            if not all(review.complete for review in reviews):
-                raise ValueError("Review incomplete")
-            # Sonnet receives source IDs so its grouping can be checked exactly.
+            # Use the shared source contract before spending on consolidation.
+            sources = source_findings(reviews)
             if args.stage == "consolidate":
-                payload = {
-                    "reviews": [r.model_dump() for r in reviews],
-                    "sources": {
-                        f"{i}:{j}": f.model_dump()
-                        for i, r in enumerate(reviews)
-                        for j, f in enumerate(r.findings)
-                    },
+                consolidation_payload = {
+                    "reviews": [{"summary": r.summary} for r in reviews],
+                    "sources": {key: f.model_dump() for key, f in sources.items()},
                 }
-                call_model("consolidate", json.dumps(payload), directory)
+                call_model("consolidate", json.dumps(consolidation_payload), directory)
                 # Reject the stage if the written consolidation fails source preservation.
                 result = Consolidation.model_validate_json(
                     (directory / "consolidate.json").read_text()
@@ -96,7 +87,7 @@ def main() -> None:
                 # Publication performs its own identity, revision and finding checks.
                 publish(
                     GitHub(os.environ["AI_REVIEWER_TOKEN"]),
-                    json.loads(context_path.read_text()),
+                    ReviewContext.model_validate_json(context_path.read_text()),
                     reviews,
                     Consolidation.model_validate_json((directory / "consolidate.json").read_text()),
                 )

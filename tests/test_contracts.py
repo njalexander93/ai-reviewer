@@ -2,7 +2,16 @@
 
 import pytest
 
-from ai_reviewer.contracts import Consolidation, Finding, Group, Review, reconcile
+from ai_reviewer.contracts import (
+    Consolidation,
+    Finding,
+    Group,
+    Review,
+    ReviewContext,
+    reconcile,
+    source_findings,
+)
+from tests.test_github import Server, bundle
 
 
 def test_consolidator_cannot_discard_a_blocker() -> None:
@@ -60,3 +69,24 @@ def test_merged_duplicates_retain_both_original_findings() -> None:
     assert reconcile(
         reviews, Consolidation(summary="Done", groups=[Group(source_ids=["0:0", "1:0"])])
     ) == [[one, two]]
+
+
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_source_index_requires_exactly_two_reports(count: int) -> None:
+    """The shared source-index boundary rejects missing or extra reviewer reports."""
+    # Empty findings do not make an incorrect reviewer count acceptable.
+    reports = [Review(complete=True, summary="Complete", findings=[]) for _ in range(count)]
+    with pytest.raises(ValueError, match="Incomplete"):
+        source_findings(reports)
+
+
+def test_context_rejects_opaque_or_missing_fields() -> None:
+    """Artifact loading cannot accept arbitrary metadata or silently missing evidence."""
+    # Obtain the valid fixture, then remove an invariant or add API passthrough noise.
+    context, _, _ = bundle(Server())
+    for invalid in [
+        {**context.model_dump(), "raw_url": "extra"},
+        {k: v for k, v in context.model_dump().items() if k != "files"},
+    ]:
+        with pytest.raises(ValueError):
+            ReviewContext.model_validate(invalid)

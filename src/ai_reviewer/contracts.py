@@ -75,6 +75,99 @@ class Consolidation(Contract):
     groups: list[Group] = Field(max_length=80)
 
 
+class ChangedFile(Contract):
+    """Carry only changed-file evidence used by reviewers and publication.
+
+    Attributes:
+        filename: Current repository-relative path.
+        previous_filename: Old path for renames, otherwise None.
+        status: GitHub change status.
+        patch: Unified diff with Git newline coordinates.
+        before: Exact old blob text, empty for added files.
+        after: Exact new blob text, empty for removed files.
+        before_mode: Old Git mode; None when the old version does not exist.
+        after_mode: New Git mode; 120000 identifies symlink text, not its target.
+    """
+
+    filename: str = Field(min_length=1)
+    previous_filename: str | None
+    status: str
+    patch: str
+    before: str
+    after: str
+    before_mode: str | None
+    after_mode: str | None
+
+
+class PriorComment(Contract):
+    """Keep discussion content and coordinates without repeated diff hunks or API metadata.
+
+    Attributes:
+        path: Commented file path.
+        line: Current line, or None for an outdated comment.
+        side: Comment's diff side, or None for file-level discussion.
+        body: Original discussion text, treated as untrusted input.
+        author: GitHub login, or None for a deleted account.
+    """
+
+    path: str
+    line: int | None
+    side: str | None
+    body: str
+    author: str | None
+
+
+class ReviewContext(Contract):
+    """Bind minimal review evidence to an immutable PR revision pair.
+
+    Attributes:
+        repo: Owner/repository pair validated by the GitHub adapter.
+        number: Positive PR number.
+        head: Reviewed head commit SHA.
+        base: Base branch tip observed during preparation.
+        diff_base: Merge-base commit used to read old file versions.
+        reviewer: GitHub login expected to publish the review.
+        title: PR title.
+        description: PR body, or None when absent.
+        files: Complete bounded list of changed-file evidence.
+        previous_comments: Minimal prior inline discussion records.
+    """
+
+    repo: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+    number: int = Field(ge=1)
+    head: str = Field(pattern=r"^[0-9a-f]{40}$")
+    base: str = Field(pattern=r"^[0-9a-f]{40}$")
+    diff_base: str = Field(pattern=r"^[0-9a-f]{40}$")
+    reviewer: str = Field(min_length=1)
+    title: str
+    description: str | None
+    files: list[ChangedFile] = Field(max_length=80)
+    previous_comments: list[PriorComment]
+
+
+def source_findings(reviews: list[Review]) -> dict[str, Finding]:
+    """Validate the independent pair and assign stable source IDs.
+
+    Args:
+        reviews: Exactly two complete reports, ordered Claude then OpenAI.
+
+    Returns:
+        Original findings keyed by zero-based review:finding IDs.
+
+    Raises:
+        ValueError: The pair is missing or either report is incomplete.
+    """
+    # Enforce the same completeness boundary before consolidation and publication.
+    if len(reviews) != 2 or not all(review.complete for review in reviews):
+        raise ValueError("Incomplete review; approval prohibited")
+    # Index original objects once for both the payload and reconciliation contract.
+    return {
+        f"{i}:{j}": finding
+        for i, review in enumerate(reviews)
+        for j, finding in enumerate(review.findings)
+    }
+
+
 def reconcile(reviews: list[Review], result: Consolidation) -> list[list[Finding]]:
     """Require complete reviews and an exact partition of all source findings.
 
@@ -89,15 +182,8 @@ def reconcile(reviews: list[Review], result: Consolidation) -> list[list[Finding
         ValueError: There are not two complete reports, or a source is missing,
             repeated or invented.
     """
-    # Both independent assessments must be present and complete.
-    if len(reviews) != 2 or not all(review.complete for review in reviews):
-        raise ValueError("Incomplete review; approval prohibited")
-    # Give each original finding an ID independent of Sonnet's grouping choices.
-    sources = {
-        f"{i}:{j}": finding
-        for i, review in enumerate(reviews)
-        for j, finding in enumerate(review.findings)
-    }
+    # Reuse the canonical completeness check and source-index contract.
+    sources = source_findings(reviews)
     # Require an exact partition so grouping cannot discard or invent evidence.
     ids = [source for group in result.groups for source in group.source_ids]
     if Counter(ids) != Counter({key: 1 for key in sources}):

@@ -66,7 +66,7 @@ other branches do not qualify. The ordinary Checks workflow still runs separatel
 
 GitHub resolves [local reusable workflows from the caller's commit](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
 This bootstrap caller does not need to exist on `main` before its PR event runs.
-Remove it after this implementation branch is merged. This repository's production
+Remove it immediately before merging, after the final candidate review. This repository's production
 caller uses its local reusable workflow and the same trusted commit for checkout.
 External repositories use the release-pinned installation template. Re-running a test can incur model costs
 even when publication detects an existing review.
@@ -80,11 +80,15 @@ even when publication detects an existing review.
 - Each model receives the same diff, complete before/after versions of changed
   text files, PR description and previous inline discussion. Before versions
   come from the merge base, matching the PR diff.
+- Context uses validated file/comment records and omits repeated GitHub diff hunks
+  and URL/user metadata. Symlinks retain their actual link text and Git mode.
 - The imported [thermo-nuclear review skill](src/ai_reviewer/prompts/review.md)
   supplies the structural quality standard. Correctness and security findings
   also count. Models must report insufficient context explicitly.
 - Sonnet sees both completed reports. It must preserve every finding exactly
-  once. Original wording and severity remain attached to grouped inline threads.
+  once. Original wording and explicit severity labels remain in feedback. Different
+  locations receive separate threads; large groups split between findings at a
+  conservative 60,000 UTF-8 byte limit per inline comment.
 - Any blocking finding means **REQUEST_CHANGES**. Two complete reports with no
   blockers mean **APPROVE**. Nonblocking observations may accompany approval.
 - Missing, invalid or incomplete results fail the run. They never become a clean
@@ -191,3 +195,10 @@ Its upstream [MIT license](src/ai_reviewer/prompts/LICENSE.cursor) is included.
 
 The [prompt manifest](src/ai_reviewer/prompts/manifest.json) records the verified
 upstream commit, immutable source URLs, SHA-256 hashes and local modifications.
+
+## Final merge checklist
+
+- [ ] Complete the last candidate review and record its passing run.
+- [ ] Remove `.github/workflows/review-branch.yml` before merging. Its temporary
+      caller must not coexist with the production caller on main.
+- [ ] Keep required code-quality checks passing on the final revision.

@@ -9,7 +9,7 @@ import pytest
 
 from ai_reviewer import cli
 from ai_reviewer.contracts import Consolidation, Review
-from tests.test_github import Server
+from tests.test_github import Server, bundle
 
 
 def test_pipeline_posts_one_clean_review_and_logs_costs(
@@ -97,7 +97,8 @@ def test_parallel_review_waits_for_both_calls(
     """Both calls start concurrently and finish recording usage even if one fails."""
     # Neither fake call can finish unless the other starts, exposing serial execution.
     started = Barrier(2, timeout=5)
-    (tmp_path / "context.json").write_text("shared context")
+    context, _, _ = bundle(Server())
+    (tmp_path / "context.json").write_text(context.model_dump_json())
 
     def model(role: str, payload: str, directory: Path) -> None:
         """Synchronize provider calls and record completion before a selected failure.
@@ -111,7 +112,7 @@ def test_parallel_review_waits_for_both_calls(
             RuntimeError: The selected provider fails after recording usage.
         """
         # Require overlap rather than inferring parallelism from execution duration.
-        assert payload == "shared context"
+        assert json.loads(payload)["head"] == "a" * 40
         started.wait()
         # Keep the usage evidence observable even when this provider reports failure.
         (directory / f"{role}.usage.json").write_text("recorded")

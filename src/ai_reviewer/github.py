@@ -8,11 +8,17 @@ import base64
 import re
 from difflib import unified_diff
 from typing import Any
-from urllib.parse import quote
 
 import httpx
 
-from ai_reviewer.contracts import Consolidation, Review, reconcile
+from ai_reviewer.contracts import (
+    ChangedFile,
+    Consolidation,
+    PriorComment,
+    Review,
+    ReviewContext,
+    reconcile,
+)
 
 
 class GitHub:
@@ -125,7 +131,7 @@ def diff_lines(patch: str) -> set[tuple[str, int]]:
     left = right = 0
     in_hunk = False
     # Reset counters at hunk headers and advance the side consumed by each line.
-    for line in patch.splitlines():
+    for line in patch.split("\n"):
         match = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
         # Headers establish coordinates; file headers and metadata add no anchors.
         if match:
@@ -148,7 +154,80 @@ def diff_lines(patch: str) -> set[tuple[str, int]]:
     return anchors
 
 
-def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> dict[str, Any]:
+def read_version(
+    gh: GitHub, repo: str, tree: str, filename: str, cache: dict[str, Any]
+) -> tuple[str, str]:
+    """Read an immutable Git blob without dereferencing symbolic links.
+
+    Args:
+        gh: GitHub client with repository read access.
+        repo: Validated owner/repository pair.
+        tree: Root tree SHA for the selected commit.
+        filename: Repository-relative path to walk through tree entries.
+        cache: Per-preparation cache of complete tree responses, mutated on misses.
+
+    Returns:
+        Exact UTF-8 blob text and Git mode, including symlink target text for 120000.
+
+    Raises:
+        ValueError: A tree is truncated, a path is missing, the object is unsupported,
+            or file bytes exceed the limit, contain NUL or are not UTF-8.
+        RuntimeError: GitHub rejects a request; transport errors also propagate.
+    """
+    # Walk nonrecursive trees so large unrelated subtrees do not truncate the lookup.
+    parts = filename.split("/")
+    for index, part in enumerate(parts):
+        if tree not in cache:
+            cache[tree] = gh.request("GET", f"/repos/{repo}/git/trees/{tree}")
+        data = cache[tree]
+        if data.get("truncated"):
+            raise ValueError("Truncated Git tree; context incomplete")
+        entry = next((item for item in data["tree"] if item["path"] == part), None)
+        if entry is None:
+            raise ValueError("Changed path missing from Git tree")
+        # Only directory entries may continue the path traversal.
+        if index < len(parts) - 1:
+            if entry["type"] != "tree":
+                raise ValueError("Changed path traverses a non-directory")
+            tree = entry["sha"]
+            continue
+        # Bound and classify the object before requesting its bytes.
+        if entry["type"] != "blob" or entry["mode"] not in ("100644", "100755", "120000"):
+            raise ValueError("Unsupported Git object")
+        if entry["size"] > 150_000:
+            raise ValueError("Changed file exceeds context limit")
+        blob = gh.request("GET", f"/repos/{repo}/git/blobs/{entry['sha']}")
+        if blob.get("encoding") != "base64" or blob["size"] > 150_000:
+            raise ValueError("Unavailable or oversized Git blob")
+        text = base64.b64decode(blob["content"]).decode("utf-8")
+        if "\0" in text:
+            raise ValueError("Binary file; automatic approval prohibited")
+        return text, entry["mode"]
+    raise ValueError("Empty changed-file path")
+
+
+def rebuild_patch(before: str, after: str) -> str:
+    """Reconstruct a unified patch using only LF as a physical line boundary.
+
+    Args:
+        before: Exact old blob text, including its final-newline state.
+        after: Exact new blob text, including its final-newline state.
+
+    Returns:
+        Unified diff with explicit markers for unterminated lines. Unicode
+        separators and carriage returns remain content rather than line boundaries.
+    """
+    # Keep each LF attached so a final-newline-only change remains observable.
+    old = re.findall(r"[^\n]*\n|[^\n]+$", before)
+    new = re.findall(r"[^\n]*\n|[^\n]+$", after)
+    # Separate unterminated diff records with Git's no-final-newline marker.
+    return "".join(
+        line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+        for line in unified_diff(old, new)
+    )
+
+
+def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> ReviewContext:
     """Capture the diff, changed file contents and earlier review discussion.
 
     Reads GitHub content and requests the reviewer only after collection succeeds.
@@ -161,8 +240,8 @@ def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> dict[str, Any]
         reviewer: Login to request; must differ from the PR author.
 
     Returns:
-        JSON-serializable packet with revision identifiers, PR metadata, prior
-        inline comments and changed files augmented with before/after text.
+        Validated context model containing revisions, PR metadata, discussion and
+        changed-file evidence. Serialize it with model_dump_json for job handoff.
 
     Raises:
         ValueError: Identifiers or PR state are invalid, context is incomplete or
@@ -182,55 +261,70 @@ def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> dict[str, Any]
     comparison = gh.request(
         "GET", f"/repos/{repo}/compare/{pr['base']['sha']}...{pr['head']['sha']}"
     )
-    # Bind discussion and file evidence to the observed head and base revisions.
-    context: dict[str, Any] = {
-        "repo": repo,
-        "number": number,
-        "head": pr["head"]["sha"],
-        "base": pr["base"]["sha"],
-        "diff_base": comparison["merge_base_commit"]["sha"],
-        "reviewer": reviewer,
-        "title": pr["title"],
-        "description": pr["body"],
-        "files": files,
-        "previous_comments": gh.pages(f"{path}/comments"),
+    # Resolve immutable roots once; tree reads are shared across changed paths.
+    head, base = pr["head"]["sha"], pr["base"]["sha"]
+    diff_base = comparison["merge_base_commit"]["sha"]
+    roots = {
+        ref: gh.request("GET", f"/repos/{repo}/git/commits/{ref}")["tree"]["sha"]
+        for ref in (diff_base, head)
     }
-    # Include complete changed-file versions, so findings can inspect surrounding logic.
+    cache: dict[str, Any] = {}
+    evidence = []
+    # Read actual Git objects, retaining mode changes and symlink text.
     for file in files:
-        # Read each existing version at its immutable commit, respecting renames.
-        for side, ref, filename in [
-            ("before", context["diff_base"], file.get("previous_filename", file["filename"])),
-            ("after", context["head"], file["filename"]),
-        ]:
-            # Added and removed files have one deliberately empty version.
-            if (side == "before" and file["status"] == "added") or (
-                side == "after" and file["status"] == "removed"
-            ):
-                file[side] = ""
-                continue
-            # Bound file contents before decoding them into model context.
-            data = gh.request(
-                "GET", f"/repos/{repo}/contents/{quote(filename, safe='')}", params={"ref": ref}
+        before, before_mode = (
+            ("", None)
+            if file["status"] == "added"
+            else read_version(
+                gh, repo, roots[diff_base], file.get("previous_filename", file["filename"]), cache
             )
-            if data.get("encoding") != "base64" or data["size"] > 150_000:
-                raise ValueError("Changed file exceeds context limit")
-            file[side] = base64.b64decode(data["content"]).decode("utf-8")
-            # NUL-containing files are binary even when their bytes decode as UTF-8.
-            if "\0" in file[side]:
-                raise ValueError("Binary file; automatic approval prohibited")
-        # GitHub can omit text patches, including generated lockfiles; rebuild from exact refs.
-        if "patch" not in file:
-            file["patch"] = "\n".join(
-                unified_diff(file["before"].splitlines(), file["after"].splitlines(), lineterm="")
+        )
+        after, after_mode = (
+            ("", None)
+            if file["status"] == "removed"
+            else read_version(gh, repo, roots[head], file["filename"], cache)
+        )
+        evidence.append(
+            ChangedFile(
+                filename=file["filename"],
+                previous_filename=file.get("previous_filename"),
+                status=file["status"],
+                patch=file["patch"] if "patch" in file else rebuild_patch(before, after),
+                before=before,
+                after=after,
+                before_mode=before_mode,
+                after_mode=after_mode,
             )
-    import json
-
-    # Bound the entire packet, including description and prior discussion.
-    if len(json.dumps(context).encode()) > 600_000:
+        )
+    # Project discussion into a bounded, explicit contract without repeated diff hunks.
+    comments = [
+        PriorComment(
+            path=c["path"],
+            line=c.get("line"),
+            side=c.get("side"),
+            body=c["body"],
+            author=(c.get("user") or {}).get("login"),
+        )
+        for c in gh.pages(f"{path}/comments")
+    ]
+    context = ReviewContext(
+        repo=repo,
+        number=number,
+        head=head,
+        base=base,
+        diff_base=diff_base,
+        reviewer=reviewer,
+        title=pr["title"],
+        description=pr["body"],
+        files=evidence,
+        previous_comments=comments,
+    )
+    # Budget only the evidence that will actually reach the providers.
+    if len(context.model_dump_json().encode()) > 600_000:
         raise ValueError("PR context exceeds 600 KB; split the change")
     # Reject a collection that raced a head or base update.
     latest = gh.request("GET", path)
-    if latest["head"]["sha"] != context["head"] or latest["base"]["sha"] != context["base"]:
+    if latest["head"]["sha"] != context.head or latest["base"]["sha"] != context.base:
         raise ValueError("PR changed during context collection")
     # Make the reviewer request only after the packet passes validation.
     gh.request("POST", f"{path}/requested_reviewers", json={"reviewers": [reviewer]})
@@ -238,7 +332,7 @@ def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> dict[str, Any]
 
 
 def publish(
-    gh: GitHub, context: dict[str, Any], reviews: list[Review], result: Consolidation
+    gh: GitHub, context: ReviewContext, reviews: list[Review], result: Consolidation
 ) -> bool:
     """Submit a consolidated review after checking evidence and current PR state.
 
@@ -261,20 +355,20 @@ def publish(
     """
     # Validate both reports and ensure the publishing credential owns the request.
     groups = reconcile(reviews, result)
-    repo, number = context["repo"], context["number"]
+    repo, number = context.repo, context.number
     path = pr_path(repo, number)
     login = gh.request("GET", "/user")["login"]
-    if login != context["reviewer"]:
+    if login != context.reviewer:
         raise ValueError("Publishing identity differs from requested reviewer")
     # Avoid another submission when this account already reviewed the revision pair.
-    marker = f"<!-- ai-reviewer:{context['head']}:{context['base']} -->"
+    marker = f"<!-- ai-reviewer:{context.head}:{context.base} -->"
     existing = gh.pages(f"{path}/reviews")
     if any(r["user"]["login"] == login and marker in (r.get("body") or "") for r in existing):
         return False
     # Use fresh GitHub diff anchors, never trust locations carried by the model.
     files = gh.pages(f"{path}/files")
     # Reuse reconstructed patches only from the trusted packet for the checked revision pair.
-    captured = {f["filename"]: f["patch"] for f in context.get("files", [])}
+    captured = {f.filename: f.patch for f in context.files}
     anchors = {
         f["filename"]: diff_lines(f.get("patch", captured.get(f["filename"], ""))) for f in files
     }
@@ -282,12 +376,25 @@ def publish(
         for finding in review.findings:
             if (finding.side, finding.line) not in anchors.get(finding.path, set()):
                 raise ValueError("Finding is outside the current diff")
-    # Keep original evidence and severity while combining duplicate threads.
+    # Preserve source locations and severity; split only between complete findings.
     comments = []
     for group in groups:
-        first = group[0]
-        body = "\n\n---\n\n".join(f"**{f.title}**\n\n{f.body}" for f in group)
-        comments.append({"path": first.path, "line": first.line, "side": first.side, "body": body})
+        by_anchor: dict[tuple[str, str, int], list[str]] = {}
+        for finding in group:
+            label = "Blocking" if finding.blocking else "Nonblocking"
+            fragment = f"**{label}: {finding.title}**\n\n{finding.body}"
+            by_anchor.setdefault((finding.path, finding.side, finding.line), []).append(fragment)
+        # A conservative UTF-8 byte budget stays below GitHub's reported body limits.
+        for (filename, side, line), fragments in by_anchor.items():
+            body = ""
+            for fragment in fragments:
+                combined = body + "\n\n---\n\n" + fragment if body else fragment
+                if len(combined.encode()) > 60_000:
+                    comments.append({"path": filename, "side": side, "line": line, "body": body})
+                    body = fragment
+                else:
+                    body = combined
+            comments.append({"path": filename, "side": side, "line": line, "body": body})
     # Attach both independent summaries beneath the consolidated overview.
     body = f"{marker}\n## AI review\n\n{result.summary}\n\n"
     for name, review in zip(["Claude Opus 5.5", "GPT-6.1 Sol"], reviews, strict=True):
@@ -299,8 +406,8 @@ def publish(
     if (
         pr["state"] != "open"
         or pr["draft"]
-        or pr["head"]["sha"] != context["head"]
-        or pr["base"]["sha"] != context["base"]
+        or pr["head"]["sha"] != context.head
+        or pr["base"]["sha"] != context.base
         or pr["user"]["login"] == login
     ):
         raise ValueError("Stale, closed, draft or self-authored PR; not publishing")
@@ -309,7 +416,7 @@ def publish(
         "POST",
         f"{path}/reviews",
         json={
-            "commit_id": context["head"],
+            "commit_id": context.head,
             "event": "REQUEST_CHANGES" if blocking else "APPROVE",
             "body": body,
             "comments": comments,
