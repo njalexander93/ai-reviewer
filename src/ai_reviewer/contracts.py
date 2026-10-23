@@ -55,8 +55,8 @@ class Group(Contract):
     """Identify duplicate findings without granting permission to delete them.
 
     Attributes:
-        source_ids: Nonempty list of zero-based "review: finding" IDs, without
-            spaces. Reconciliation validates membership and uniqueness.
+        source_ids: Nonempty list of zero-based "review:finding" IDs, such as "0:1".
+            Reconciliation validates membership and uniqueness.
     """
 
     source_ids: list[str] = Field(min_length=1, max_length=80)

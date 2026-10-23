@@ -31,8 +31,9 @@ flowchart LR
    | `AI_REVIEWER_TOKEN` | Reviewer's GitHub personal access token |
 
 3. Copy [the caller workflow](examples/ai-review.yml) into the target repository
-   as `.github/workflows/ai-review.yml`. It pins the initial implementation.
-   For upgrades, change both commit pins to the same reviewed, full commit SHA.
+   as `.github/workflows/ai-review.yml`. Replace both `REVIEWER_RELEASE_COMMIT_SHA` placeholders with the same reviewed,
+   full commit SHA from a release of this repository. The template is not deployable
+   until those placeholders are replaced.
    Merge the caller into the target's default branch.
 4. Enable **dismiss stale pull request approvals when new commits are pushed**
    in the target's branch protection or ruleset. Keep existing tests and required
@@ -65,8 +66,9 @@ other branches do not qualify. The ordinary Checks workflow still runs separatel
 
 GitHub resolves [local reusable workflows from the caller's commit](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
 This bootstrap caller does not need to exist on `main` before its PR event runs.
-Remove it after this implementation branch is merged; the pinned production
-caller remains the normal review path. Re-running a test can incur model costs
+Remove it after this implementation branch is merged. This repository's production
+caller uses its local reusable workflow and the same trusted commit for checkout.
+External repositories use the release-pinned installation template. Re-running a test can incur model costs
 even when publication detects an existing review.
 
 ## Review policy
