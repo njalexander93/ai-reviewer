@@ -54,6 +54,21 @@ and [stale approval dismissal](https://docs.github.com/en/repositories/configuri
 Private targets need a credential with access to them; a `public_repo` token is
 insufficient.
 
+## Test the implementation branch
+
+[Branch review test](.github/workflows/review-branch.yml) runs on non-draft PR
+updates from the same-repository `feat/automated-pr-review` branch. It calls the
+local reusable workflow and checks out the same PR merge commit, so both workflow
+logic and Python implementation come from the candidate revision. This exercises
+real provider calls, posts a real review and incurs API charges. Fork PRs and
+other branches do not qualify. The ordinary Checks workflow still runs separately.
+
+GitHub resolves [local reusable workflows from the caller's commit](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
+This bootstrap caller does not need to exist on `main` before its PR event runs.
+Remove it after this implementation branch is merged; the pinned production
+caller remains the normal review path. Re-running a test can incur model costs
+even when publication detects an existing review.
+
 ## Review policy
 
 - Runs on PR opening, reopening, publication from draft, and new commits.
