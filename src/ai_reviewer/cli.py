@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ai_reviewer.contracts import Consolidation, Review, ReviewContext, reconcile, source_findings
-from ai_reviewer.github import GitHub, prepare, publish
+from ai_reviewer.github import GitHub, prepare, publish, validate_anchors
 from ai_reviewer.models import call_model, print_costs
 
 
@@ -71,8 +71,11 @@ def main() -> None:
                 for role in ("claude", "openai")
             ]
             # Use the shared source contract before spending on consolidation.
-            sources = source_findings(reviews)
             if args.stage == "consolidate":
+                sources = source_findings(reviews)
+                validate_anchors(
+                    ReviewContext.model_validate_json(context_path.read_text()), reviews
+                )
                 consolidation_payload = {
                     "reviews": [{"summary": r.summary} for r in reviews],
                     "sources": {key: f.model_dump() for key, f in sources.items()},

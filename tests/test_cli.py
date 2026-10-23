@@ -131,3 +131,26 @@ def test_parallel_review_waits_for_both_calls(
     # Returning from the stage must mean both calls have finished, including failure paths.
     for role in ("claude", "openai"):
         assert (tmp_path / f"{role}.usage.json").read_text() == "recorded"
+
+
+def test_invalid_anchor_stops_before_consolidator_purchase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A valid report contract with an invalid diff line never reaches the paid API."""
+    # Capture a real fixture packet, then move its finding beyond the available hunk.
+    server = Server()
+    context = cli.prepare(server.gh, "owner/repo", 1, "reviewer")
+    _, reviews, _ = bundle(server)
+    reviews[0].findings[0].line = 999
+    (tmp_path / "context.json").write_text(context.model_dump_json())
+    for role, review in zip(("claude", "openai"), reviews, strict=True):
+        (tmp_path / f"{role}.json").write_text(review.model_dump_json())
+    calls = []
+    monkeypatch.setattr(cli, "call_model", lambda *args: calls.append(args))
+    monkeypatch.setattr(sys, "argv", ["review", "consolidate", "--directory", str(tmp_path)])
+    # Reject rather than discard the finding or pay for a useless consolidation.
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 1
+    assert calls == []
+    assert (tmp_path / "claude.json").exists()

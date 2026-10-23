@@ -416,9 +416,7 @@ def test_git_line_boundaries_preserve_unicode_and_final_newline() -> None:
     patch = rebuild_patch("old\n", "first\u2028+same-line\n")
     assert diff_lines(patch) == {("LEFT", 1), ("RIGHT", 1)}
     # An unterminated line and a terminated line are different Git contents.
-    assert rebuild_patch("x", "x\n") == (
-        "--- \n+++ \n@@ -1 +1 @@\n-x\n\\ No newline at end of file\n+x\n"
-    )
+    assert rebuild_patch("x", "x\n").endswith("@@ -1 +1 @@\n-x\n\\ No newline at end of file\n+x\n")
 
 
 def test_grouped_findings_keep_distinct_locations_and_severity() -> None:
@@ -522,3 +520,12 @@ def test_blob_reader_walks_nested_tree_and_reuses_cache() -> None:
     # Removing server tree responses proves subsequent reads use the per-packet cache.
     del responses["root"], responses["nested"]
     assert read_version(gh, "owner/repo", "root", "src/app.py", cache) == ("x()\n", "100755")
+
+
+def test_repetitive_blob_diff_does_not_invent_changed_lines() -> None:
+    """Prepending one line leaves distant repeated lines outside the Git hunk."""
+    before = "same\n" * 300
+    patch = rebuild_patch(before, "new\n" + before)
+    assert "@@ -1,3 +1,4 @@" in patch
+    assert ("RIGHT", 200) not in diff_lines(patch)
+    assert ("RIGHT", 1) in diff_lines(patch)

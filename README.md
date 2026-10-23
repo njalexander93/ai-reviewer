@@ -62,11 +62,15 @@ updates from the same-repository `feat/automated-pr-review` branch. It calls the
 local reusable workflow and checks out the same PR merge commit, so both workflow
 logic and Python implementation come from the candidate revision. This exercises
 real provider calls, posts a real review and incurs API charges. Fork PRs and
-other branches do not qualify. The ordinary Checks workflow still runs separately.
+other branches do not qualify. The base must also equal the initial main commit
+`01a7a031a2762b35bcbec7c0280ed1a60eee3469`; once main advances, this bootstrap
+job is ineligible. It cannot duplicate the production caller after merge.
+The ordinary Checks workflow still runs separately.
 
 GitHub resolves [local reusable workflows from the caller's commit](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
 This bootstrap caller does not need to exist on `main` before its PR event runs.
-Remove it immediately before merging, after the final candidate review. This repository's production
+The immutable base gate permits the final candidate review without relying on
+a manual pre-merge deletion for safety. This repository's production
 caller uses its local reusable workflow and the same trusted commit for checkout.
 External repositories use the release-pinned installation template. Re-running a test can incur model costs
 even when publication detects an existing review.
@@ -112,7 +116,10 @@ review incomplete. Model judgment can still be wrong or affected by malicious
 instructions in source; structured output does not eliminate that risk.
 
 Limits are 80 changed files, 150 KB per file version and 600 KB of total serialized
-context. Missing text patches are reconstructed from the captured file versions.
+context. Missing text patches are reconstructed with Git from inert temporary
+blob files; no repository code or external diff driver is executed. Findings
+are checked against captured diff anchors before purchasing consolidation. Invalid
+anchors fail the run and preserve report artifacts instead of dropping findings.
 Binary files, unavailable content and oversized changes fail without
 approval. Each model may return up to 40 findings. Output is capped at 16,000
 tokens per call. No automatic provider retries are performed.
@@ -130,9 +137,10 @@ secrets. The CLI deliberately suppresses provider exception bodies.
 ## Cost reporting
 
 The final **Report API costs** step prints Opus, Sol and Sonnet estimates, Claude/OpenAI
-subtotals and a combined total. It runs after success or failure. Missing usage
-is **unknown**, never silently counted as free. Review comments contain no cost
-accounting.
+subtotals and a combined total. It runs after success or failure. An attempted
+call with unavailable usage is **unknown**, never silently counted as free. A
+stage never attempted is reported as **not run ($0)**. Review comments contain
+no cost accounting.
 
 Estimates use provider-reported input, output and cache token counts. Rates are
 recorded in [models.py](src/ai_reviewer/models.py), checked on **2026-10-23** against
@@ -199,6 +207,6 @@ upstream commit, immutable source URLs, SHA-256 hashes and local modifications.
 ## Final merge checklist
 
 - [ ] Complete the last candidate review and record its passing run.
-- [ ] Remove `.github/workflows/review-branch.yml` before merging. Its temporary
-      caller must not coexist with the production caller on main.
+- [ ] Confirm the bootstrap base gate still pins the initial main commit. It
+      automatically disables candidate execution once main advances.
 - [ ] Keep required code-quality checks passing on the final revision.

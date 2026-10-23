@@ -126,8 +126,10 @@ def test_cost_example_matches_hand_calculation(
 
 
 def test_unknown_usage_is_not_zero(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
-    """Absent artifacts leave both provider totals explicitly incomplete."""
-    # Report costs from an empty artifact directory.
+    """Attempted calls with unavailable usage leave totals explicitly incomplete."""
+    # Mark attempted calls whose usage could not be retrieved.
+    for role in ("claude", "openai"):
+        (tmp_path / f"{role}.usage.json").write_text("null")
     print_costs(tmp_path)
     output = capsys.readouterr().out
     # Require both provider subtotals to disclose unavailable usage.
@@ -138,3 +140,12 @@ def test_unknown_usage_is_not_zero(tmp_path: Path, capsys: pytest.CaptureFixture
 def test_cache_counts_use_separate_prices() -> None:
     """1M fresh, 1M cached and 1M writes cost $9.20 for Opus, without output."""
     assert Usage(input=1000000, output=0, cached=1000000, cache_write=1000000).cost("claude") == 9.2
+
+
+def test_unattempted_calls_cost_zero(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """A stage never attempted in the job does not make its cost unknown."""
+    print_costs(tmp_path)
+    output = capsys.readouterr().out
+    assert "consolidate: not run ($0)" in output
+    assert "Estimated API total: $0.0000\n" in output
+    assert "unknown" not in output

@@ -109,7 +109,7 @@ Preserve disagreements explicitly in the summary. Do not mention pricing.
             instructions=instructions,
             input=payload,
             reasoning={"effort": "medium"},
-            text_format=Review,
+            text_format=schema,
             max_output_tokens=16000,
             store=False,
             service_tier="default",
@@ -162,7 +162,7 @@ def print_costs(directory: Path) -> None:
 
     Args:
         directory: Job artifact directory containing optional role.usage.json files.
-            Missing files and JSON null mark usage unknown, rather than free.
+            Missing files mean not attempted; JSON null marks attempted usage unknown.
 
     Raises:
         OSError: An existing usage artifact cannot be read.
@@ -175,7 +175,10 @@ def print_costs(directory: Path) -> None:
     for role in MODELS:
         provider = "OpenAI" if role == "openai" else "Claude"
         path = directory / f"{role}.usage.json"
-        data = json.loads(path.read_text()) if path.exists() else None
+        if not path.exists():
+            print(f"{role}: not run ($0)")
+            continue
+        data = json.loads(path.read_text())
         # Missing usage and reported usage require different accounting paths.
         if data is None:
             unknown.add(provider)

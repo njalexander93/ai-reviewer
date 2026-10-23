@@ -6,7 +6,9 @@ fixed GitHub API host; untrusted paths are encoded, not interpolated as URLs.
 
 import base64
 import re
-from difflib import unified_diff
+import subprocess
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import httpx
@@ -216,15 +218,60 @@ def rebuild_patch(before: str, after: str) -> str:
     Returns:
         Unified diff with explicit markers for unterminated lines. Unicode
         separators and carriage returns remain content rather than line boundaries.
+
+    Raises:
+        RuntimeError: Git fails to produce the diff.
+        OSError: Temporary files or the Git executable are unavailable.
+        subprocess.TimeoutExpired: Git exceeds the 30-second limit.
     """
-    # Keep each LF attached so a final-newline-only change remains observable.
-    old = re.findall(r"[^\n]*\n|[^\n]+$", before)
-    new = re.findall(r"[^\n]*\n|[^\n]+$", after)
-    # Separate unterminated diff records with Git's no-final-newline marker.
-    return "".join(
-        line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
-        for line in unified_diff(old, new)
-    )
+    # Diff inert temporary blobs; disable external diff drivers and text conversion.
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "before").write_bytes(before.encode("utf-8"))
+        (root / "after").write_bytes(after.encode("utf-8"))
+        result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--no-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--text",
+                "--no-color",
+                "--diff-algorithm=myers",
+                "--no-indent-heuristic",
+                "--unified=3",
+                "--",
+                "before",
+                "after",
+            ],
+            cwd=root,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        # Git uses exit 1 for a successful diff containing changes.
+        if result.returncode not in (0, 1):
+            raise RuntimeError("Git could not reconstruct the patch")
+        return result.stdout.decode("utf-8")
+
+
+def validate_anchors(context: ReviewContext, reviews: list[Review]) -> None:
+    """Reject invalid model locations before purchasing consolidation.
+
+    Args:
+        context: Immutable changed-file packet supplied to both reviewers.
+        reviews: Independent reports with locations to validate.
+
+    Raises:
+        ValueError: A finding is outside the captured diff. Reports remain on disk
+            for diagnosis; this fails the run rather than silently dropping findings.
+    """
+    anchors = {file.filename: diff_lines(file.patch) for file in context.files}
+    for review in reviews:
+        for finding in review.findings:
+            if (finding.side, finding.line) not in anchors.get(finding.path, set()):
+                raise ValueError("Finding is outside the captured diff")
 
 
 def prepare(gh: GitHub, repo: str, number: int, reviewer: str) -> ReviewContext:

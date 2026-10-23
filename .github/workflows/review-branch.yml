@@ -8,11 +8,13 @@ permissions:
   pull-requests: write
 jobs:
   review:
-    # Only the explicitly selected, same-repository implementation branch may use secrets.
+    # Bootstrap only against the initial main commit; merging makes this job ineligible.
+    # Restrict candidate execution to this explicitly authorized same-repository branch.
     if: >-
       !github.event.pull_request.draft &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'feat/automated-pr-review'
+      github.event.pull_request.head.ref == 'feat/automated-pr-review' &&
+      github.event.pull_request.base.sha == '01a7a031a2762b35bcbec7c0280ed1a60eee3469'
     # Local reusable workflows come from this caller's commit, including the PR merge ref.
     uses: ./.github/workflows/review.yml
     with:
