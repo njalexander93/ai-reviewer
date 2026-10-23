@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ai_reviewer.contracts import Consolidation, Review, reconcile
@@ -25,7 +26,8 @@ def main() -> None:
     # Select one workflow stage and its shared artifact directory.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "stage", choices=["prepare", "claude", "openai", "consolidate", "publish", "costs"]
+        "stage",
+        choices=["prepare", "review", "claude", "openai", "consolidate", "publish", "costs"],
     )
     parser.add_argument("--directory", type=Path, default=Path("results"))
     args = parser.parse_args()
@@ -51,6 +53,17 @@ def main() -> None:
             )
             # Persist the collected packet for both independent reviewers.
             context_path.write_text(json.dumps(context))
+        # Start both paid calls before waiting; a failure still waits for the other usage record.
+        elif args.stage == "review":
+            payload = context_path.read_text()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    pool.submit(call_model, role, payload, directory)
+                    for role in ("claude", "openai")
+                ]
+                # Propagate failures only after the executor has allowed both calls to finish.
+                for future in futures:
+                    future.result()
         # Independent reviewers read the same packet without seeing each other.
         elif args.stage in ("claude", "openai"):
             call_model(args.stage, context_path.read_text(), directory)

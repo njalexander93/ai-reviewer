@@ -3,6 +3,7 @@
 import json
 import sys
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -47,7 +48,7 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
 
     # Run the real stage dispatcher with only external boundaries replaced.
     monkeypatch.setattr(cli, "call_model", model)
-    for stage in ["prepare", "claude", "openai", "consolidate", "publish", "costs"]:
+    for stage in ["prepare", "review", "consolidate", "publish", "costs"]:
         monkeypatch.setattr(sys, "argv", ["review", stage, "--directory", str(tmp_path)])
         cli.main()
     # Verify identical reviewer input, the published verdict and log-only accounting.
@@ -87,3 +88,45 @@ def test_incomplete_report_blocks_later_stages(
     assert error.value.code == 1
     assert "secret-content" not in capsys.readouterr().out
     assert not (tmp_path / "consolidate.json").exists()
+
+
+@pytest.mark.parametrize("failed_role", [None, "claude", "openai"])
+def test_parallel_review_waits_for_both_calls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failed_role: str | None
+) -> None:
+    """Both calls start concurrently and finish recording usage even if one fails."""
+    # Neither fake call can finish unless the other starts, exposing serial execution.
+    started = Barrier(2, timeout=5)
+    (tmp_path / "context.json").write_text("shared context")
+
+    def model(role: str, payload: str, directory: Path) -> None:
+        """Synchronize provider calls and record completion before a selected failure.
+
+        Args:
+            role: Provider under test; selects its independent usage artifact.
+            payload: Context text shared by both concurrent calls.
+            directory: Isolated artifact directory.
+
+        Raises:
+            RuntimeError: The selected provider fails after recording usage.
+        """
+        # Require overlap rather than inferring parallelism from execution duration.
+        assert payload == "shared context"
+        started.wait()
+        # Keep the usage evidence observable even when this provider reports failure.
+        (directory / f"{role}.usage.json").write_text("recorded")
+        if role == failed_role:
+            raise RuntimeError("synthetic provider failure")
+
+    # Exercise the real CLI dispatcher with the paid boundary replaced.
+    monkeypatch.setattr(cli, "call_model", model)
+    monkeypatch.setattr(sys, "argv", ["reviewer", "review", "--directory", str(tmp_path)])
+    if failed_role:
+        with pytest.raises(SystemExit) as error:
+            cli.main()
+        assert error.value.code == 1
+    else:
+        cli.main()
+    # Returning from the stage must mean both calls have finished, including failure paths.
+    for role in ("claude", "openai"):
+        assert (tmp_path / f"{role}.usage.json").read_text() == "recorded"

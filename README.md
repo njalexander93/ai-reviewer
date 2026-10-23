@@ -38,7 +38,7 @@ flowchart LR
 4. Enable **dismiss stale pull request approvals when new commits are pushed**
    in the target's branch protection or ruleset. Keep existing tests and required
    human reviews. This automation does not configure merge rules.
-5. Open or update a non-draft PR. Check the workflow's `costs` job for usage.
+5. Open or update a non-draft PR. Check the workflow's **Report API costs** step for usage.
    An existing PR needs an update or manual workflow dispatch after installation.
 
 The shared workflow runs **inside the calling repository's Actions run**. It uses
@@ -96,8 +96,10 @@ even when publication detects an existing review.
 
 The workflow checks out only its pinned reviewer implementation. It reads PR
 content through GitHub's API and never executes PR code, installs its packages,
-or exposes shell tools to models. Provider jobs receive only their API key;
-only preparation and publication receive the reviewer credential.
+or exposes shell tools to models. One job performs setup once and runs both independent reviews concurrently in a
+single step. Both provider API keys are available to that step; only preparation
+and publication receive the reviewer credential. All stages share the runner and
+workspace, so step-scoped environment variables are not a sandbox boundary.
 
 **This is a bounded static review, not a replacement for the interactive agents.**
 It cannot inspect unchanged dependencies, run tests, browse links or verify an
@@ -123,7 +125,7 @@ secrets. The CLI deliberately suppresses provider exception bodies.
 
 ## Cost reporting
 
-The final `costs` job prints Opus, Sol and Sonnet estimates, Claude/OpenAI
+The final **Report API costs** step prints Opus, Sol and Sonnet estimates, Claude/OpenAI
 subtotals and a combined total. It runs after success or failure. Missing usage
 is **unknown**, never silently counted as free. Review comments contain no cost
 accounting.
