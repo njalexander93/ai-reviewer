@@ -31,9 +31,9 @@ flowchart LR
    | `AI_REVIEWER_TOKEN` | Reviewer's GitHub personal access token |
 
 3. Copy [the caller workflow](examples/ai-review.yml) into the target repository
-   as `.github/workflows/ai-review.yml`. Replace both `REVIEWER_COMMIT_SHA` values
-   with the same reviewed, full commit SHA from this repository. Merge the caller
-   into the target's default branch.
+   as `.github/workflows/ai-review.yml`. It pins the initial implementation.
+   For upgrades, change both commit pins to the same reviewed, full commit SHA.
+   Merge the caller into the target's default branch.
 4. Enable **dismiss stale pull request approvals when new commits are pushed**
    in the target's branch protection or ruleset. Keep existing tests and required
    human reviews. This automation does not configure merge rules.
