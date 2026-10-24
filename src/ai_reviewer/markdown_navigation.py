@@ -42,6 +42,7 @@ def section_index(filename: str, text: str) -> dict[str, Any]:
             ):
                 fence = ""
             continue
+        # Comments suppress fence syntax; a top-level fence can interrupt skipped blocks.
         if comment:
             comment = "-->" not in line
             continue

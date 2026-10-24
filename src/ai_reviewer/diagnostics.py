@@ -19,15 +19,14 @@ class UnresolvedEvidence(ValueError):
 
     Attributes:
         attempts: Parsed and anchor-validated report count, including this response.
-        reason: Fixed subclass-owned reason code, never provider text.
+        reason: Required internal reason code, never provider text.
     """
 
-    reason: str
-
-    def __init__(self, attempts: int, message: str) -> None:
-        """Retain the attempt count and an internal exception message."""
+    def __init__(self, attempts: int, message: str, reason: str) -> None:
+        """Retain the attempt count, internal message and required safe reason code."""
         super().__init__(message)
         self.attempts = attempts
+        self.reason = reason
 
     def details(self) -> dict[str, Any]:
         """Return source-free failure metadata for logs and artifacts."""
@@ -41,12 +40,12 @@ class IncompleteWithoutRequests(UnresolvedEvidence):
         attempts: Parsed and anchor-validated report count, including this response.
     """
 
-    reason = "missing_source_requests"
-
     def __init__(self, attempts: int) -> None:
         """Retain the attempt count without copying untrusted provider prose."""
         super().__init__(
-            attempts, "Required evidence unresolved: incomplete response has no source requests"
+            attempts,
+            "Required evidence unresolved: incomplete response has no source requests",
+            "missing_source_requests",
         )
 
 
@@ -59,15 +58,13 @@ class FollowupExhausted(UnresolvedEvidence):
         request_count: Full outstanding count, before diagnostic truncation.
     """
 
-    reason = "followup_budget_exhausted"
-
     def __init__(self, attempts: int, requests: list[SourceRequest], paths: set[str]) -> None:
         """Retain at most 20 requests, accepting paths only from the captured snapshot.
 
         Long paths are truncated to 240 characters. Unknown paths are redacted.
         Requests and paths are read without mutation; no source is fetched.
         """
-        super().__init__(attempts, "Required follow-up work exhausted")
+        super().__init__(attempts, "Required follow-up work exhausted", "followup_budget_exhausted")
         self.request_count = len(requests)
         self.requests = [
             {
