@@ -2,7 +2,7 @@
 
 import pytest
 
-from ai_reviewer.chunking import plan
+from ai_reviewer.chunking import file_declarations, plan
 from ai_reviewer.contracts import ChangedFile
 from tests.test_github import Server, bundle
 
@@ -79,7 +79,7 @@ def test_fragments_keep_unicode_newlines_modes_and_absolute_coordinates() -> Non
         before_mode="100644",
         after_mode="100755",
     )
-    split = units(file)
+    split = units(file, file_declarations(file))
     assert len(split) > 1
     assert "".join(u.patch for u in split) == file.patch
     for unit in split:
@@ -136,7 +136,7 @@ def test_large_mode_change_preserves_complete_source() -> None:
         after_mode="100755",
     )
     # Split patchless evidence without losing either version or reusing unit IDs.
-    split = units(file)
+    split = units(file, file_declarations(file))
     assert len(split) > 1
     assert len({u.id for u in split}) == len(split)
     assert "".join(u.before for u in split) == content
@@ -161,7 +161,7 @@ def test_single_oversized_physical_line_fails_explicitly() -> None:
     )
     # Require explicit rejection rather than slicing away an indivisible line.
     with pytest.raises(ValueError, match="Indivisible"):
-        units(file)
+        units(file, file_declarations(file))
 
 
 @pytest.mark.parametrize(
@@ -259,7 +259,7 @@ def test_direct_reference_outside_changed_hunk_remains_in_integration() -> None:
         after_mode="100644",
     )
     context.files = [main, helper]
-    split = units(main)
+    split = units(main, file_declarations(main))
     assert all("helpers.target" not in u.after for u in split)
     links = direct_relations(context)
     assert links[relation_key(main.filename, helper.filename)][0].start == 1
@@ -270,7 +270,7 @@ def test_direct_reference_outside_changed_hunk_remains_in_integration() -> None:
         update={
             "chunks": [
                 Chunk(id="chunk-0000", units=split),
-                Chunk(id="chunk-0001", units=units(helper)),
+                Chunk(id="chunk-0001", units=units(helper, file_declarations(helper))),
             ]
         }
     )
@@ -402,7 +402,7 @@ def test_incremental_packet_sizes_match_serialized_unicode_and_shared_comments()
     ]
     # Compare independent full serialization with incremental admission and duplicate admission.
     metadata = packet_metadata(context)
-    evidence = [u for f in context.files for u in units(f)]
+    evidence = [u for f in context.files for u in units(f, file_declarations(f))]
     sizer = PacketSizer(metadata, evidence)
     budget = sizer.budget("chunk-0000")
     chunk = Chunk(id="chunk-0000", units=[])
@@ -498,7 +498,6 @@ def test_large_navigation_is_bounded_without_losing_patch_coverage(description_s
     planned = plan(context, packet_bytes=CAPACITY_PACKET_BYTES)
     inventory = planned.metadata.overview["inventory"]
     assert planned.metadata.overview["declaration_navigation"] == "truncated"
-    assert planned.metadata.declaration_ranges["many.py"][1][-1] == (3000, 3000)
     assert len(encode(inventory[0]["declarations"]).encode()) < 16_000
     assert "".join(u.patch for c in planned.chunks for u in c.units) == context.files[0].patch
     assert all(
@@ -540,5 +539,31 @@ def test_plan_reuses_discovery_for_splitting_and_packet_builders(
     planned = plan(context, packet_bytes=CAPACITY_PACKET_BYTES)
     payloads = [c.payload(planned.metadata) for c in planned.chunks]
     assert parsed == ["", source]
-    assert planned.metadata.declaration_ranges["app.py"] == ([], [(1, 3)])
     assert '"name":"handle","start":1,"end":3' in payloads[0]
+
+
+def test_navigation_projection_does_not_mutate_captured_metadata() -> None:
+    """Small and full projections remain independent of call order and shared sizers."""
+    from copy import deepcopy
+
+    from ai_reviewer.chunking import bound_navigation
+
+    captured = {
+        "inventory": [
+            {
+                "filename": "app.py",
+                "declarations": {
+                    "RIGHT": {
+                        "status": "indexed",
+                        "entries": [{"name": "handle", "start": 1, "end": 3}],
+                    }
+                },
+            }
+        ]
+    }
+    original = deepcopy(captured)
+    omitted = bound_navigation(captured, 0)
+    full = bound_navigation(captured, 16000)
+    assert captured == original
+    assert omitted == {"inventory": [{"filename": "app.py"}], "declaration_navigation": "truncated"}
+    assert full == {**original, "declaration_navigation": "complete"}

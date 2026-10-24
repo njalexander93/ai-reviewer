@@ -20,7 +20,7 @@ from ai_reviewer.chunking import (
     PacketSizer,
     Plan,
     Unit,
-    bound_navigation,
+    omit_navigation,
     plan,
 )
 from ai_reviewer.contracts import (
@@ -441,7 +441,7 @@ def integration_pages(assignment: Assignment, packet_bytes: int) -> list[Assignm
     base = json.loads(assignment.payload)
     # Navigation must yield to source and reports before creating more required work.
     if "overview" in base:
-        bound_navigation(base["overview"], 0)
+        base["overview"] = omit_navigation(base["overview"])
     serialized = encode(base)
     if len(serialized.encode()) <= packet_bytes:
         return [assignment.model_copy(update={"payload": serialized})]
@@ -532,7 +532,7 @@ def followup_payload(
     # Prefer all requested evidence over advisory navigation on a full continuation.
     serialized = encode(payload)
     if len(serialized.encode()) > packet_bytes and "overview" in payload:
-        bound_navigation(payload["overview"], 0)
+        payload["overview"] = omit_navigation(payload["overview"])
         serialized = encode(payload)
     # Reject the entire continuation if required evidence still cannot fit.
     if len(serialized.encode()) > packet_bytes:

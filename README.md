@@ -219,7 +219,8 @@ Navigation fields are capped at 16,000 UTF-8 bytes across the inventory and trim
 further when needed to fit a required source unit. Oversized integration and follow-up
 packets omit navigation before paging reports or rejecting required evidence.
 `declaration_navigation: truncated` means entries or entire file indexes were omitted; absence is not evidence that a
-function does not exist. Complete splitting ranges remain cached separately.
+function does not exist. Unit splitting consumes complete discovery before navigation
+is projected. Projections return new metadata; packet sizers retain unchanged inputs.
 Discovery never executes source and does not replace reading it. Unsupported languages, malformed Python and
 bare-CR line endings have explicit unavailable statuses; ordinary source requests
 still work. Whole-context payload bytes remain unchanged. Index bytes count toward
