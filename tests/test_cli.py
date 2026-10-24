@@ -12,6 +12,13 @@ from ai_reviewer.contracts import ChunkReview, Consolidation
 from tests.test_github import Server, bundle
 
 
+@pytest.fixture(autouse=True)
+def configured_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep existing dual-provider fixtures independent of developer credentials."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-anthropic")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
+
+
 def test_pipeline_posts_one_clean_review_and_logs_costs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
@@ -56,7 +63,7 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
         payloads[role] = json.loads(payload)
         report = (
             Consolidation(summary="Both reviewers found no blockers.", groups=[])
-            if role == "consolidate"
+            if role in ("haiku", "luna")
             else ChunkReview(complete=True, summary=f"{role} completed", findings=[], requests=[])
         )
         # Match the artifact interface consumed by the next real CLI stage.
@@ -71,7 +78,7 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     assert payloads["claude"] == payloads["openai"]
     assert payloads["claude"]["head"] == "a" * 40
     assert payloads["claude"]["issues"][0]["description"] == "Retain prior edits."
-    assert payloads["consolidate"]["reviews"][:2] == [
+    assert payloads["haiku"]["reviews"][:2] == [
         "claude completed",
         "openai completed",
     ]

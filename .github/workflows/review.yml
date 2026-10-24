@@ -14,9 +14,9 @@ on:
         default: njalexander93/ai-reviewer
     secrets:
       ANTHROPIC_API_KEY:
-        required: true
+        required: false
       OPENAI_API_KEY:
-        required: true
+        required: false
       AI_REVIEWER_TOKEN:
         required: true
       LINEAR_API_KEY:
@@ -56,15 +56,16 @@ jobs:
           AI_REVIEWER_TOKEN: ${{ secrets.AI_REVIEWER_TOKEN }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           PR_NUMBER: ${{ inputs.pr-number }}
-      - name: Review with Claude and OpenAI in parallel
+      - name: Review with configured providers
         run: poetry run python -m ai_reviewer.cli review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      - name: Consolidate with Sonnet
+      - name: Consolidate with Haiku or Luna
         run: poetry run python -m ai_reviewer.cli consolidate
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       - name: Publish GitHub review
         run: poetry run python -m ai_reviewer.cli publish
         env:

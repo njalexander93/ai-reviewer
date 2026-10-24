@@ -11,7 +11,7 @@ from ai_reviewer.contracts import (
 )
 from ai_reviewer.diagnostics import report_failure
 from ai_reviewer.github import GitHub, publish
-from ai_reviewer.models import print_costs
+from ai_reviewer.models import ConfigurationError, print_costs
 from ai_reviewer.work import consolidate_chunks, load_reviews, review_chunks
 
 
@@ -56,7 +56,7 @@ def main() -> None:
                 identity,
                 linear_token=os.environ.get("LINEAR_API_KEY"),
             )
-            # Persist the collected packet for both independent reviewers.
+            # Persist the collected packet for the enabled independent reviewers.
             context_path.write_text(context.model_dump_json())
         else:
             context = ReviewContext.model_validate_json(context_path.read_text())
@@ -75,6 +75,8 @@ def main() -> None:
                 )
     except Exception as error:
         # Keep stage failures diagnosable without printing arbitrary exception text.
+        if isinstance(error, ConfigurationError):
+            print("Configure at least one nonempty ANTHROPIC_API_KEY or OPENAI_API_KEY.")
         report_failure(error, directory / f"{args.stage}.error.json", stage=args.stage)
         raise SystemExit(1) from None
 

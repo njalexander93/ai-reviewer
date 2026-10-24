@@ -23,6 +23,13 @@ from ai_reviewer.github import publish
 from tests.test_github import Server, bundle
 
 
+@pytest.fixture(autouse=True)
+def configured_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep existing dual-provider fixtures independent of developer credentials."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-anthropic")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
+
+
 def large_context() -> ReviewContext:
     """Return an isolated synthetic snapshot that exceeds the whole-packet ceiling.
 
@@ -70,7 +77,7 @@ def fake_model(
             summary="Assessments agree.",
             groups=[Group(source_ids=[key]) for key in data.get("sources", {})],
         )
-        if role == "consolidate"
+        if role in ("haiku", "luna")
         else ChunkReview(
             complete=True, summary="Reviewed actual supplied source.", findings=[], requests=[]
         )
@@ -634,7 +641,7 @@ def test_capacity_fallback_bounds_integration_and_followup_payloads(
 def test_small_review_consolidates_once_with_original_assessments(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A small complete review includes both independent summaries in its one Sonnet call."""
+    """A small complete review includes both independent summaries in its one Haiku call."""
     context, _, _ = bundle(Server())
     calls = []
 
@@ -644,7 +651,7 @@ def test_small_review_consolidates_once_with_original_assessments(
         Role/payload/directory and kwargs follow fake_model's contract. The calls list
         changes only for consolidation; artifact creation and preflight behavior remain shared.
         """
-        if role == "consolidate":
+        if role in ("haiku", "luna"):
             calls.append(json.loads(payload))
         fake_model(role, payload, directory, **kwargs)
 

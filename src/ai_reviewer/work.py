@@ -1,8 +1,9 @@
 """Execute and validate bounded chunk, follow-up and integration work in one job.
 
 Every provider attempt has an isolated artifact directory. The manifest records
-planned work before calls start; downstream stages replay the plan and source
-requests against the captured snapshot before accepting any completed report.
+the enabled providers and planned work before generation starts. Downstream stages
+replay the plan and source requests against the captured snapshot before accepting
+any completed report.
 Pure integration planning also lives here; only execution/consolidation call models.
 No repository code runs. Failures preserve evidence but prevent partial approval.
 """
@@ -52,13 +53,21 @@ from ai_reviewer.limits import (
     MAX_WORK,
     SUMMARY_PAGE_SIZE,
 )
-from ai_reviewer.models import AssignmentKind, CapacityError, Role, call_model
+from ai_reviewer.models import (
+    AssignmentKind,
+    CapacityError,
+    Provider,
+    Providers,
+    Role,
+    call_model,
+    configured_providers,
+)
 from ai_reviewer.patch import lines
 from ai_reviewer.serialization import digest, encode
 
 
 class Assignment(Contract):
-    """Bind one whole, local or integration scope to both required reviewers.
+    """Bind one whole, local or integration scope to the enabled reviewers.
 
     Attributes:
         id: Internally generated identifier used in artifact paths.
@@ -115,7 +124,7 @@ class Completion(Contract):
     """
 
     assignment: str
-    role: Literal["claude", "openai"]
+    role: Provider
     status: Literal["pending", "complete", "failed"] = "pending"
     attempts: int = Field(default=0, ge=0, le=MAX_ATTEMPTS)
 
@@ -124,12 +133,14 @@ class Manifest(Contract):
     """Persist required work and results for deterministic coverage replay.
 
     Attributes:
-        plan_digest: Hash of the complete serialized plan, including its snapshot.
+        providers: Required reviewers resolved once before preflight, never from artifacts.
+        plan_digest: Hash binding the complete plan and enabled provider set.
         packet_bytes: Selected UTF-8 ceiling needed to reconstruct that plan.
         assignments: Ordered, digest-only records appended before each batch starts.
         results: One mutable completion per assignment/provider, owned by the coordinator.
     """
 
+    providers: Providers
     plan_digest: str
     packet_bytes: int
     assignments: list[AssignmentRecord]
@@ -145,7 +156,7 @@ def local_assignments(context: ReviewContext, planned: Plan) -> list[Assignment]
 
     Returns:
         One whole assignment with byte-identical input, or ordered local assignments.
-        Each assignment requires both providers; this function performs no I/O.
+        Each assignment requires every enabled provider; this function performs no I/O.
     """
     # Preserve small-input bytes while using the same downstream work protocol.
     if planned.whole is not None:
@@ -187,7 +198,10 @@ def report_atoms(assignment: str, provider: str, report: Review) -> list[dict[st
 
 
 def integration_assignments(
-    context: ReviewContext, planned: Plan, local: dict[tuple[str, str], Review]
+    context: ReviewContext,
+    planned: Plan,
+    local: dict[tuple[str, str], Review],
+    providers: Providers = ("claude", "openai"),
 ) -> list[Assignment]:
     """Plan actual-source checks across visible relationships and every local scope.
 
@@ -197,6 +211,7 @@ def integration_assignments(
     Args:
         context: Immutable snapshot supplying captured reference source.
         planned: Matching local plan, metadata, relationships and packet ceiling.
+        providers: Canonical required reviewer set, matching the run manifest.
         local: Completed reports keyed by every (chunk ID, provider) pair.
 
     Returns:
@@ -214,7 +229,7 @@ def integration_assignments(
     report_data = {
         (chunk.id, role): report_atoms(chunk.id, role, local[(chunk.id, role)])
         for chunk in planned.chunks
-        for role in ("claude", "openai")
+        for role in providers
     }
     assignments = []
     links = {(r.left, r.right): r.evidence for r in planned.relations}
@@ -252,13 +267,11 @@ def integration_assignments(
         paths = {u.filename for u in scope}
         return [reference_data[key] for key in sorted(reference_keys(paths, paths))]
 
-    # Each chunk rechecks integration using actual local source and both reports.
+    # Each chunk rechecks integration using actual local source and all enabled reports.
     for i, chunk in enumerate(planned.chunks):
         payload = json.loads(chunk.payload(planned.metadata))
         payload["phase"] = "integration: assess PR-wide compatibility; request missing source"
-        payload["reports"] = [
-            atom for role in ("claude", "openai") for atom in report_data[(chunk.id, role)]
-        ]
+        payload["reports"] = [atom for role in providers for atom in report_data[(chunk.id, role)]]
         payload["reference_source"] = reference_source(chunk.units)
         assignments.append(
             Assignment(
@@ -281,7 +294,7 @@ def integration_assignments(
             "reports": {
                 f"{i}:{role}:{j}": atom
                 for i, chunk in enumerate(planned.chunks)
-                for role in ("claude", "openai")
+                for role in providers
                 for j, atom in enumerate(report_data[(chunk.id, role)])
             },
         },
@@ -303,7 +316,7 @@ def integration_assignments(
             "reports": {
                 f"{ownership[u.id]}:{role}:{j}"
                 for u in scope
-                for role in ("claude", "openai")
+                for role in providers
                 for j in range(len(report_data[(planned.chunks[ownership[u.id]].id, role)]))
             },
         }
@@ -322,7 +335,7 @@ def integration_assignments(
         payload["reports"] = [
             atom
             for k in owners
-            for role in ("claude", "openai")
+            for role in providers
             for atom in report_data[(planned.chunks[k].id, role)]
         ]
         return Assignment(
@@ -426,7 +439,7 @@ def integration_pages(assignment: Assignment, packet_bytes: int) -> list[Assignm
 
     Returns:
         The original assignment if it fits, otherwise ordered page-suffixed assignments
-        with identical owned sections. Every page requires both providers.
+        with identical owned sections. Every page requires every enabled provider.
 
     Raises:
         ValueError: Invalid JSON or source plus one indivisible atom exceeds the ceiling.
@@ -654,7 +667,7 @@ def run_batch(
     anchors: AnchorIndex,
     packet_bytes: int,
 ) -> None:
-    """Run both providers with two workers and persist every terminal result.
+    """Run enabled providers with two workers and persist every terminal result.
 
     Args:
         context: Immutable snapshot shared by all workers.
@@ -677,7 +690,7 @@ def run_batch(
         raise ValueError("Total review work budget exceeded")
     manifest.assignments.extend(assignment_record(a) for a in assignments)
     completions = [
-        Completion(assignment=a.id, role=role) for a in assignments for role in ("claude", "openai")
+        Completion(assignment=a.id, role=role) for a in assignments for role in manifest.providers
     ]
     manifest.results.extend(completions)
     save_manifest(directory, manifest)
@@ -746,7 +759,7 @@ def read_batch(
     # Require one successful completion for each planned assignment/provider identity.
     reports: dict[tuple[str, str], Review] = {}
     for assignment in assignments:
-        for role in ("claude", "openai"):
+        for role in manifest.providers:
             matches = [
                 r for r in manifest.results if r.assignment == assignment.id and r.role == role
             ]
@@ -783,10 +796,11 @@ def read_batch(
     return reports
 
 
-def preflight(context: ReviewContext, planned: Plan, directory: Path) -> None:
-    """Count both providers on every local scope before purchasing any review.
+def preflight(context: ReviewContext, planned: Plan, directory: Path, providers: Providers) -> None:
+    """Count enabled providers on every local scope before purchasing any review.
 
     Args:
+        providers: Required reviewer set resolved before any provider calls.
         context: Snapshot that produced planned.
         planned: Candidate plan whose initial inputs will be counted serially.
         directory: Run root; provider setup uses preflight/assignment-ID directories.
@@ -797,9 +811,9 @@ def preflight(context: ReviewContext, planned: Plan, directory: Path) -> None:
 
     call_model may write diagnostic artifacts on failure, including capacity rejection.
     """
-    # Count both independent formats before any initial review is generated.
+    # Count every enabled provider format before any initial review is generated.
     for assignment in local_assignments(context, planned):
-        for role in ("claude", "openai"):
+        for role in providers:
             call_model(
                 role,
                 assignment.payload,
@@ -821,22 +835,25 @@ def review_chunks(context: ReviewContext, directory: Path) -> None:
             cannot complete. Capacity overflow selects one smaller plan before retrying.
         Exception: Unhandled provider or filesystem errors propagate to the CLI.
 
-    Writes the manifest and all attempt artifacts. Preflight, both local providers,
+    Writes the manifest and all attempt artifacts. Preflight, enabled local providers,
     local replay, integration execution and integration replay run in that order.
     """
     # Reject reused workspaces instead of mixing attempts and their cost accounting.
     if (directory / "manifest.json").exists() or (directory / "work").exists():
         raise ValueError("Review run requires a fresh artifact directory")
+    # Resolve credentials once; failed configured providers never become disabled.
+    providers = configured_providers()
     # Select a capacity policy before committing work to a manifest.
     planned = plan(context)
     try:
-        preflight(context, planned, directory)
+        preflight(context, planned, directory, providers)
     except CapacityError:
         planned = plan(context, packet_bytes=CAPACITY_PACKET_BYTES)
-        preflight(context, planned, directory)
+        preflight(context, planned, directory, providers)
     # Bind required work to the chosen plan and compile shared coordinates once.
     manifest = Manifest(
-        plan_digest=digest(planned.model_dump_json()),
+        providers=providers,
+        plan_digest=digest(encode({"plan": planned.model_dump(), "providers": providers})),
         packet_bytes=planned.packet_bytes,
         assignments=[],
         results=[],
@@ -846,7 +863,7 @@ def review_chunks(context: ReviewContext, directory: Path) -> None:
     local = local_assignments(context, planned)
     run_batch(context, manifest, local, directory, anchors, planned.packet_bytes)
     reports = read_batch(context, local, manifest, directory, anchors, planned.packet_bytes)
-    integration = integration_assignments(context, planned, reports)
+    integration = integration_assignments(context, planned, reports, manifest.providers)
     run_batch(context, manifest, integration, directory, anchors, planned.packet_bytes)
     read_batch(context, integration, manifest, directory, anchors, planned.packet_bytes)
 
@@ -872,15 +889,17 @@ def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
     # Rebuild the plan from persisted policy and require its exact snapshot binding.
     manifest = Manifest.model_validate_json((directory / "manifest.json").read_text())
     planned = plan(context, packet_bytes=manifest.packet_bytes)
-    if manifest.plan_digest != digest(planned.model_dump_json()):
+    if manifest.plan_digest != digest(
+        encode({"plan": planned.model_dump(), "providers": manifest.providers})
+    ):
         raise ValueError("Coverage plan does not match the captured snapshot")
     anchors = compile_anchors(context)
     local = local_assignments(context, planned)
     reports = read_batch(context, local, manifest, directory, anchors, planned.packet_bytes)
-    integration = integration_assignments(context, planned, reports)
+    integration = integration_assignments(context, planned, reports, manifest.providers)
     # Compare exact ownership and provider keys, not a report-count approximation.
     expected = local + integration
-    keys = [(a.id, role) for a in expected for role in ("claude", "openai")]
+    keys = [(a.id, role) for a in expected for role in manifest.providers]
     actual = [(r.assignment, r.role) for r in manifest.results]
     if manifest.assignments != [assignment_record(a) for a in expected] or sorted(keys) != sorted(
         actual
@@ -901,17 +920,17 @@ def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
             )
             for assignment in local
             if assignment.kind == "whole"
-            for role in ("claude", "openai")
+            for role in manifest.providers
         ],
         summary=f"{len(local)} local scopes; {len(expected)} local/integration assignments "
-        f"completed by both providers. Snapshot `{planned.snapshot}`. "
+        f"completed by {', '.join(manifest.providers)}. Snapshot `{planned.snapshot}`. "
         "Exact section ownership and follow-up evidence are in the workflow coverage manifest. "
         "Completion does not establish model understanding.",
     )
 
 
 def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
-    """Group original findings and reduce assessments through bounded Sonnet calls.
+    """Group original findings and reduce assessments through bounded consolidator calls.
 
     Args:
         context: Snapshot used to validate coverage before any consolidation call.
@@ -919,7 +938,7 @@ def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
 
     Raises:
         ValueError: Coverage fails, prior consolidation artifacts exist, call budgets
-            are exhausted, or Sonnet drops, duplicates or invents source IDs.
+            are exhausted, or consolidator drops, duplicates or invents source IDs.
         Exception: Provider and filesystem failures propagate with available usage retained.
 
     Writes per-call artifacts, consolidate.json and coverage.txt. Cross-batch duplicate
@@ -930,6 +949,8 @@ def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
     if any((directory / name).exists() for name in ("consolidation", "consolidation-summaries")):
         raise ValueError("Consolidation requires fresh artifacts; earlier usage must be retained")
     covered = load_reviews(context, directory)
+    manifest = Manifest.model_validate_json((directory / "manifest.json").read_text())
+    consolidator: Role = "haiku" if "claude" in manifest.providers else "luna"
     reports = covered.reviews
     sources = source_findings(reports)
     items = list(sources.items())
@@ -960,8 +981,8 @@ def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
     for index, sources_batch in enumerate(batches):
         target = directory / "consolidation" / str(index)
         payload = combined if include_summaries else encode({"sources": sources_batch})
-        call_model("consolidate", payload, target)
-        result = Consolidation.model_validate_json((target / "consolidate.json").read_text())
+        call_model(consolidator, payload, target)
+        result = Consolidation.model_validate_json((target / f"{consolidator}.json").read_text())
         flattened = [key for group in result.groups for key in group.source_ids]
         if sorted(flattened) != sorted(sources_batch):
             raise ValueError("Consolidation lost or duplicated original findings")
@@ -978,11 +999,13 @@ def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
             if summary_calls > MAX_SUMMARY_CALLS:
                 raise ValueError("Summary work budget exceeded")
             call_model(
-                "consolidate",
+                consolidator,
                 encode({"sources": {}, "reviews": summaries[start : start + SUMMARY_PAGE_SIZE]}),
                 target,
             )
-            result = Consolidation.model_validate_json((target / "consolidate.json").read_text())
+            result = Consolidation.model_validate_json(
+                (target / f"{consolidator}.json").read_text()
+            )
             if result.groups:
                 raise ValueError("Summary pass invented findings")
             reduced.append(result.summary)
