@@ -35,7 +35,7 @@ def test_large_file_is_split_without_losing_changes() -> None:
     assert len(result.chunks) > 1
     units = [unit for chunk in result.chunks for unit in chunk.units]
     assert "".join(unit.patch for unit in units) == context.files[0].patch
-    assert all(len(chunk.payload(context).encode()) <= 600_000 for chunk in result.chunks)
+    assert all(len(chunk.payload(result.metadata).encode()) <= 600_000 for chunk in result.chunks)
 
 
 def test_metadata_overflow_is_not_silently_trimmed() -> None:
@@ -259,14 +259,21 @@ def test_direct_reference_outside_changed_hunk_remains_in_integration() -> None:
     links = direct_relations(context)
     assert links[relation_key(main.filename, helper.filename)][0].start == 1
     # Force the two known scopes apart to inspect their integration evidence.
-    from ai_reviewer.chunking import Chunk, Plan, digest
+    from ai_reviewer.chunking import Chunk
 
-    planned = Plan(
-        snapshot=digest(context.model_dump_json()),
-        whole=None,
-        chunks=[Chunk(id="chunk-0000", units=split), Chunk(id="chunk-0001", units=units(helper))],
+    planned = plan(context).model_copy(
+        update={
+            "chunks": [
+                Chunk(id="chunk-0000", units=split),
+                Chunk(id="chunk-0001", units=units(helper)),
+            ]
+        }
     )
-    reports = [Review(complete=True, summary="Local done", findings=[]) for _ in range(4)]
+    reports = {
+        (c.id, role): Review(complete=True, summary="Local done", findings=[])
+        for c in planned.chunks
+        for role in ("claude", "openai")
+    }
     edges = [
         a for a in integration_assignments(context, planned, reports) if a.id.startswith("edge-")
     ]
@@ -280,8 +287,57 @@ def test_direct_reference_outside_changed_hunk_remains_in_integration() -> None:
     # If packing co-locates the tail and helper, integration must still see the import.
     together = plan(context)
     assert len(together.chunks) == 1
-    same_chunk = integration_assignments(context, together, reports[:2])
+    same_chunk = integration_assignments(context, together, reports)
     actual = [
         section["text"] for a in same_chunk for section in json.loads(a.payload)["reference_source"]
     ]
     assert any("from helpers.target import call\n" in text for text in actual)
+
+
+def test_reference_index_retains_overlaps_renames_and_first_line_evidence() -> None:
+    """Literal path/module matches retain the first reference, even with shared suffixes."""
+    from ai_reviewer.chunking import direct_relations
+
+    context, _, _ = bundle(Server())
+    template = ChangedFile(
+        filename="unused",
+        previous_filename=None,
+        status="modified",
+        patch="",
+        before="",
+        after="",
+        before_mode="100644",
+        after_mode="100644",
+    )
+    context.files = [
+        template.model_copy(
+            update={
+                "filename": "src/caller.py",
+                "before": "prefix\nlib.target\n" + "padding\n" * 40 + "lib.target\n",
+                "after": "old/name.py\n" + "padding\n" * 40 + "lib.target\n",
+            }
+        ),
+        template.model_copy(
+            update={"filename": "lib/target.py", "previous_filename": "old/name.py"}
+        ),
+        template.model_copy(update={"filename": "target.py"}),
+        template.model_copy(update={"filename": "tests/test_target.py"}),
+        template.model_copy(update={"filename": "unrelated.py"}),
+    ]
+    links = direct_relations(context)
+    assert set(links) == {
+        ("lib/target.py", "src/caller.py"),
+        ("src/caller.py", "target.py"),
+        ("lib/target.py", "target.py"),
+        ("lib/target.py", "tests/test_target.py"),
+        ("target.py", "tests/test_target.py"),
+    }
+    evidence = links[("lib/target.py", "src/caller.py")]
+    assert [(e.path, e.side) for e in evidence] == [
+        ("src/caller.py", "LEFT"),
+        ("src/caller.py", "RIGHT"),
+    ]
+    assert evidence[0].start <= 2 <= evidence[0].end < 43
+    assert evidence[1].start <= 1 <= evidence[1].end < 42
+    context.files.reverse()
+    assert direct_relations(context) == links

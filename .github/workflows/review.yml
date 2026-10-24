@@ -32,6 +32,7 @@ jobs:
   review:
     name: AI review
     runs-on: ubuntu-latest
+    # Effective wall-clock ceiling; work maxima need not finish before cancellation.
     timeout-minutes: 180
     steps:
       - name: Validate implementation pin

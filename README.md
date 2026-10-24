@@ -56,26 +56,6 @@ and [stale approval dismissal](https://docs.github.com/en/repositories/configuri
 Private targets need a credential with access to them; a `public_repo` token is
 insufficient.
 
-## Test the implementation branch
-
-[Branch review test](.github/workflows/review-branch.yml) runs on non-draft PR
-updates from the same-repository `feat/automated-pr-review` branch. It calls the
-local reusable workflow and checks out the same PR merge commit, so both workflow
-logic and Python implementation come from the candidate revision. This exercises
-real provider calls, posts a real review and incurs API charges. Fork PRs and
-other branches do not qualify. The base must also equal the initial main commit
-`01a7a031a2762b35bcbec7c0280ed1a60eee3469`; once main advances, this bootstrap
-job is ineligible. It cannot duplicate the production caller after merge.
-The ordinary Checks workflow still runs separately.
-
-GitHub resolves [local reusable workflows from the caller's commit](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
-This bootstrap caller does not need to exist on `main` before its PR event runs.
-The immutable base gate permits the final candidate review without relying on
-a manual pre-merge deletion for safety. This repository's production
-caller uses its local reusable workflow and the same trusted commit for checkout.
-External repositories use the release-pinned installation template. Re-running a test can incur model costs
-even when publication detects an existing review.
-
 ## Review policy
 
 - Runs on PR opening, reopening, publication from draft, and new commits.
@@ -83,7 +63,8 @@ even when publication detects an existing review.
   **Run workflow** and enter the PR number. Draft, closed and reviewer-authored
   PRs are rejected. Requests serialize per repository and PR.
 - Small packets retain two independent whole-packet reviews with complete before/after
-  text. Larger snapshots use deterministic chunks and two reviews of every required
+  text. Both sizes use the same manifest, source validation and consolidation flow.
+  Larger snapshots use deterministic chunks and two reviews of every required
   local/integration assignment. Each packet includes PR metadata, the full issue
   requirements, a changed-file inventory and relevant previous inline discussion.
   Before versions come from the merge base, matching the PR diff.
@@ -179,7 +160,10 @@ replace the old 80-file and 150 KB per-version rejection.
    Python function/class boundaries, then diff sections, then physical patch
    lines. Other languages use diff boundaries. Retain original patch records,
    old/new cursors, source offsets, modes, renames and final-newline state.
-3. Pack direct references, source/test pairs and directory peers together using
+3. Compile the inventory and discussion index once per plan. Scan each captured
+   version with a shared literal-reference index, and join normalized source/test
+   names. Reuse this relationship evidence during packing and integration.
+   Pack direct references, source/test pairs and directory peers together using
    stable ordering. A unit is capped at 160,000 bytes so two actual source units
    can accompany reports during integration. Local packets target 420,000 bytes,
    leaving 180,000 bytes for required follow-ups under the 600,000-byte ceiling.
@@ -198,8 +182,10 @@ replace the old 80-file and 150 KB per-version rejection.
    integration assignments. This
    is a bounded heuristic, **not a complete dependency graph**. Models must request
    missing source and remain incomplete if the snapshot cannot answer.
-6. Recompute the plan and validate the coverage manifest before consolidation and
-   publication. Require both providers for all assignments and all follow-ups.
+6. Recompute the plan and validate the coverage manifest once before consolidation
+   and once before publication. The manifest stores assignment and plan hashes;
+   full payloads stay in attempt artifacts. Reports are keyed by assignment and
+   provider. Require both providers for all assignments and all follow-ups.
    Coverage proves assignment/completion; it does not prove model understanding.
 7. Sonnet groups up to 40 original findings per batch with global source IDs.
    All findings, locations and severity survive exactly once. Cross-batch duplicate
@@ -214,7 +200,12 @@ and [Sol 1.05M context](https://developers.openai.com/api/docs/models/gpt-6.1-so
 and stays below Sol's 272k long-context price threshold. Bytes are not converted
 into guessed tokens. See [Claude token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting)
 and [OpenAI token counting](https://developers.openai.com/api/docs/guides/token-counting).
-Counts are preflight estimates; provider rejection still fails closed.
+For a whole packet, count both provider inputs before either generates a report.
+If either exceeds capacity, re-plan into chunks targeting at most 200,000 bytes.
+Each resulting call still undergoes provider token counting; there is no byte/token
+conversion or guarantee that required metadata can fit. The fallback plan is bound
+to the manifest and replayed by downstream stages. Other provider failures remain
+failures, not partitioning signals.
 
 Operational defaults are deliberate finite safeguards, not performance optima:
 
@@ -234,7 +225,11 @@ one requires reviewing downstream bounds. The work limits are **not a dollar
 budget**. Large PRs can cost substantially more through repeated overview/source,
 follow-ups and integration. There is no promise that an accepted snapshot will
 finish: required evidence, output or total work may exceed a later bound, which
-blocks approval and retains available artifacts. A new chunked run needs a fresh
+blocks approval. The **180-minute job timeout is the effective wall-clock limit**;
+the assignment and per-call maxima cannot all be exhausted within it. Timeout may
+interrupt a stage. Cost reporting and artifact upload use `always()`, but their
+completion after job cancellation is not established. A timed-out run may therefore
+lose usage/evidence and must never be treated as a clean review. A new run needs a fresh
 artifact directory, as supplied by a new Actions job.
 
 See [measured examples and validation limits](docs/chunking-validation.md).

@@ -12,12 +12,32 @@ from ai_reviewer.github import (
     GitHub,
     diff_lines,
     pr_path,
-    publish,
     read_version,
     rebuild_patch,
 )
+from ai_reviewer.github import (
+    publish as publish_review,
+)
 
 PATCH = "@@ -1,2 +1,2 @@\n first\n-old\n+new"
+
+
+def publish(
+    gh: GitHub, context: ReviewContext, reports: list[Review], result: Consolidation
+) -> bool:
+    """Isolate adapter behavior with a synthetic canonical-loader result.
+
+    Real artifact completeness is exercised by test_work and the CLI handoff.
+    """
+    from ai_reviewer.chunking import digest
+    from ai_reviewer.contracts import CoveredReviews
+
+    covered = CoveredReviews(
+        reviews=reports,
+        snapshot=digest(context.model_dump_json()),
+        summary="Both providers completed fixture work.",
+    )
+    return publish_review(gh, context, covered, result)
 
 
 class Server:

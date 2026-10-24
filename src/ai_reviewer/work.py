@@ -6,8 +6,9 @@ requests against the captured snapshot before accepting any completed report.
 """
 
 import json
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from pydantic import Field
@@ -18,18 +19,17 @@ from ai_reviewer.chunking import (
     Chunk,
     Plan,
     Unit,
-    direct_relations,
+    digest,
     encode,
     lines,
     plan,
-    related,
-    relation_key,
 )
 from ai_reviewer.contracts import (
     ChunkReview,
     CompletedReview,
     Consolidation,
     Contract,
+    CoveredReviews,
     FinalConsolidation,
     Group,
     Review,
@@ -37,9 +37,9 @@ from ai_reviewer.contracts import (
     SourceRequest,
     reconcile,
     source_findings,
+    validate_anchors,
 )
-from ai_reviewer.github import validate_anchors
-from ai_reviewer.models import Role, call_model
+from ai_reviewer.models import CapacityError, Role, call_model
 
 
 class Assignment(Contract):
@@ -48,6 +48,21 @@ class Assignment(Contract):
     id: str
     payload: str
     sections: list[str]
+
+
+class AssignmentRecord(Contract):
+    """Persist assignment identity and evidence digest without duplicating its payload."""
+
+    id: str
+    payload_digest: str
+    sections: list[str]
+
+
+def assignment_record(assignment: Assignment) -> AssignmentRecord:
+    """Bind manifest ownership to the payload retained in each attempt directory."""
+    return AssignmentRecord(
+        id=assignment.id, payload_digest=digest(assignment.payload), sections=assignment.sections
+    )
 
 
 class Completion(Contract):
@@ -62,21 +77,28 @@ class Completion(Contract):
 class Manifest(Contract):
     """Persist exact section ownership and required provider work, including failures."""
 
-    plan: Plan
-    assignments: list[Assignment]
+    plan_digest: str
+    force_chunks: bool = False
+    assignments: list[AssignmentRecord]
     results: list[Completion]
 
 
 def local_assignments(context: ReviewContext, planned: Plan) -> list[Assignment]:
     """Require one pair of independent reviews for every planned chunk."""
+    if planned.whole is not None:
+        return [
+            Assignment(
+                id="whole", payload=planned.whole, sections=[f.filename for f in context.files]
+            )
+        ]
     return [
-        Assignment(id=c.id, payload=c.payload(context), sections=[u.id for u in c.units])
+        Assignment(id=c.id, payload=c.payload(planned.metadata), sections=[u.id for u in c.units])
         for c in planned.chunks
     ]
 
 
 def integration_assignments(
-    context: ReviewContext, planned: Plan, local: list[Review]
+    context: ReviewContext, planned: Plan, local: dict[tuple[str, str], Review]
 ) -> list[Assignment]:
     """Require actual-source integration across every visible cross-chunk relation.
 
@@ -84,25 +106,28 @@ def integration_assignments(
     candidates, not a complete dependency graph. Every chunk also receives an
     integration pass to identify missing relationships via source requests.
     """
+    if planned.whole is not None:
+        return []
     assignments = []
-    links = direct_relations(context)
+    links = {(r.left, r.right): r.evidence for r in planned.relations}
 
     def reference_source(scope: list[Unit]) -> list[dict[str, Any]]:
         """Retain actual imports for same-chunk and cross-chunk relationships alike."""
+        paths = {u.filename for u in scope}
         requests = [
             request
-            for index, a in enumerate(scope)
-            for b in scope[index + 1 :]
-            for request in links.get(relation_key(a.filename, b.filename), [])
+            for (a, b), evidence in links.items()
+            if a in paths and b in paths
+            for request in evidence
         ]
         unique = {request.model_dump_json(): request for request in requests}
         return source_sections(context, list(unique.values()))
 
     # Each chunk rechecks integration using actual local source and both reports.
     for i, chunk in enumerate(planned.chunks):
-        payload = json.loads(chunk.payload(context))
+        payload = json.loads(chunk.payload(planned.metadata))
         payload["phase"] = "integration: assess PR-wide compatibility; request missing source"
-        payload["reports"] = [r.model_dump() for r in local[i * 2 : i * 2 + 2]]
+        payload["reports"] = [local[(chunk.id, role)].model_dump() for role in ("claude", "openai")]
         payload["reference_source"] = reference_source(chunk.units)
         assignments.append(
             Assignment(
@@ -117,30 +142,44 @@ def integration_assignments(
     all_units = sorted(
         (u for c in planned.chunks for u in c.units), key=lambda u: (u.filename, u.patch_start)
     )
-    edges = []
-    for index, a in enumerate(all_units):
-        for j in range(index + 1, len(all_units)):
-            b = all_units[j]
-            if ownership[a.id] == ownership[b.id]:
-                continue
-            if (j == index + 1 and related(a, b, links)) or relation_key(
-                a.filename, b.filename
-            ) in links:
-                edges.append((a, b))
+    by_file: dict[str, list[Unit]] = defaultdict(list)
+    for unit in all_units:
+        by_file[unit.filename].append(unit)
+    edges: dict[tuple[str, str], tuple[Unit, Unit]] = {}
+
+    def add_edge(a: Unit, b: Unit) -> None:
+        """Keep distinct cross-owner pairs bounded before packet construction."""
+        if ownership[a.id] != ownership[b.id]:
+            edges[(a.id, b.id)] = (a, b)
+            if len(edges) > 20_000:
+                raise ValueError("Integration relationship budget exceeded")
+
+    for a, b in zip(all_units, all_units[1:]):
+        if PurePosixPath(a.filename).parent == PurePosixPath(b.filename).parent:
+            add_edge(a, b)
+    for left, right in links:
+        for a in by_file[left]:
+            for b in by_file[right]:
+                add_edge(a, b)
     # Pack relationship pairs together, preserving both actual source endpoints.
     pending: list[Unit] = []
 
     def packet(scope: list[Unit]) -> Assignment:
         """Attach reports only from owners of the actual source under integration."""
         pair = Chunk(id=f"edge-{len(assignments):04d}", units=scope)
-        payload = json.loads(pair.payload(context))
+        payload = json.loads(pair.payload(planned.metadata))
         payload["phase"] = "integration: check cross-chunk relationships using actual source"
         payload["reference_source"] = reference_source(scope)
         owners = sorted({ownership[u.id] for u in scope})
-        payload["reports"] = [r.model_dump() for k in owners for r in local[k * 2 : k * 2 + 2]]
+        payload["reports"] = [
+            local[(planned.chunks[k].id, role)].model_dump()
+            for k in owners
+            for role in ("claude", "openai")
+        ]
         return Assignment(id=pair.id, payload=encode(payload), sections=[u.id for u in scope])
 
-    for a, b in edges:
+    order = {unit.id: i for i, unit in enumerate(all_units)}
+    for a, b in sorted(edges.values(), key=lambda edge: (order[edge[0].id], order[edge[1].id])):
         trial = pending + [u for u in (a, b) if u not in pending]
         if pending and len(packet(trial).payload.encode()) > PACKET_BYTES:
             assignments.append(packet(pending))
@@ -266,7 +305,7 @@ def run_batch(
     """Schedule two workers, recording all terminal results even if one fails."""
     if len(manifest.assignments) + len(assignments) > MAX_WORK:
         raise ValueError("Total review work budget exceeded")
-    manifest.assignments.extend(assignments)
+    manifest.assignments.extend(assignment_record(a) for a in assignments)
     completions = [
         Completion(assignment=a.id, role=role) for a in assignments for role in ("claude", "openai")
     ]
@@ -295,9 +334,9 @@ def run_batch(
 
 def read_batch(
     context: ReviewContext, assignments: list[Assignment], manifest: Manifest, directory: Path
-) -> list[Review]:
+) -> dict[tuple[str, str], Review]:
     """Replay attempt inputs and require complete results with no unresolved requests."""
-    reports: list[Review] = []
+    reports: dict[tuple[str, str], Review] = {}
     for assignment in assignments:
         for role in ("claude", "openai"):
             matches = [
@@ -323,38 +362,50 @@ def read_batch(
                     raise ValueError("Unexpected follow-up attempt")
                 else:
                     payload = followup_payload(context, assignment, history)
-            reports.append(
-                CompletedReview(
-                    complete=True,
-                    summary=history[-1].summary,
-                    findings=[f for r in history for f in r.findings],
-                )
+            reports[(assignment.id, role)] = CompletedReview(
+                complete=True,
+                summary=history[-1].summary,
+                findings=[f for r in history for f in r.findings],
             )
     return reports
 
 
 def review_chunks(context: ReviewContext, directory: Path) -> None:
-    """Run local work then both providers' source-grounded integration assignments."""
-    planned = plan(context)
-    if planned.whole is not None:
-        raise ValueError("Chunk runner requires a large packet")
+    """Run one manifest-backed review flow, using the whole packet when capacity permits."""
     # Reject reused workspaces instead of mixing attempts and their cost accounting.
     if (directory / "manifest.json").exists() or (directory / "work").exists():
-        raise ValueError("Chunk run requires a fresh artifact directory")
-    manifest = Manifest(plan=planned, assignments=[], results=[])
+        raise ValueError("Review run requires a fresh artifact directory")
+    planned = plan(context)
+    force_chunks = False
+    if planned.whole is not None:
+        try:
+            # Count both provider inputs before either provider can generate a report.
+            for role in ("claude", "openai"):
+                call_model(
+                    role, planned.whole, directory / "preflight", chunked=True, preflight=True
+                )
+        except CapacityError:
+            force_chunks = True
+            planned = plan(context, force_chunks=True)
+    manifest = Manifest(
+        plan_digest=digest(planned.model_dump_json()),
+        force_chunks=force_chunks,
+        assignments=[],
+        results=[],
+    )
     local = local_assignments(context, planned)
     run_batch(context, manifest, local, directory)
     reports = read_batch(context, local, manifest, directory)
     integration = integration_assignments(context, planned, reports)
     run_batch(context, manifest, integration, directory)
-    load_reviews(context, directory)
+    read_batch(context, integration, manifest, directory)
 
 
-def load_reviews(context: ReviewContext, directory: Path) -> tuple[list[Review], Manifest]:
+def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
     """Recompute exact required work before consolidation and again before publication."""
     manifest = Manifest.model_validate_json((directory / "manifest.json").read_text())
-    planned = plan(context)
-    if planned.whole is not None or manifest.plan != planned:
+    planned = plan(context, force_chunks=manifest.force_chunks)
+    if manifest.plan_digest != digest(planned.model_dump_json()):
         raise ValueError("Coverage plan does not match the captured snapshot")
     local = local_assignments(context, planned)
     reports = read_batch(context, local, manifest, directory)
@@ -362,10 +413,19 @@ def load_reviews(context: ReviewContext, directory: Path) -> tuple[list[Review],
     expected = local + integration
     keys = [(a.id, role) for a in expected for role in ("claude", "openai")]
     actual = [(r.assignment, r.role) for r in manifest.results]
-    if manifest.assignments != expected or sorted(keys) != sorted(actual):
+    if manifest.assignments != [assignment_record(a) for a in expected] or sorted(keys) != sorted(
+        actual
+    ):
         raise ValueError("Coverage assignments are missing, duplicated or unexpected")
-    reports.extend(read_batch(context, integration, manifest, directory))
-    return reports, manifest
+    reports.update(read_batch(context, integration, manifest, directory))
+    return CoveredReviews(
+        reviews=[reports[key] for key in keys],
+        snapshot=planned.snapshot,
+        summary=f"{len(local)} local scopes; {len(expected)} local/integration assignments "
+        f"completed by both providers. Snapshot `{planned.snapshot}`. "
+        "Exact section ownership and follow-up evidence are in the workflow coverage manifest. "
+        "Completion does not establish model understanding.",
+    )
 
 
 def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
@@ -376,7 +436,8 @@ def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
     """
     if any((directory / name).exists() for name in ("consolidation", "consolidation-summaries")):
         raise ValueError("Consolidation requires fresh artifacts; earlier usage must be retained")
-    reports, manifest = load_reviews(context, directory)
+    covered = load_reviews(context, directory)
+    reports = covered.reviews
     sources = source_findings(reports, len(reports))
     items = list(sources.items())
     groups: list[Group] = []
@@ -427,8 +488,4 @@ def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
     result = FinalConsolidation(summary=summaries[0], groups=groups)
     reconcile(reports, result, len(reports))
     (directory / "consolidate.json").write_text(result.model_dump_json())
-    (directory / "coverage.txt").write_text(
-        f"{len(manifest.plan.chunks)} chunks; {len(manifest.assignments)} local/integration "
-        f"assignments; both providers completed all work. Snapshot {manifest.plan.snapshot}. "
-        "Coverage confirms completion, not model understanding."
-    )
+    (directory / "coverage.txt").write_text(covered.summary)

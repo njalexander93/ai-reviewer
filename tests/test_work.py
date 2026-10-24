@@ -42,8 +42,12 @@ def large_context() -> ReviewContext:
     return context
 
 
-def fake_model(role: str, payload: str, directory: Path, *, chunked: bool = False) -> None:
+def fake_model(
+    role: str, payload: str, directory: Path, *, chunked: bool = False, preflight: bool = False
+) -> None:
     """Return complete source-preserving responses without paid calls or GitHub writes."""
+    if preflight:
+        return
     directory.mkdir(parents=True, exist_ok=True)
     data = json.loads(payload)
     report = (
@@ -67,13 +71,17 @@ def test_large_pipeline_requires_both_providers_and_actual_integration_source(
     context = large_context()
     monkeypatch.setattr(work, "call_model", fake_model)
     work.review_chunks(context, tmp_path)
-    reports, manifest = work.load_reviews(context, tmp_path)
+    covered = work.load_reviews(context, tmp_path)
+    reports = covered.reviews
+    manifest = work.Manifest.model_validate_json((tmp_path / "manifest.json").read_text())
     assert len(reports) == 2 * len(manifest.assignments)
     assert all(r.status == "complete" for r in manifest.results)
     edges = [a for a in manifest.assignments if a.id.startswith("edge-")]
     assert edges
     for edge in edges:
-        packet = json.loads(edge.payload)
+        packet = json.loads(
+            (work.attempt_directory(tmp_path, edge.id, "claude", 0) / "payload.json").read_text()
+        )
         assert packet["reports"]
         assert all(unit["after"] for unit in packet["scope"]["units"])
     work.consolidate_chunks(context, tmp_path)
@@ -84,14 +92,14 @@ def test_large_pipeline_requires_both_providers_and_actual_integration_source(
     assert {str(p): p.read_text() for p in tmp_path.rglob("*.usage.json")} == usage_before
     server = Server()
     server.files = [{"filename": f.filename, "patch": f.patch} for f in context.files]
-    assert publish(server.gh, context, reports, result, directory=tmp_path)
+    assert publish(server.gh, context, covered, result)
     assert len(server.writes) == 1
     assert server.writes[0][1]["event"] == "APPROVE"
     assert "Completion does not establish model understanding" in server.writes[0][1]["body"]
     # The existing stale revision protection also applies to chunked publication.
     server.pr["head"]["sha"] = "f" * 40
     with pytest.raises(ValueError, match="Stale"):
-        publish(server.gh, context, reports, result, directory=tmp_path)
+        publish(server.gh, context, covered, result)
     assert len(server.writes) == 1
 
 
@@ -114,7 +122,7 @@ def test_corrupt_coverage_cannot_approve(
     elif damage == "failed":
         manifest.results[0].status = "failed"
     elif damage == "plan":
-        manifest.plan.chunks[0].units.pop()
+        manifest.plan_digest = "tampered"
     elif damage == "snapshot":
         context.head = "f" * 40
     else:
@@ -196,7 +204,7 @@ def test_many_reports_preserve_global_source_ids(
     context = large_context()
     monkeypatch.setattr(work, "call_model", fake_model)
     work.review_chunks(context, tmp_path)
-    _, manifest = work.load_reviews(context, tmp_path)
+    covered = work.load_reviews(context, tmp_path)
     # Independent fixture: 12 reports with 10 distinct original observations each.
     reports = [
         CompletedReview(
@@ -216,7 +224,9 @@ def test_many_reports_preserve_global_source_ids(
         )
         for i in range(12)
     ]
-    monkeypatch.setattr(work, "load_reviews", lambda *args: (reports, manifest))
+    monkeypatch.setattr(
+        work, "load_reviews", lambda *args: covered.model_copy(update={"reviews": reports})
+    )
     work.consolidate_chunks(context, tmp_path)
     result = FinalConsolidation.model_validate_json((tmp_path / "consolidate.json").read_text())
     ids = [source for group in result.groups for source in group.source_ids]
@@ -298,7 +308,7 @@ def test_known_cross_chunk_defect_matches_whole_packet_fixture(
 
     monkeypatch.setattr(work, "call_model", model)
     work.review_chunks(context, tmp_path)
-    reports, _ = work.load_reviews(context, tmp_path)
+    reports = work.load_reviews(context, tmp_path).reviews
     found = [f for r in reports for f in r.findings]
     assert found == [expected, expected]
 
@@ -327,7 +337,15 @@ def test_accumulated_findings_are_paged_with_actual_integration_source() -> None
         )
         for i in range(2 * len(planned.chunks))
     ]
-    assignments = work.integration_assignments(context, planned, reports)
+    assignments = work.integration_assignments(
+        context,
+        planned,
+        {
+            (c.id, role): reports[i * 2 + j]
+            for i, c in enumerate(planned.chunks)
+            for j, role in enumerate(("claude", "openai"))
+        },
+    )
     pages = [a for a in assignments if a.id.startswith("integration-0000")]
     assert len(pages) > 1
     assert all(len(a.payload.encode()) <= 600_000 for a in assignments)
@@ -340,3 +358,79 @@ def test_accumulated_findings_are_paged_with_actual_integration_source() -> None
     assert {f["title"] for f in findings} == {
         f"Report {i} finding {j}" for i in range(2) for j in range(120)
     }
+
+
+def test_reordered_reports_keep_assignment_identity() -> None:
+    """Changing mapping insertion order cannot attach another chunk's reports."""
+    from ai_reviewer.contracts import Review
+
+    context = large_context()
+    planned = plan(context)
+    reports = {
+        (c.id, role): Review(complete=True, summary=f"{c.id}/{role}", findings=[])
+        for c in planned.chunks
+        for role in ("claude", "openai")
+    }
+    reversed_reports = dict(reversed(list(reports.items())))
+    actual = work.integration_assignments(context, planned, reversed_reports)
+    for i, chunk in enumerate(planned.chunks):
+        packet = json.loads(next(a.payload for a in actual if a.id == f"integration-{i:04d}"))
+        assert [r["summary"] for r in packet["reports"]] == [
+            f"{chunk.id}/claude",
+            f"{chunk.id}/openai",
+        ]
+    assert actual == work.integration_assignments(context, planned, reports)
+
+
+def test_manifest_retains_hashes_and_rejects_tampered_assignment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The manifest stays small while payload edits still prevent consolidation."""
+    context = large_context()
+    monkeypatch.setattr(work, "call_model", fake_model)
+    work.review_chunks(context, tmp_path)
+    path = tmp_path / "manifest.json"
+    data = json.loads(path.read_text())
+    assert path.stat().st_size < 50_000
+    assert all("payload" not in a and len(a["payload_digest"]) == 64 for a in data["assignments"])
+    data["assignments"][0]["payload_digest"] = "0" * 64
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Coverage assignments"):
+        work.load_reviews(context, tmp_path)
+
+
+@pytest.mark.parametrize("rejecting_role", ["claude", "openai"])
+def test_token_overflow_replans_before_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rejecting_role: str
+) -> None:
+    """Either tokenizer can force chunks without spending on the rejected whole packet."""
+    context = large_context()
+    context.files = context.files[:1]
+    original = context.model_dump_json()
+    assert plan(context).whole == original
+    generated = []
+
+    def model(
+        role: str, payload: str, directory: Path, *, chunked: bool = False, preflight: bool = False
+    ) -> None:
+        """Model the capacity response independently of byte size; record generated inputs."""
+        if preflight:
+            if role == rejecting_role:
+                raise work.CapacityError("Provider input capacity budget exceeded")
+            return
+        generated.append(payload)
+        fake_model(role, payload, directory, chunked=chunked)
+
+    monkeypatch.setattr(work, "call_model", model)
+    work.review_chunks(context, tmp_path)
+    covered = work.load_reviews(context, tmp_path)
+    assert covered.reviews
+    assert original not in generated
+    assert all("scope" in json.loads(payload) for payload in generated)
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert manifest["force_chunks"] is True
+    # Replay cannot silently switch back to the byte-only whole assignment.
+    manifest["force_chunks"] = False
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="Coverage plan"):
+        work.load_reviews(context, tmp_path)

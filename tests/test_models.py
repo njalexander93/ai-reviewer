@@ -209,3 +209,26 @@ def test_costs_include_every_isolated_attempt(
     assert "Claude subtotal: $1.2000 + unknown" in output
     assert "OpenAI subtotal: $0.4000" in output
     assert "Estimated API total: $1.6000 + unknown" in output
+
+
+@pytest.mark.parametrize("role", ["claude", "openai"])
+def test_preflight_never_generates_or_records_usage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str
+) -> None:
+    """Counting-only requests must not cross the paid-generation boundary."""
+    generated = []
+    client = SimpleNamespace(
+        responses=SimpleNamespace(
+            parse=lambda **kwargs: generated.append(kwargs),
+            input_tokens=SimpleNamespace(count=lambda **kwargs: SimpleNamespace(input_tokens=1000)),
+        ),
+        messages=SimpleNamespace(
+            parse=lambda **kwargs: generated.append(kwargs),
+            count_tokens=lambda **kwargs: SimpleNamespace(input_tokens=1000),
+        ),
+    )
+    monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
+    monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
+    call_model(role, "context", tmp_path, chunked=True, preflight=True)
+    assert generated == []
+    assert list(tmp_path.iterdir()) == []

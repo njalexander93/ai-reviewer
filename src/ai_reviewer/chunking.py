@@ -9,6 +9,9 @@ import ast
 import hashlib
 import json
 import re
+from bisect import bisect_right
+from collections import defaultdict, deque
+from itertools import combinations
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
@@ -69,28 +72,65 @@ class Chunk(Contract):
     id: str
     units: list[Unit]
 
-    def payload(self, context: ReviewContext) -> str:
-        """Combine local evidence with shared requirements and relevant discussion."""
+    def payload(self, metadata: "PacketMetadata") -> str:
+        """Serialize candidate evidence using snapshot metadata compiled once."""
         paths = {u.filename for u in self.units} | {u.previous_filename for u in self.units}
+        indices = sorted(
+            set(metadata.global_comments).union(
+                *(metadata.comments_by_path.get(path, []) for path in paths)
+            )
+        )
         return encode(
             {
-                "overview": overview(context),
+                "overview": metadata.overview,
                 "scope": self.model_dump(),
-                "previous_comments": [
-                    c.model_dump()
-                    for c in context.previous_comments
-                    if c.path in paths or c.path not in {f.filename for f in context.files}
-                ],
+                "previous_comments": [metadata.comments[i] for i in indices],
             }
         )
 
 
+class PacketMetadata(Contract):
+    """Cache inventory and indexed discussion for one immutable snapshot."""
+
+    overview: dict[str, Any]
+    comments: list[dict[str, Any]]
+    comments_by_path: dict[str | None, list[int]]
+    global_comments: list[int]
+
+
+class Relation(Contract):
+    """Persist deterministic file endpoints and captured reference evidence."""
+
+    left: str
+    right: str
+    evidence: list[SourceRequest]
+
+
 class Plan(Contract):
-    """Select the unchanged whole-packet path or exact partitioned work."""
+    """Describe whole or partitioned assignments with reusable snapshot evidence."""
 
     snapshot: str
     whole: str | None
     chunks: list[Chunk] = Field(max_length=MAX_CHUNKS)
+    metadata: PacketMetadata
+    relations: list[Relation]
+
+
+def packet_metadata(context: ReviewContext) -> PacketMetadata:
+    """Compile full-blob line counts and discussion membership once per plan."""
+    changed = {f.filename for f in context.files}
+    by_path: dict[str | None, list[int]] = defaultdict(list)
+    global_comments = []
+    for i, comment in enumerate(context.previous_comments):
+        by_path[comment.path].append(i)
+        if comment.path not in changed:
+            global_comments.append(i)
+    return PacketMetadata(
+        overview=overview(context),
+        comments=[c.model_dump() for c in context.previous_comments],
+        comments_by_path=dict(by_path),
+        global_comments=global_comments,
+    )
 
 
 def overview(context: ReviewContext) -> dict[str, Any]:
@@ -252,53 +292,99 @@ def relation_key(left: str, right: str) -> tuple[str, str]:
 
 
 def direct_relations(context: ReviewContext) -> dict[tuple[str, str], list[SourceRequest]]:
-    """Find direct references in full captured blobs, never only in hunk excerpts.
+    """Index all known literal references with one multi-pattern scan per version.
 
-    Source/test names imply a relationship. Textual path references additionally
-    retain a short actual source range showing the reference on each side found.
-    The 20,000-relation bound prevents a dense name/reference graph exhausting work.
+    A failure-linked trie preserves substring matches (including overlapping paths).
+    Only the first occurrence per target/version contributes source evidence.
+    Normalized source/test names are joined separately, without source scans.
     """
     files = sorted(context.files, key=lambda f: f.filename)
+    targets: dict[str, set[str]] = defaultdict(set)
+    names: dict[str, list[str]] = defaultdict(list)
+    for file in files:
+        names[PurePosixPath(file.filename).stem.removeprefix("test_").removesuffix("_test")].append(
+            file.filename
+        )
+        for ref in (
+            file.filename,
+            str(PurePosixPath(file.filename).with_suffix("")).replace("/", "."),
+            file.previous_filename,
+        ):
+            if ref:
+                targets[ref].add(file.filename)
+    # Failure links let each character advance the index without rescanning blobs.
+    transitions: list[dict[str, int]] = [{}]
+    failures = [0]
+    outputs: list[list[str]] = [[]]
+    for ref in sorted(targets):
+        state = 0
+        for char in ref:
+            if char not in transitions[state]:
+                transitions[state][char] = len(transitions)
+                transitions.append({})
+                failures.append(0)
+                outputs.append([])
+            state = transitions[state][char]
+        outputs[state].append(ref)
+    queue = deque(transitions[0].values())
+    while queue:
+        state = queue.popleft()
+        for char, child in transitions[state].items():
+            queue.append(child)
+            fallback = failures[state]
+            while fallback and char not in transitions[fallback]:
+                fallback = failures[fallback]
+            failures[child] = transitions[fallback].get(char, 0)
+            outputs[child].extend(outputs[failures[child]])
     result: dict[tuple[str, str], list[SourceRequest]] = {}
-    for index, left in enumerate(files):
-        for right in files[index + 1 :]:
-            names = [
-                PurePosixPath(f.filename).stem.removeprefix("test_").removesuffix("_test")
-                for f in (left, right)
-            ]
-            evidence = []
-            for source, target in ((left, right), (right, left)):
-                references = [
-                    target.filename,
-                    str(PurePosixPath(target.filename).with_suffix("")).replace("/", "."),
-                ]
-                if target.previous_filename:
-                    references.append(target.previous_filename)
-                versions: list[tuple[Literal["LEFT", "RIGHT"], str]] = [
-                    ("LEFT", source.before),
-                    ("RIGHT", source.after),
-                ]
-                for side, text in versions:
-                    positions = [text.find(ref) for ref in references if ref]
-                    positions = [position for position in positions if position >= 0]
-                    if not positions:
-                        continue
-                    line = text.count("\n", 0, min(positions)) + 1
-                    total = text.count("\n") + int(bool(text) and not text.endswith("\n"))
-                    evidence.append(
-                        SourceRequest(
-                            path=source.filename,
-                            side=side,
-                            start=max(1, line - 10),
-                            end=min(total, line + 10),
-                            reason="Captured direct path reference",
-                        )
-                    )
-            if evidence or names[0] == names[1]:
-                result[relation_key(left.filename, right.filename)] = evidence
-                if len(result) > 20_000:
-                    raise ValueError("Captured relationship budget exceeded")
-    return result
+
+    def add(left: str, right: str, evidence: SourceRequest | None = None) -> None:
+        """Bound discovered relationships before expanding integration work."""
+        key = relation_key(left, right)
+        result.setdefault(key, [])
+        if evidence is not None:
+            result[key].append(evidence)
+        if len(result) > 20_000:
+            raise ValueError("Captured relationship budget exceeded")
+
+    for group in names.values():
+        for left, right in combinations(group, 2):
+            add(left, right)
+    for file in files:
+        versions: list[tuple[Literal["LEFT", "RIGHT"], str]] = [
+            ("LEFT", file.before),
+            ("RIGHT", file.after),
+        ]
+        for side, text in versions:
+            first: dict[str, int] = {}
+            newlines = []
+            state = 0
+            for position, char in enumerate(text):
+                if char == "\n":
+                    newlines.append(position)
+                while state and char not in transitions[state]:
+                    state = failures[state]
+                state = transitions[state].get(char, 0)
+                for ref in outputs[state]:
+                    for target in targets[ref]:
+                        if target != file.filename:
+                            start = position - len(ref) + 1
+                            first[target] = min(first.get(target, start), start)
+            total = len(newlines) + int(bool(text) and not text.endswith("\n"))
+            for target, position in sorted(first.items()):
+                line = bisect_right(newlines, position) + 1
+                add(
+                    file.filename,
+                    target,
+                    SourceRequest(
+                        path=file.filename,
+                        side=side,
+                        start=max(1, line - 10),
+                        end=min(total, line + 10),
+                        reason="Captured direct path reference",
+                    ),
+                )
+    return dict(sorted(result.items()))
 
 
 def related(a: Unit, b: Unit, links: dict[tuple[str, str], list[SourceRequest]]) -> bool:
@@ -309,7 +395,7 @@ def related(a: Unit, b: Unit, links: dict[tuple[str, str], list[SourceRequest]])
     )
 
 
-def plan(context: ReviewContext) -> Plan:
+def plan(context: ReviewContext, *, force_chunks: bool = False) -> Plan:
     """Plan exact ownership without fetching, calling models or modifying the snapshot.
 
     Reject duplicate paths, oversized shared metadata or exhausted collection/work
@@ -320,15 +406,24 @@ def plan(context: ReviewContext) -> Plan:
         raise ValueError("Snapshot exceeds 32 MB collection budget")
     if len({f.filename for f in context.files}) != len(context.files):
         raise ValueError("Duplicate changed-file path")
-    if len(serialized.encode()) <= PACKET_BYTES:
-        return Plan(snapshot=digest(serialized), whole=serialized, chunks=[])
+    metadata = packet_metadata(context)
+    if not force_chunks and len(serialized.encode()) <= PACKET_BYTES:
+        return Plan(
+            snapshot=digest(serialized),
+            whole=serialized,
+            chunks=[],
+            metadata=metadata,
+            relations=[],
+        )
     pending = [u for f in sorted(context.files, key=lambda f: f.filename) for u in units(f)]
     links = direct_relations(context)
     chunks: list[Chunk] = []
     # Start with the stable first unit, then prefer visible related evidence.
     while pending:
         chunk = Chunk(id=f"chunk-{len(chunks):04d}", units=[pending.pop(0)])
-        if len(chunk.payload(context).encode()) > CHUNK_BYTES:
+        if len(chunk.payload(metadata).encode()) > (
+            min(CHUNK_BYTES, 200_000) if force_chunks else CHUNK_BYTES
+        ):
             raise ValueError("Shared metadata, replies or unit exceeds chunk budget")
         candidates = sorted(
             pending,
@@ -341,7 +436,9 @@ def plan(context: ReviewContext) -> Plan:
         )
         for unit in candidates:
             trial = Chunk(id=chunk.id, units=[*chunk.units, unit])
-            if len(trial.payload(context).encode()) <= CHUNK_BYTES:
+            if len(trial.payload(metadata).encode()) <= (
+                min(CHUNK_BYTES, 200_000) if force_chunks else CHUNK_BYTES
+            ):
                 chunk = trial
                 pending.remove(unit)
         chunks.append(chunk)
@@ -349,7 +446,13 @@ def plan(context: ReviewContext) -> Plan:
             raise ValueError("Chunk work budget exceeded")
     if not chunks:
         raise ValueError("Shared metadata exceeds packet budget")
-    return Plan(snapshot=digest(serialized), whole=None, chunks=chunks)
+    return Plan(
+        snapshot=digest(serialized),
+        whole=None,
+        chunks=chunks,
+        metadata=metadata,
+        relations=[Relation(left=a, right=b, evidence=e) for (a, b), e in links.items()],
+    )
 
 
 def validate_patch(file: ChangedFile) -> None:

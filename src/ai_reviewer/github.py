@@ -14,11 +14,12 @@ from typing import Any
 
 import httpx
 
-from ai_reviewer.chunking import MAX_BLOB_BYTES
+from ai_reviewer.chunking import MAX_BLOB_BYTES, digest
 from ai_reviewer.contracts import (
     Consolidation,
-    Review,
+    CoveredReviews,
     ReviewContext,
+    diff_lines,
     reconcile,
 )
 
@@ -138,45 +139,6 @@ def pr_path(repo: str, number: int) -> str:
     return f"/repos/{repo}/pulls/{number}"
 
 
-def diff_lines(patch: str) -> set[tuple[str, int]]:
-    """Extract inline coordinates from GitHub unified-diff hunks.
-
-    Args:
-        patch: Unified patch text; content outside recognized hunks is ignored.
-
-    Returns:
-        Pairs of side and one-based line number. Context lines occur on both
-        sides, deletions on LEFT and additions on RIGHT. No hunks means no anchors.
-        This parser extracts coordinates; it does not validate patch completeness.
-    """
-    # Track old and new line counters independently across each hunk.
-    anchors: set[tuple[str, int]] = set()
-    left = right = 0
-    in_hunk = False
-    # Reset counters at hunk headers and advance the side consumed by each line.
-    for line in patch.split("\n"):
-        match = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-        # Headers establish coordinates; file headers and metadata add no anchors.
-        if match:
-            left, right = map(int, match.groups())
-            in_hunk = True
-        # Added lines exist only in the new file.
-        elif in_hunk and line.startswith("+"):
-            anchors.add(("RIGHT", right))
-            right += 1
-        # Deleted lines exist only in the old file.
-        elif in_hunk and line.startswith("-"):
-            anchors.add(("LEFT", left))
-            left += 1
-        # Unchanged context advances both files at once.
-        elif in_hunk and line.startswith(" "):
-            anchors.update({("LEFT", left), ("RIGHT", right)})
-            left += 1
-            right += 1
-    # Collapse repeated coordinates across overlapping hunks.
-    return anchors
-
-
 def read_version(
     gh: GitHub, repo: str, tree: str, filename: str, cache: dict[str, Any]
 ) -> tuple[str, str]:
@@ -280,31 +242,11 @@ def rebuild_patch(before: str, after: str) -> str:
         return result.stdout.decode("utf-8")
 
 
-def validate_anchors(context: ReviewContext, reviews: list[Review]) -> None:
-    """Reject invalid model locations before purchasing consolidation.
-
-    Args:
-        context: Immutable changed-file packet supplied to both reviewers.
-        reviews: Independent reports with locations to validate.
-
-    Raises:
-        ValueError: A finding is outside the captured diff. Reports remain on disk
-            for diagnosis; this fails the run rather than silently dropping findings.
-    """
-    anchors = {file.filename: diff_lines(file.patch) for file in context.files}
-    for review in reviews:
-        for finding in review.findings:
-            if (finding.side, finding.line) not in anchors.get(finding.path, set()):
-                raise ValueError("Finding is outside the captured diff")
-
-
 def publish(
     gh: GitHub,
     context: ReviewContext,
-    reviews: list[Review],
+    covered: CoveredReviews,
     result: Consolidation,
-    *,
-    directory: Path | None = None,
 ) -> bool:
     """Submit a consolidated review after checking evidence and current PR state.
 
@@ -315,9 +257,8 @@ def publish(
     Args:
         gh: Client authenticated as the reviewer recorded in context.
         context: Packet from prepare, including repository, PR and revision IDs.
-        reviews: Complete reports in validated assignment/provider order.
+        covered: Reports and coverage summary from the canonical artifact loader.
         result: Consolidated summary and an exact partition of source findings.
-        directory: Required coverage artifacts for a chunked run; revalidated before posting.
 
     Returns:
         False if this revision was already published; True after a new submission.
@@ -326,27 +267,11 @@ def publish(
         ValueError: Results, identity, diff anchors or current PR state are invalid.
         RuntimeError: GitHub rejects a request; transport errors also propagate.
     """
-    # Validate both reports and ensure the publishing credential owns the request.
-    expected_count = 2
-    coverage = ""
-    if directory is not None:
-        # Revalidate artifacts here too; CLI validation alone cannot authorize approval.
-        from ai_reviewer.work import load_reviews
-
-        loaded, manifest = load_reviews(context, directory)
-        if loaded != reviews:
-            raise ValueError("Publication reports differ from covered work")
-        expected_count = len(loaded)
-        coverage = (
-            f"{len(manifest.plan.chunks)} chunks; "
-            f"{len(manifest.assignments)} local/integration assignments completed by both "
-            f"providers. Snapshot `{manifest.plan.snapshot}`. Exact section ownership and "
-            "follow-up evidence are in the workflow coverage manifest. "
-            "Completion does not establish model understanding."
-        )
-    elif len(context.model_dump_json().encode()) > 600_000:
-        raise ValueError("Large review requires a validated coverage manifest")
-    groups = reconcile(reviews, result, expected_count)
+    # Coverage was replayed once by the canonical loader; bind it to this snapshot.
+    if covered.snapshot != digest(context.model_dump_json()):
+        raise ValueError("Publication snapshot differs from covered work")
+    reviews = covered.reviews
+    groups = reconcile(reviews, result, len(reviews))
     repo, number = context.repo, context.number
     path = pr_path(repo, number)
     login = gh.request("GET", "/user")["login"]
@@ -387,13 +312,9 @@ def publish(
                 else:
                     body = combined
             comments.append({"path": filename, "side": side, "line": line, "body": body})
-    # Attach both independent summaries beneath the consolidated overview.
+    # Attach the validated completion summary beneath the consolidated overview.
     body = f"{marker}\n## AI review\n\n{result.summary}\n\n"
-    if directory is not None:
-        body += coverage
-    else:
-        for name, review in zip(["Claude Opus 5.5", "GPT-6.1 Sol"], reviews, strict=True):
-            body += f"<details><summary>{name}</summary>\n\n{review.summary}\n\n</details>\n"
+    body += covered.summary
     # Reject oversized publication atomically; never publish a partial approval.
     if (
         len(body.encode()) > 60_000

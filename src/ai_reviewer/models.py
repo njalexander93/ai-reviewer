@@ -11,6 +11,7 @@ from typing import Literal
 import anthropic
 import openai
 
+from ai_reviewer.chunking import PACKET_BYTES
 from ai_reviewer.contracts import ChunkReview, Consolidation, Contract, Review
 
 Role = Literal["claude", "openai", "consolidate"]
@@ -74,14 +75,21 @@ class Usage(Contract):
         )
 
 
-def call_model(role: Role, payload: str, directory: Path, *, chunked: bool = False) -> None:
+class CapacityError(ValueError):
+    """Signal a pre-generation capacity rejection that can trigger repartitioning."""
+
+
+def call_model(
+    role: Role, payload: str, directory: Path, *, chunked: bool = False, preflight: bool = False
+) -> None:
     """Write validated output and usage artifacts, including usage on invalid completions.
 
     Args:
         role: Independent reviewer or consolidator.
         payload: Immutable context or completed review pair.
         directory: Output directory unique to this provider attempt.
-        chunked: Enable bounded source requests for chunk/integration work.
+        chunked: Enable bounded source requests for all planned review work.
+        preflight: Count input only; never generate or write usage artifacts.
 
     Raises:
         ValueError: A response is incomplete or lacks parsed structured output.
@@ -135,6 +143,8 @@ Preserve disagreements explicitly in the summary. Do not mention pricing.
             },
         ).input_tokens
         check_capacity(payload, count)
+        if preflight:
+            return
         usage_path.write_text("null")
         response = client.responses.parse(
             model=MODELS[role],
@@ -173,6 +183,8 @@ Preserve disagreements explicitly in the summary. Do not mention pricing.
             output_format=schema,
         ).input_tokens
         check_capacity(payload, count)
+        if preflight:
+            return
         usage_path.write_text("null")
         message = claude.messages.parse(
             model=MODELS[role],
@@ -251,5 +263,5 @@ def check_capacity(payload: str, input_tokens: int) -> None:
     and Sol's 272k long-context pricing threshold. Output/reasoning is capped at
     16k separately. This is a conservative work policy, not a byte/token formula.
     """
-    if len(payload.encode()) > 600_000 or not 0 <= input_tokens <= 250_000:
-        raise ValueError("Provider input capacity budget exceeded")
+    if len(payload.encode()) > PACKET_BYTES or not 0 <= input_tokens <= 250_000:
+        raise CapacityError("Provider input capacity budget exceeded")
