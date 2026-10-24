@@ -611,8 +611,10 @@ def run_assignment(
     """
     history: list[ChunkReview] = []
     payload = assignment.payload
-    # Persist exact input before each paid call, then use the shared replay transition.
-    for round_ in range(MAX_ATTEMPTS):
+    # The shared transition enforces the attempt bound for execution and replay.
+    # Persist exact input before each paid call.
+    while True:
+        round_ = len(history)
         target = attempt_directory(directory, assignment.id, role, round_)
         target.mkdir(parents=True, exist_ok=True)
         (target / "payload.json").write_text(payload)
@@ -633,7 +635,6 @@ def run_assignment(
         if next_payload is None:
             return len(history)
         payload = next_payload
-    raise ValueError("Required follow-up work exhausted")
 
 
 def save_manifest(directory: Path, manifest: Manifest) -> None:
@@ -713,7 +714,8 @@ def run_batch(
                     completion.attempts = error.attempts
                 report_failure(
                     error,
-                    directory / "work" / completion.assignment / completion.role / "failure.json",
+                    attempt_directory(directory, completion.assignment, completion.role, 0).parent
+                    / "failure.json",
                     assignment=completion.assignment,
                     role=completion.role,
                     phase="worker",

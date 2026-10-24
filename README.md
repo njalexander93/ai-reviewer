@@ -214,11 +214,15 @@ Chunked local and integration packets include a declaration index in
 `overview.inventory[].declarations`. Python classes, functions and async functions
 have qualified names and one-based inclusive LEFT/RIGHT ranges, including decorators.
 Use the inventory's current filename for either side of a renamed file. The index
-is compiled into shared plan metadata; packing and follow-ups reuse it. It does not
-execute source or replace reading it. Unsupported languages, malformed Python and
+is compiled once per plan; unit splitting and packet navigation share that discovery.
+Navigation fields are capped at 16,000 UTF-8 bytes across the inventory and trimmed
+further when needed to fit a required source unit. `declaration_navigation: truncated`
+means entries or entire file indexes were omitted; absence is not evidence that a
+function does not exist. Complete splitting ranges remain cached separately.
+Discovery never executes source and does not replace reading it. Unsupported languages, malformed Python and
 bare-CR line endings have explicit unavailable statuses; ordinary source requests
 still work. Whole-context payload bytes remain unchanged. Index bytes count toward
-existing packet limits; metadata that cannot fit still fails closed.
+existing packet limits; required source and review metadata still fail closed if oversized.
 
 Follow-up exhaustion records `FollowupExhausted` in worker logs and
 `work/<assignment>/<provider>/failure.json`, with validated attempt count, completed

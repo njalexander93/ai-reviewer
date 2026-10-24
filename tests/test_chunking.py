@@ -460,3 +460,85 @@ def test_unavailable_navigation_is_explicit(filename: str, source: str, status: 
     from ai_reviewer.chunking import declaration_index
 
     assert declaration_index(filename, source) == {"status": status, "entries": []}
+
+
+def test_parenthesized_decorator_includes_opening_at_line() -> None:
+    """Requesting a declaration must include the complete multiline decorator."""
+    from ai_reviewer.chunking import declaration_index
+
+    source = "@(\n    decorate\n)\ndef handle():\n    pass\n"
+    assert declaration_index("app.py", source) == {
+        "status": "indexed",
+        "entries": [{"name": "handle", "start": 1, "end": 5}],
+    }
+
+
+@pytest.mark.parametrize("description_size", [0, 48_000])
+def test_large_navigation_is_bounded_without_losing_patch_coverage(description_size: int) -> None:
+    """Thousands of declarations cannot crowd required source out of the smaller plan."""
+    from ai_reviewer.limits import CAPACITY_PACKET_BYTES
+    from ai_reviewer.serialization import encode
+
+    context, _, _ = bundle(Server())
+    context.description = "x" * description_size
+    source = "".join(f"def handler_{n}(): return {n}\n" for n in range(3000))
+    context.files = [
+        ChangedFile(
+            filename="many.py",
+            previous_filename=None,
+            status="added",
+            before="",
+            after=source,
+            patch="@@ -0,0 +1,3000 @@\n"
+            + "".join("+" + line for line in source.splitlines(keepends=True)),
+            before_mode=None,
+            after_mode="100644",
+        )
+    ]
+    planned = plan(context, packet_bytes=CAPACITY_PACKET_BYTES)
+    inventory = planned.metadata.overview["inventory"]
+    assert planned.metadata.overview["declaration_navigation"] == "truncated"
+    assert planned.metadata.declaration_ranges["many.py"][1][-1] == (3000, 3000)
+    assert len(encode(inventory[0]["declarations"]).encode()) < 16_000
+    assert "".join(u.patch for c in planned.chunks for u in c.units) == context.files[0].patch
+    assert all(
+        len(c.payload(planned.metadata).encode()) <= CAPACITY_PACKET_BYTES for c in planned.chunks
+    )
+
+
+def test_plan_reuses_discovery_for_splitting_and_packet_builders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plan-time parsing happens once per version; packing reuses its complete ranges."""
+    import ast
+
+    from ai_reviewer.limits import CAPACITY_PACKET_BYTES
+
+    context, _, _ = bundle(Server())
+    source = "@decorate\ndef handle():\n    return 1\n"
+    context.files = [
+        ChangedFile(
+            filename="app.py",
+            previous_filename=None,
+            status="added",
+            before="",
+            after=source,
+            patch="@@ -0,0 +1,3 @@\n+@decorate\n+def handle():\n+    return 1\n",
+            before_mode=None,
+            after_mode="100644",
+        )
+    ]
+    parse = ast.parse
+    parsed = []
+
+    def record_parse(text: str) -> ast.Module:
+        """Record parse inputs while retaining real syntax and coordinate behavior."""
+        parsed.append(text)
+        return parse(text)
+
+    monkeypatch.setattr(ast, "parse", record_parse)
+    planned = plan(context, packet_bytes=CAPACITY_PACKET_BYTES)
+    payloads = [c.payload(planned.metadata) for c in planned.chunks]
+    assert parsed == ["", source]
+    assert planned.metadata.declaration_ranges["app.py"] == ([], [(1, 3)])
+    assert '"name":"handle","start":1,"end":3' in payloads[0]

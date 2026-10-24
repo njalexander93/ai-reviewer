@@ -7,6 +7,8 @@ No reviewed code is imported or executed. Coverage establishes work, not judgmen
 """
 
 import ast
+import io
+import tokenize
 from bisect import bisect_right
 from collections import defaultdict, deque
 from pathlib import PurePosixPath
@@ -21,6 +23,7 @@ from ai_reviewer.limits import (
     MAX_CHUNKS,
     MAX_RELATIONS,
     MAX_SNAPSHOT_BYTES,
+    NAVIGATION_BYTES,
     PACKET_BYTES,
     UNIT_BYTES,
 )
@@ -112,12 +115,15 @@ class PacketMetadata(Contract):
         comments: Original-order discussion dictionaries, shared read-only by builders.
         comments_by_path: Current/old discussion path to indices in comments.
         global_comments: Indices whose path is not a current changed path; included everywhere.
+        declaration_ranges: Complete decorator-inclusive LEFT/RIGHT ranges for unit splitting.
+            Kept separately from bounded navigation so truncation cannot change coverage.
     """
 
     overview: dict[str, Any]
     comments: list[dict[str, Any]]
     comments_by_path: dict[str | None, list[int]]
     global_comments: list[int]
+    declaration_ranges: dict[str, tuple[list[tuple[int, int]], list[tuple[int, int]]]]
 
 
 class ArrayBudget:
@@ -169,7 +175,8 @@ class PacketSizer:
     """Cache immutable evidence lengths for many incremental packet budgets.
 
     Attributes:
-        metadata: Shared snapshot metadata; must remain unchanged after construction.
+        metadata: Shared snapshot metadata; navigation may be bounded before packing.
+            Source and discussion values must remain unchanged after construction.
         sizes: UTF-8 JSON lengths indexed by array section and stable item key.
     """
 
@@ -295,8 +302,18 @@ def packet_metadata(context: ReviewContext) -> PacketMetadata:
         if comment.path not in changed:
             global_comments.append(i)
     # Cache the full inventory separately from packet-specific unit evidence.
+    data = overview(context)
+    ranges = {
+        item["filename"]: (
+            [(d["start"], d["end"]) for d in item["declarations"]["LEFT"]["entries"]],
+            [(d["start"], d["end"]) for d in item["declarations"]["RIGHT"]["entries"]],
+        )
+        for item in data["inventory"]
+    }
+    bound_navigation(data, NAVIGATION_BYTES)
     return PacketMetadata(
-        overview=overview(context),
+        overview=data,
+        declaration_ranges=ranges,
         comments=[c.model_dump() for c in context.previous_comments],
         comments_by_path=dict(by_path),
         global_comments=global_comments,
@@ -331,6 +348,41 @@ def overview(context: ReviewContext) -> dict[str, Any]:
     return data
 
 
+def bound_navigation(data: dict[str, Any], byte_limit: int) -> None:
+    """Bound advisory declaration fields in an overview in place, without losing source.
+
+    byte_limit caps added UTF-8 bytes across all inventory items, including field
+    overhead. Source order is preserved. A truncated global status tells reviewers
+    that missing file/side entries are unavailable, not proof of no declarations.
+    The complete splitting ranges are cached before this projection is bounded.
+    """
+    remaining = max(0, byte_limit)
+    truncated = data.get("declaration_navigation") == "truncated"
+    for item in data["inventory"]:
+        navigation = item.pop("declarations", None)
+        if navigation is None:
+            continue
+        # Admit complete side statuses first, then as many source-ordered entries as fit.
+        selected = {
+            side: {"status": index["status"], "entries": []} for side, index in navigation.items()
+        }
+        cost = len(encode({"declarations": selected}).encode()) - 1
+        if cost > remaining:
+            truncated = True
+            continue
+        remaining -= cost
+        item["declarations"] = selected
+        for side, index in navigation.items():
+            for entry in index["entries"]:
+                cost = len(encode(entry).encode()) + bool(selected[side]["entries"])
+                if cost > remaining:
+                    truncated = True
+                    break
+                selected[side]["entries"].append(entry)
+                remaining -= cost
+    data["declaration_navigation"] = "truncated" if truncated else "complete"
+
+
 def declaration_index(filename: str, text: str) -> dict[str, Any]:
     """Locate Python classes/functions without executing captured text.
 
@@ -353,6 +405,16 @@ def declaration_index(filename: str, text: str) -> dict[str, Any]:
         tree = ast.parse(text)
     except SyntaxError, ValueError, RecursionError:
         return {"status": "parse_error", "entries": []}
+    # AST expression positions omit a parenthesized decorator's opening @ token.
+    decorators = []
+    statement_start = True
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if token.type in (tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT):
+            statement_start = True
+        elif token.type not in (tokenize.NL, tokenize.COMMENT):
+            if statement_start and token.string == "@":
+                decorators.append(token.start[0])
+            statement_start = False
     # Iterative traversal retains lexical owners without a second recursion limit.
     entries = []
     pending: list[tuple[ast.AST, str]] = [(tree, "")]
@@ -363,7 +425,11 @@ def declaration_index(filename: str, text: str) -> dict[str, Any]:
             entries.append(
                 {
                     "name": owner,
-                    "start": min([node.lineno, *(d.lineno for d in node.decorator_list)]),
+                    "start": (
+                        decorators[bisect_right(decorators, node.decorator_list[0].lineno) - 1]
+                        if node.decorator_list
+                        else node.lineno
+                    ),
                     "end": node.end_lineno or node.lineno,
                 }
             )
@@ -371,40 +437,20 @@ def declaration_index(filename: str, text: str) -> dict[str, Any]:
     return {"status": "indexed", "entries": sorted(entries, key=lambda entry: entry["start"])}
 
 
-def declarations(filename: str, text: str) -> list[tuple[int, int]]:
-    """Return sorted one-based inclusive Python declaration ranges without imports.
-
-    Args:
-        filename: Path used only to select the .py parser.
-        text: Captured source to parse, never execute.
-
-    Returns:
-        Function, async-function and class ranges, including nested declarations.
-        Unsupported paths or syntax/parser failures return no boundaries, allowing
-        the caller to fall back to diff and physical-line splitting.
-    """
-    # Unsupported or unparsable source uses the caller's non-syntax splitting fallback.
-    if not filename.endswith(".py"):
-        return []
-    try:
-        tree = ast.parse(text)
-    except SyntaxError, ValueError, RecursionError:
-        return []
-    # Include nested declarations without importing or executing the source.
-    return sorted(
-        (node.lineno, node.end_lineno or node.lineno)
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    )
-
-
-def units(file: ChangedFile, unit_bytes: int = UNIT_BYTES) -> list[Unit]:
+def units(
+    file: ChangedFile,
+    unit_bytes: int = UNIT_BYTES,
+    *,
+    declaration_ranges: tuple[list[tuple[int, int]], list[tuple[int, int]]] | None = None,
+) -> list[Unit]:
     """Split one captured file into bounded units with exact patch-record ownership.
 
     Args:
         file: Complete captured patch and before/after blobs, already validated.
         unit_bytes: Maximum UTF-8 bytes for each unit's model_dump_json serialization.
             Defaults to UNIT_BYTES; enclosing packet overhead is budgeted separately.
+        declaration_ranges: Precompiled LEFT/RIGHT ranges from the same snapshot. When
+            omitted, discover them locally through the canonical Python index.
 
     Returns:
         Deterministic units covering all patch records, including headers and newline
@@ -417,10 +463,14 @@ def units(file: ChangedFile, unit_bytes: int = UNIT_BYTES) -> list[Unit]:
     # Compile physical records, declaration boundaries and canonical fragment cursors.
     records = lines(file.patch)
     old, new = lines(file.before), lines(file.after)
-    old_defs, new_defs = (
-        declarations(file.filename, file.before),
-        declarations(file.filename, file.after),
-    )
+    if declaration_ranges is None:
+        before = declaration_index(file.previous_filename or file.filename, file.before)
+        after = declaration_index(file.filename, file.after)
+        declaration_ranges = (
+            [(d["start"], d["end"]) for d in before["entries"]],
+            [(d["start"], d["end"]) for d in after["entries"]],
+        )
+    old_defs, new_defs = declaration_ranges
     cursors: list[tuple[int, int]] = []
     boundaries = []
     ends: list[tuple[int, int]] = []
@@ -702,7 +752,9 @@ def plan(context: ReviewContext, *, packet_bytes: int = PACKET_BYTES) -> Plan:
     # Reserve space for two source endpoints, their reports and reference evidence.
     unit_bytes = min(UNIT_BYTES, packet_bytes // 4) if packet_bytes < PACKET_BYTES else UNIT_BYTES
     pending = [
-        u for f in sorted(context.files, key=lambda f: f.filename) for u in units(f, unit_bytes)
+        u
+        for f in sorted(context.files, key=lambda f: f.filename)
+        for u in units(f, unit_bytes, declaration_ranges=metadata.declaration_ranges[f.filename])
     ]
     links = direct_relations(context)
     chunks: list[Chunk] = []
@@ -710,6 +762,25 @@ def plan(context: ReviewContext, *, packet_bytes: int = PACKET_BYTES) -> Plan:
     target_bytes = (
         min(CHUNK_BYTES, packet_bytes // 2) if packet_bytes < PACKET_BYTES else CHUNK_BYTES
     )
+    # Advisory navigation must not make an otherwise fitting source unit indivisible.
+    navigation_bytes = sum(
+        len(encode({"declarations": item["declarations"]}).encode()) - 1
+        for item in metadata.overview["inventory"]
+        if "declarations" in item
+    )
+    required = sizer.budget("chunk-0000")
+    headroom = min(
+        (
+            target_bytes
+            - required.size
+            - required.growth(sizer.additions([unit]))
+            + navigation_bytes
+            for unit in pending
+        ),
+        default=0,
+    )
+    # A complete-to-truncated status change adds one byte.
+    bound_navigation(metadata.overview, min(NAVIGATION_BYTES, headroom - 1))
     # Start with the stable first unit, then prefer visible related evidence.
     while pending:
         chunk = Chunk(id=f"chunk-{len(chunks):04d}", units=[pending.pop(0)])

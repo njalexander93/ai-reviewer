@@ -140,6 +140,8 @@ For chunked packets, overview.inventory lists declarations by LEFT/RIGHT with qu
 names and inclusive start/end lines. Use these locations instead of guessing ranges.
 Use the inventory filename as request.path on either side, including renamed files.
 Index statuses other than indexed mean navigation is unavailable; inspect supplied source.
+overview.declaration_navigation=truncated means some files or entries were omitted to
+preserve the source budget. Missing entries never prove a declaration is absent.
 The index locates declarations only; it does not replace reading their source.
 Requests can only read changed files from the captured snapshot. No tools execute code.
 If context is required, set complete=false and request it. Never infer unseen compatibility.
