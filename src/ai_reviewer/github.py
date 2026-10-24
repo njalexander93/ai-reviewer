@@ -333,7 +333,7 @@ def publish(
         or len(json.dumps(comments, ensure_ascii=False).encode()) > MAX_GITHUB_PAYLOAD_BYTES
     ):
         raise ValueError("Publication exceeds bounded payload; manual review required")
-    # Derive the verdict from original findings, never from Sonnet's prose.
+    # Derive the verdict from original findings, never from the consolidator's prose.
     blocking = any(f.blocking for review in reviews for f in review.findings)
     # Recheck immediately before the one write. GitHub has no conditional-review API.
     pr = gh.request("GET", path)

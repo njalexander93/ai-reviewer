@@ -280,7 +280,9 @@ def test_direct_reference_outside_changed_hunk_remains_in_integration() -> None:
         for role in ("claude", "openai")
     }
     edges = [
-        a for a in integration_assignments(context, planned, reports) if a.id.startswith("edge-")
+        a
+        for a in integration_assignments(context, planned, reports, ("claude", "openai"))
+        if a.id.startswith("edge-")
     ]
     assert edges
     import json
@@ -292,7 +294,7 @@ def test_direct_reference_outside_changed_hunk_remains_in_integration() -> None:
     # If packing co-locates the tail and helper, integration must still see the import.
     together = plan(context)
     assert len(together.chunks) == 1
-    same_chunk = integration_assignments(context, together, reports)
+    same_chunk = integration_assignments(context, together, reports, ("claude", "openai"))
     actual = [
         section["text"] for a in same_chunk for section in json.loads(a.payload)["reference_source"]
     ]
