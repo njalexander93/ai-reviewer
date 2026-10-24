@@ -15,11 +15,19 @@ from ai_reviewer.contracts import ChunkReview, Consolidation, ReviewContext
 
 
 def failure_details(error: Exception) -> dict[str, Any]:
-    """Extract error class, numeric HTTP status and at most 20 redacted schema errors."""
+    """Return bounded, redacted metadata for error without printing or mutating it.
+
+    Includes its class name, an integer HTTP status in 100..599 when present, and
+    at most 20 Pydantic errors with at most 12 location components each. Only known
+    schema field names, integer indices and built-in validation codes are retained.
+    Exception messages, inputs, contexts, URLs, bodies and headers are omitted.
+    """
+    # Admit only a class name and numeric HTTP status from generic exceptions.
     details: dict[str, Any] = {"error": type(error).__name__}
     status = getattr(error, "status_code", None)
     if type(status) is int and 100 <= status <= 599:
         details["http_status"] = status
+    # Derive safe field names/codes from owned schemas rather than exception text.
     if isinstance(error, ValidationError):
         fields = set()
         for model in (ChunkReview, Consolidation, ReviewContext):
@@ -44,13 +52,20 @@ def failure_details(error: Exception) -> dict[str, Any]:
 
 
 def report_failure(error: Exception, path: Path | None = None, **context: str) -> None:
-    """Log safe metadata and optionally save it; context must be trusted internal labels.
+    """Print safe diagnostics and optionally write them without masking write failures.
 
-    Artifact-write failures must not replace the original exception. Exception
-    messages, validation input/context, response bodies and headers are omitted.
+    Args:
+        error: Exception to classify without exposing its message or response content.
+        path: Optional artifact path; its parent must already exist.
+        **context: Trusted internal string labels only, such as provider or stage.
+
+    Writes a bounded JSON object to stdout and, when requested, path. Artifact OSError
+    is handled with a generic warning; the caller still owns propagation of error.
     """
+    # Trusted call-site labels supplement redacted provider/schema metadata.
     serialized = json.dumps({**context, **failure_details(error)}, ensure_ascii=True)
     print(f"Review failure: {serialized}", flush=True)
+    # Artifact storage is best effort and must not replace the original failure.
     if path is not None:
         try:
             path.write_text(serialized + "\n")

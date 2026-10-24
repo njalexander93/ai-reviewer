@@ -67,22 +67,27 @@ class Review(Contract):
 class SourceRequest(Contract):
     """Request inclusive Git lines from a captured changed-file version only."""
 
+    # Current captured filename; LEFT reads before, RIGHT reads after, including renames.
     path: str
     side: Literal["LEFT", "RIGHT"]
+    # One-based inclusive bounds; source_sections checks ordering and availability.
     start: int = Field(ge=1)
     end: int = Field(ge=1)
+    # Nonempty explanation of the evidence needed; never executable instructions.
     reason: str = Field(min_length=1, max_length=1000)
 
 
 class ChunkReview(Review):
     """Review assigned sections; required missing evidence must be requested explicitly."""
 
+    # Required missing ranges. advance rejects complete reports with outstanding requests.
     requests: list[SourceRequest] = Field(max_length=MAX_SOURCE_REQUESTS)
 
 
 class CompletedReview(Review):
     """Preserve findings from up to three attempts of one assigned provider review."""
 
+    # Retain findings from all successful attempts; summary/complete follow Review.
     findings: list[Finding] = Field(max_length=MAX_COMPLETED_FINDINGS)
 
 
@@ -113,6 +118,7 @@ class Consolidation(Contract):
 class FinalConsolidation(Consolidation):
     """Hold bounded batches after each Sonnet response preserves its source partition."""
 
+    # Aggregate partition across bounded batches; summary retains Consolidation semantics.
     groups: list[Group] = Field(max_length=MAX_FINAL_GROUPS)
 
 
@@ -216,7 +222,8 @@ def source_findings(reviews: list[Review]) -> dict[str, Finding]:
         Original findings keyed by zero-based review:finding IDs.
 
     Raises:
-        ValueError: The required report count is wrong or a report is incomplete.
+        ValueError: Fewer than two reports are supplied or a report is incomplete.
+            Exact assignment/provider coverage is enforced by load_reviews, not here.
     """
     # Enforce the same completeness boundary before consolidation and publication.
     if len(reviews) < 2 or not all(review.complete for review in reviews):
@@ -254,7 +261,13 @@ def reconcile(reviews: list[Review], result: Consolidation) -> list[list[Finding
 
 
 class IndependentSummary(Contract):
-    """Label an original assessment at the loader, where assignment identity is known."""
+    """Label an original assessment where assignment/provider identity is known.
+
+    Attributes:
+        assignment: Whole-work assignment ID supplied by the canonical loader.
+        provider: Independent reviewer whose label publication must display.
+        summary: Original report assessment, without consolidation rewriting.
+    """
 
     assignment: str
     provider: Literal["claude", "openai"]
@@ -262,11 +275,16 @@ class IndependentSummary(Contract):
 
 
 class CoveredReviews(Contract):
-    """Carry canonical-loader results to publication without replaying artifacts twice.
+    """Carry trusted canonical-loader data without replaying artifacts in publication.
 
-    Internal application data, not an unforgeable capability or an accepted wire format.
-    The CLI obtains it only from load_reviews after exact work and anchor validation. Snapshot
-    binding prevents accidentally publishing these reports against another packet.
+    The CLI obtains this only after exact work and anchor validation. It is internal
+    application data, not an unforgeable capability or accepted wire format.
+
+    Attributes:
+        reviews: Complete reports in stable assignment/provider order for source IDs.
+        independent_summaries: Explicit whole-review identity and original assessments.
+        snapshot: Hash binding these reports to the captured context's exact JSON.
+        summary: Human-readable coverage statement; not evidence of model understanding.
     """
 
     reviews: list[Review]
@@ -275,11 +293,17 @@ class CoveredReviews(Contract):
     summary: str
 
 
+# Read-only current path to immutable (LEFT/RIGHT, one-based line) coordinates.
 AnchorIndex = Mapping[str, frozenset[tuple[str, int]]]
 
 
 def compile_anchors(context: ReviewContext) -> AnchorIndex:
-    """Build a read-only index once for a snapshot's review or replay stage."""
+    """Return a read-only path-to-frozen-coordinate index for context's captured patches.
+
+    Context must have unique current paths; callers validate patch completeness during
+    preparation. The index is shared across workers without mutation and contains
+    LEFT/RIGHT one-based inline locations, not a proof of model understanding.
+    """
     return MappingProxyType(
         {file.filename: frozenset(diff_lines(file.patch)) for file in context.files}
     )
@@ -296,6 +320,7 @@ def validate_anchors(anchors: AnchorIndex, reviews: list[Review]) -> None:
         ValueError: A finding is outside the captured diff. Reports remain on disk
             for diagnosis; this fails the run rather than silently dropping findings.
     """
+    # Reject any unsupported location rather than filtering findings out of the verdict.
     for review in reviews:
         for finding in review.findings:
             if (finding.side, finding.line) not in anchors.get(finding.path, frozenset()):

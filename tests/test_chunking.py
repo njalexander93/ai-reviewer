@@ -30,6 +30,7 @@ def test_large_file_is_split_without_losing_changes() -> None:
             after_mode="100644",
         )
     ]
+    # Plan the oversized file, then require disjoint record coverage and bounded packets.
     result = plan(context)
     assert result.whole is None
     assert len(result.chunks) > 1
@@ -112,6 +113,7 @@ def test_packing_is_stable_under_file_inventory_order() -> None:
         )
         for name in ("b", "a", "test_a")
     ]
+    # Only inventory order changes; both plans must retain identical ownership.
     first = plan(context)
     context.files.reverse()
     second = plan(context)
@@ -133,6 +135,7 @@ def test_large_mode_change_preserves_complete_source() -> None:
         before_mode="100644",
         after_mode="100755",
     )
+    # Split patchless evidence without losing either version or reusing unit IDs.
     split = units(file)
     assert len(split) > 1
     assert len({u.id for u in split}) == len(split)
@@ -156,6 +159,7 @@ def test_single_oversized_physical_line_fails_explicitly() -> None:
         before_mode=None,
         after_mode="100644",
     )
+    # Require explicit rejection rather than slicing away an indivisible line.
     with pytest.raises(ValueError, match="Indivisible"):
         units(file)
 
@@ -187,6 +191,7 @@ def test_patch_validation_accepts_exact_git_changes(before: str, after: str) -> 
         before_mode="100644",
         after_mode="100644",
     )
+    # Validate a real Git-produced patch without changing either source fixture.
     validate_patch(file)
     assert file.before == before and file.after == after
 
@@ -324,6 +329,7 @@ def test_reference_index_matches_complete_tokens_renames_and_first_line_evidence
         template.model_copy(update={"filename": "tests/test_target.py"}),
         template.model_copy(update={"filename": "unrelated.py"}),
     ]
+    # Check exact known relationships, then require evidence near the first references.
     links = direct_relations(context)
     assert set(links) == {
         ("lib/target.py", "src/caller.py"),
@@ -363,6 +369,7 @@ def test_common_filenames_and_short_substrings_do_not_create_relations() -> None
         template.model_copy(update={"filename": name, "before": "", "after": text})
         for name, text in (("go.mod", ""), ("a.py", ""), ("caller.py", "cargo data setup"))
     ]
+    # Reject substring/name-only collisions before adding one complete module token.
     assert direct_relations(context) == {}
     context.files[-1].after = "import a\n"
     assert set(direct_relations(context)) == {("a.py", "caller.py")}
@@ -393,6 +400,7 @@ def test_incremental_packet_sizes_match_serialized_unicode_and_shared_comments()
         )
         for path in ("unchanged.py", "a.py", "b.py")
     ]
+    # Compare independent full serialization with incremental admission and duplicate admission.
     metadata = packet_metadata(context)
     evidence = [u for f in context.files for u in units(f)]
     sizer = PacketSizer(metadata, evidence)

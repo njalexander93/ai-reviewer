@@ -253,7 +253,6 @@ completion after job cancellation is not established. A timed-out run may theref
 lose usage/evidence and must never be treated as a clean review. A new run needs a fresh
 artifact directory, as supplied by a new Actions job.
 
-See [measured examples and validation limits](docs/chunking-validation.md).
 
 GitHub review submission is not atomic with the final revision check. A push in
 that small interval can leave a review attached to the old commit. Enable stale

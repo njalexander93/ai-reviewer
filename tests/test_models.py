@@ -168,6 +168,7 @@ def test_provider_count_blocks_generation_before_capacity_overflow(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str
 ) -> None:
     """A provider count above 250k blocks generation even for a tiny byte payload."""
+    # Expose a provider count over policy and observe whether generation starts.
     generated = []
     client = SimpleNamespace(
         responses=SimpleNamespace(
@@ -194,6 +195,7 @@ def test_costs_include_every_isolated_attempt(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
     """Three Opus attempts at $0.40 and two Sol attempts at $0.20 total $1.60."""
+    # Create nested successful attempts plus unknown usage before aggregating costs.
     for role, count in (("claude", 3), ("openai", 2)):
         for index in range(count):
             target = tmp_path / "work" / str(index) / role
@@ -216,6 +218,7 @@ def test_preflight_never_generates_or_records_usage(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str
 ) -> None:
     """Counting-only requests must not cross the paid-generation boundary."""
+    # Keep counting successful while making generation observable.
     generated = []
     client = SimpleNamespace(
         responses=SimpleNamespace(
@@ -240,12 +243,17 @@ def test_provider_validation_failure_saves_redacted_diagnostics(
     """An SDK parse failure records provider and schema location before propagating."""
     from pydantic import ValidationError
 
+    # Inject a real validation exception carrying private input at the SDK boundary.
     error = ValidationError.from_exception_data(
         "Review", [{"type": "string_type", "loc": ("summary",), "input": {"secret": "content"}}]
     )
 
     def parse(**kwargs: object) -> None:
-        """Inject a real validation exception at the SDK parsing boundary."""
+        """Raise the captured real ValidationError at the SDK parse boundary.
+
+        All SDK keyword options are accepted but ignored. No provider/network call occurs;
+        the exception intentionally carries private input for the diagnostic assertion.
+        """
         raise error
 
     client = SimpleNamespace(
@@ -281,10 +289,15 @@ def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
     """Both providers receive accurate scope framing and the same request-capable contract."""
     from ai_reviewer.contracts import ChunkReview
 
+    # Capture count requests for each role/scope without purchasing a completion.
     calls = []
 
     def count(**kwargs: object) -> SimpleNamespace:
-        """Capture the actual preflight provider request without making a paid call."""
+        """Capture kwargs and return an SDK-shaped synthetic count of 100 input tokens.
+
+        The calls list retains the actual request options for assertions. No generation,
+        network access or artifact writes occur in this replacement count endpoint.
+        """
         calls.append(kwargs)
         return SimpleNamespace(input_tokens=100)
 

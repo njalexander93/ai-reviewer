@@ -200,6 +200,7 @@ def test_chunked_cli_handoff_uses_manifest_and_large_consolidation_contract(
     from ai_reviewer import work
     from tests.test_work import fake_model, large_context
 
+    # Bind synthetic providers and GitHub to real stage/artifact handling.
     context = large_context()
     (tmp_path / "context.json").write_text(context.model_dump_json())
     server = Server()
@@ -207,6 +208,7 @@ def test_chunked_cli_handoff_uses_manifest_and_large_consolidation_contract(
     monkeypatch.setattr(work, "call_model", fake_model)
     monkeypatch.setattr(cli, "GitHub", lambda token: server.gh)
     monkeypatch.setenv("AI_REVIEWER_TOKEN", "fixture-token")
+    # Run all downstream commands, then require exactly one completed publication.
     for stage in ("review", "consolidate", "publish"):
         monkeypatch.setattr(sys, "argv", ["review", stage, "--directory", str(tmp_path)])
         cli.main()

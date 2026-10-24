@@ -32,6 +32,7 @@ def publish(
     from ai_reviewer.contracts import CoveredReviews, IndependentSummary
     from ai_reviewer.serialization import digest
 
+    # Construct internal loader-shaped data to isolate adapter behavior.
     covered = CoveredReviews(
         reviews=reports,
         independent_summaries=[
@@ -41,6 +42,7 @@ def publish(
         snapshot=digest(context.model_dump_json()),
         summary="Both providers completed fixture work.",
     )
+    # Run the production adapter; separate work/CLI tests establish artifact coverage.
     return publish_review(gh, context, covered, result)
 
 
@@ -643,6 +645,7 @@ def test_preparation_accepts_more_than_eighty_changed_files(
     """The previous 80-file restriction no longer rejects a complete 125-file snapshot."""
     from ai_reviewer import context as collection
 
+    # Supply a complete paginated inventory beyond the former 80-file threshold.
     server = Server()
     server.pr["changed_files"] = 125
     server.files = [
@@ -666,6 +669,7 @@ def test_summary_provider_labels_follow_explicit_identity() -> None:
     from ai_reviewer.contracts import CoveredReviews, IndependentSummary
     from ai_reviewer.serialization import digest
 
+    # Deliberately order explicit presentation identities differently from report order.
     server = Server()
     context, reports, result = bundle(server)
     covered = CoveredReviews(
@@ -677,6 +681,7 @@ def test_summary_provider_labels_follow_explicit_identity() -> None:
             IndependentSummary(assignment="whole", provider="claude", summary="Claude assessment"),
         ],
     )
+    # Require the posted labels to follow metadata rather than list position.
     publish_review(server.gh, context, covered, result)
     body = server.writes[0][1]["body"]
     assert "<summary>OpenAI</summary>\n\nOpenAI assessment" in body

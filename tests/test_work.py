@@ -24,7 +24,11 @@ from tests.test_github import Server, bundle
 
 
 def large_context() -> ReviewContext:
-    """Provide two changed components whose combined packet exceeds 600 KB."""
+    """Return an isolated synthetic snapshot that exceeds the whole-packet ceiling.
+
+    Two added source/test files each carry 2,000 LF-terminated lines and full patches.
+    No repository contents or provider responses are read; callers may mutate the fixture.
+    """
     context, _, _ = bundle(Server())
     context.files = [
         ChangedFile(
@@ -45,7 +49,18 @@ def large_context() -> ReviewContext:
 def fake_model(
     role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
 ) -> None:
-    """Return complete source-preserving responses without paid calls or GitHub writes."""
+    """Write synthetic reports at the provider boundary without network calls.
+
+    Args:
+        role: Reviewer writes an empty complete report; consolidate groups each source ID.
+        payload: JSON input whose sources determine the synthetic consolidation groups.
+        directory: Artifact location, created if needed.
+        kind: Accepted for call_model compatibility; it does not change the fake's behavior.
+        preflight: Return without files or generation when true.
+
+    Writes role.json and a null usage artifact. Invalid JSON and filesystem errors
+    propagate. These application fixtures do not establish real provider behavior.
+    """
     if preflight:
         return
     directory.mkdir(parents=True, exist_ok=True)
@@ -113,6 +128,7 @@ def test_corrupt_coverage_cannot_approve(
     context = large_context()
     monkeypatch.setattr(work, "call_model", fake_model)
     work.review_chunks(context, tmp_path)
+    # Alter one previously valid coverage invariant, then require replay to fail.
     path = tmp_path / "manifest.json"
     manifest = work.Manifest.model_validate_json(path.read_text())
     if damage == "missing":
@@ -142,7 +158,12 @@ def test_cross_chunk_source_requests_are_resolved_or_fail_closed(
     seen = []
 
     def model(role: str, payload: str, directory: Path, **kwargs: object) -> None:
-        """Request a known line, then inspect the exact captured bytes on continuation."""
+        """Write a required source request, then complete only when unresolved is false.
+
+        Role selects the artifact filename; payload is recorded in seen and its requested
+        text is checked on continuation. Directory must exist. Extra call options are
+        ignored. The written JSON is synthetic, not a recorded provider response.
+        """
         data = json.loads(payload)
         seen.append(data)
         report = ChunkReview(
@@ -165,6 +186,7 @@ def test_cross_chunk_source_requests_are_resolved_or_fail_closed(
         (directory / f"{role}.json").write_text(report.model_dump_json())
 
     monkeypatch.setattr(work, "call_model", model)
+    # Exercise successful continuation or exhaustion through the real attempt loop.
     if unresolved:
         with pytest.raises(ValueError, match="exhausted"):
             work.run_assignment(
@@ -187,13 +209,18 @@ def test_failed_provider_leaves_manifest_incomplete(
     """One successful provider cannot mask the other provider's failure."""
 
     def model(role: str, payload: str, directory: Path, **kwargs: object) -> None:
-        """Fail OpenAI while allowing all scheduled Claude evidence to finish."""
+        """Accept preflight, then raise TimeoutError for OpenAI generation.
+
+        Role/payload/directory follow fake_model; kwargs supplies the preflight flag.
+        Claude generation delegates to fake_model with local framing and writes evidence.
+        """
         if kwargs.get("preflight"):
             return
         if role == "openai":
             raise TimeoutError()
         fake_model(role, payload, directory, kind="local")
 
+    # Run the real batch with one failing generation provider and inspect persisted states.
     monkeypatch.setattr(work, "call_model", model)
     with pytest.raises(ValueError, match="failed"):
         work.review_chunks(large_context(), tmp_path)
@@ -290,7 +317,11 @@ def test_known_cross_chunk_defect_matches_whole_packet_fixture(
     )
 
     def recognize(payload: str) -> list:
-        """Recognize only the deliberately planted incompatibility in actual source."""
+        """Return the planted finding only when payload contains both incompatible snippets.
+
+        Payload is whole-context or scoped JSON. The returned list contains the fixture's
+        original expected object, not a model inference; only supplied after text is read.
+        """
         data = json.loads(payload)
         files = data.get("files", data.get("scope", {}).get("units", []))
         actual = "\n".join(f["after"] for f in files)
@@ -305,7 +336,12 @@ def test_known_cross_chunk_defect_matches_whole_packet_fixture(
     assert len(plan(context, packet_bytes=200_000).chunks) == 2
 
     def model(role: str, payload: str, directory: Path, **kwargs: object) -> None:
-        """Return the recognizer's evidence-backed finding in the application schema."""
+        """Write recognizer findings or force chunking at the whole-packet preflight.
+
+        Role selects the output filename; payload supplies captured source; directory
+        must exist. kwargs carries kind/preflight. Whole preflight raises CapacityError,
+        local preflight returns, and generation writes a synthetic complete ChunkReview.
+        """
         if kwargs.get("preflight"):
             if kwargs.get("kind") == "whole":
                 raise work.CapacityError("Synthetic forced partition")
@@ -349,6 +385,7 @@ def test_accumulated_findings_are_paged_with_actual_integration_source() -> None
         )
         for i in range(2 * len(planned.chunks))
     ]
+    # Force report paging, then require actual source and every distinct finding on its pages.
     assignments = work.integration_assignments(
         context,
         planned,
@@ -385,6 +422,7 @@ def test_reordered_reports_keep_assignment_identity() -> None:
         for c in planned.chunks
         for role in ("claude", "openai")
     }
+    # Reorder storage only; scope/report identity must remain unchanged.
     reversed_reports = dict(reversed(list(reports.items())))
     actual = work.integration_assignments(context, planned, reversed_reports)
     for i, chunk in enumerate(planned.chunks):
@@ -427,7 +465,12 @@ def test_token_overflow_replans_before_generation(
     def model(
         role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
     ) -> None:
-        """Model the capacity response independently of byte size; record generated inputs."""
+        """Reject only the selected role's whole preflight, then delegate to fake_model.
+
+        Role/payload/directory/kind/preflight follow fake_model. Generated input strings
+        are retained in generated. CapacityError is independent of byte length here;
+        all other preflights return without artifacts.
+        """
         if preflight:
             if role == rejecting_role and kind == "whole":
                 raise work.CapacityError("Provider input capacity budget exceeded")
@@ -459,11 +502,16 @@ def test_stage_compiles_anchors_once_for_all_workers_and_replay(
     compiled = []
 
     def compile_once(context: ReviewContext) -> work.AnchorIndex:
-        """Count the expensive snapshot boundary, without bypassing its implementation."""
+        """Compile context with the original implementation and record the returned index.
+
+        Returns the same read-only index, without replacing validation or changing context.
+        Only the test's compiled list is mutated.
+        """
         anchors = compile_original(context)
         compiled.append(anchors)
         return anchors
 
+    # Count actual index construction during review/replay and verify its read-only boundary.
     monkeypatch.setattr(work, "compile_anchors", compile_once)
     monkeypatch.setattr(work, "call_model", fake_model)
     work.review_chunks(context, tmp_path)
@@ -494,16 +542,25 @@ def test_integration_budget_matches_finished_packets_without_trial_serialization
     serialized = []
 
     def budget(self: PacketSizer, id: str, extra: dict | None = None) -> object:
-        """Retain the counters used for each final packet, without replacing their logic."""
+        """Call the original PacketSizer.budget and retain its live counter by scope id.
+
+        Id/extra follow that method's contract. Returns its actual mutable ArrayBudget;
+        the test's budgets map observes later admission without reimplementing accounting.
+        """
         result = original_budget(self, id, extra)
         budgets[id] = result
         return result
 
     def payload(self: Chunk, metadata: object) -> str:
-        """Observe full source serialization at the public packet boundary."""
+        """Record this chunk's ID, then return its original payload serialization.
+
+        Metadata follows Chunk.payload's contract. Only the test's serialized list changes;
+        source and byte construction remain the production implementation.
+        """
         serialized.append(self.id)
         return original_payload(self, metadata)
 
+    # Observe final serialization and compare its bytes to the retained incremental budget.
     monkeypatch.setattr(PacketSizer, "budget", budget)
     monkeypatch.setattr(Chunk, "payload", payload)
     assignments = work.integration_assignments(context, planned, reports)
@@ -532,7 +589,13 @@ def test_capacity_fallback_bounds_integration_and_followup_payloads(
     def model(
         role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
     ) -> None:
-        """Enforce the fallback ceiling on every call and request one small source range."""
+        """Reject oversized input, then request source once per local provider assignment.
+
+        Role/payload/directory/kind/preflight follow fake_model. CapacityError is raised
+        above 200,000 UTF-8 bytes, even on preflight. Accepted preflight writes nothing.
+        Generation records input, writes one synthetic request for local work, and delegates
+        later reports to fake_model. The requested set tracks each assignment/provider pair.
+        """
         if len(payload.encode()) > 200_000:
             raise work.CapacityError("Dense synthetic input exceeds capacity")
         if preflight:
@@ -559,6 +622,7 @@ def test_capacity_fallback_bounds_integration_and_followup_payloads(
         else:
             fake_model(role, payload, directory, kind=kind)
 
+    # Run fallback and real artifact replay under the synthetic byte-sensitive provider gate.
     monkeypatch.setattr(work, "call_model", model)
     work.review_chunks(context, tmp_path)
     assert work.load_reviews(context, tmp_path).reviews
@@ -575,11 +639,16 @@ def test_small_review_consolidates_once_with_original_assessments(
     calls = []
 
     def model(role: str, payload: str, directory: Path, **kwargs: object) -> None:
-        """Record consolidation inputs while retaining real artifact replay."""
+        """Record decoded consolidation inputs, then delegate every call to fake_model.
+
+        Role/payload/directory and kwargs follow fake_model's contract. The calls list
+        changes only for consolidation; artifact creation and preflight behavior remain shared.
+        """
         if role == "consolidate":
             calls.append(json.loads(payload))
         fake_model(role, payload, directory, **kwargs)
 
+    # Run the real small-review flow and inspect the single consolidation request.
     monkeypatch.setattr(work, "call_model", model)
     work.review_chunks(context, tmp_path)
     work.consolidate_chunks(context, tmp_path)
@@ -604,6 +673,7 @@ def test_attempt_transition_rejects_invalid_completion(state: str) -> None:
         if state == "incomplete_without_request"
         else [SourceRequest(path="app.py", side="RIGHT", start=1, end=1, reason="Check caller")],
     )
+    # Supply invalid states directly so rejection does not depend on a model response.
     history = [report, report] if state == "exhausted" else []
     with pytest.raises(ValueError):
         work.advance(

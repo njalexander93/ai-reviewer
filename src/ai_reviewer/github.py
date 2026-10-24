@@ -73,7 +73,7 @@ class GitHub:
             RuntimeError: GitHub fails, redirects a write, exceeds five redirects,
                 or redirects outside its HTTPS API host. Messages omit response bodies.
             httpx.HTTPError: A transport or timeout failure prevents completion.
-            ValueError: A nonempty response cannot be decoded as JSON.
+            ValueError: Request budget is exhausted or a nonempty response is invalid JSON.
         """
         # Follow moved read resources without forwarding credentials outside GitHub.
         for redirect in range(6):
@@ -271,7 +271,8 @@ def publish(
         False if this revision was already published; True after a new submission.
 
     Raises:
-        ValueError: Results, identity, diff anchors or current PR state are invalid.
+        ValueError: Results, identity, diff anchors or current PR state are invalid,
+            or the assembled review exceeds comment-count/body/payload bounds.
         RuntimeError: GitHub rejects a request; transport errors also propagate.
     """
     # Coverage was replayed once by the canonical loader; bind it to this snapshot.
