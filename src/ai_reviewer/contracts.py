@@ -319,19 +319,28 @@ def compile_anchors(context: ReviewContext) -> AnchorIndex:
     )
 
 
-def validate_anchors(anchors: AnchorIndex, reviews: list[Review]) -> None:
-    """Reject invalid model locations before purchasing consolidation.
+def partition_findings(anchors: AnchorIndex, review: Review) -> tuple[list[Finding], list[int]]:
+    """Separate publishable findings from invalid nonblocking locations.
 
     Args:
-        anchors: Precompiled immutable snapshot coordinates.
-        reviews: Independent reports with locations to validate.
+        anchors: Immutable coordinates from the captured diff, not full source lines.
+        review: Schema-validated report; neither it nor its findings are mutated.
+
+    Returns:
+        Original accepted findings in order and zero-based rejected finding indexes.
+        Indexes refer to the untouched provider response for artifact provenance.
 
     Raises:
-        ValueError: A finding is outside the captured diff. Reports remain on disk
-            for diagnosis; this fails the run rather than silently dropping findings.
+        ValueError: Any blocking finding is outside the captured diff.
     """
-    # Reject any unsupported location rather than filtering findings out of the verdict.
-    for review in reviews:
-        for finding in review.findings:
-            if (finding.side, finding.line) not in anchors.get(finding.path, frozenset()):
-                raise ValueError("Finding is outside the captured diff")
+    accepted = []
+    rejected = []
+    # Only advisory location errors are recoverable; blockers must still fail closed.
+    for index, finding in enumerate(review.findings):
+        if (finding.side, finding.line) in anchors.get(finding.path, frozenset()):
+            accepted.append(finding)
+        elif finding.blocking:
+            raise ValueError("Finding is outside the captured diff")
+        else:
+            rejected.append(index)
+    return accepted, rejected

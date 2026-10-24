@@ -148,6 +148,22 @@ against Linear's [published SDK schema](https://github.com/linear/linear/blob/61
 not a flat attachment list. Mock fixtures preserve that provider contract;
 authenticated live validation remains deferred.
 
+## Rejected advisory locations
+
+A schema-valid nonblocking finding outside the captured diff is excluded from
+integration, consolidation and publication. Full source visibility does not make
+an unchanged line a valid inline anchor. Invalid blocking locations still fail
+the run, as do schema, completeness and coverage errors. No correction call is made.
+
+The exact response remains in `work/<assignment>/<provider>/<attempt>/<provider>.json`.
+`rejected-findings.json` beside it records each rejected finding, its zero-based
+index in that response and the validation reason. Accepted findings retain their
+original order, wording and severity. Replay derives the same selection from the
+raw response; the diagnostic sidecar is not trusted as review input. An affected
+report's summary is replaced with a neutral completion/context statement so its
+original prose cannot publish the rejected finding. The original summary remains
+in the raw response. Usage and cost artifacts are unchanged.
+
 ## Failure diagnostics
 
 Failed stages and model calls emit bounded JSON diagnostics to Actions logs and
@@ -226,9 +242,10 @@ replace the old 80-file and 150 KB per-version rejection.
    scope instructions with the same source-request contract. Require every enabled provider for all assignments and all follow-ups.
    Coverage proves assignment/completion; it does not prove model understanding.
 7. The consolidator groups up to 40 original findings per batch with global source IDs.
-   All findings, locations and severity survive exactly once. Cross-batch duplicate
-   findings remain separate. Bounded summary passes carry original assessments
-   and disagreements into one overview. Publication submits **one GitHub review**.
+   All accepted findings, locations and severity survive exactly once. Cross-batch duplicate
+   findings remain separate. Bounded summary passes carry assessments
+   and disagreements into one overview, using neutral summaries for reports with
+   rejected advisory locations as described above. Publication submits **one GitHub review**.
 
 Chunked local and integration packets include a declaration index in
 `overview.inventory[].declarations`. Python classes, functions and async functions

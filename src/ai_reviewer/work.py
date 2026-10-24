@@ -37,7 +37,7 @@ from ai_reviewer.contracts import (
     ReviewContext,
     SourceRequest,
     compile_anchors,
-    validate_anchors,
+    partition_findings,
 )
 from ai_reviewer.diagnostics import FollowupExhausted, report_failure
 from ai_reviewer.limits import (
@@ -568,7 +568,7 @@ def advance(
     report_json: str,
     anchors: AnchorIndex,
     packet_bytes: int,
-) -> tuple[ChunkReview, str | None]:
+) -> tuple[ChunkReview, str | None, list[dict[str, Any]]]:
     """Validate one report and determine the next protocol step without I/O.
 
     Args:
@@ -580,22 +580,41 @@ def advance(
         packet_bytes: Maximum UTF-8 size of a continuation payload.
 
     Returns:
-        Parsed report and next JSON payload, or None for the payload when complete.
+        Accepted report, next JSON payload (None when complete), and rejection records
+        containing original finding indexes, raw findings and validation reasons.
 
     Raises:
         FollowupExhausted: The final allowed report still requests required evidence.
-        ValueError: Schema or anchors are invalid, completion conflicts with requests,
+        ValueError: Schema or blocking anchors are invalid, completion conflicts with requests,
             incomplete work has no request, requested source
             is unavailable, or the continuation exceeds the packet ceiling.
     """
     # Parse and anchor-check before interpreting a provider completion claim.
     report = ChunkReview.model_validate_json(report_json)
-    validate_anchors(anchors, [report])
+    findings, rejected_indexes = partition_findings(anchors, report)
+    rejected = [
+        {
+            "finding_index": index,
+            "finding": report.findings[index].model_dump(),
+            "reason": "Finding is outside the captured diff",
+        }
+        for index in rejected_indexes
+    ]
+    # Raw prose may repeat a rejected finding; keep it only in the original artifact.
+    if rejected:
+        report = report.model_copy(
+            update={
+                "findings": findings,
+                "summary": "Review completed."
+                if report.complete
+                else "Review requires more context.",
+            }
+        )
     # Complete work must have no outstanding required source requests.
     if report.complete:
         if report.requests:
             raise ValueError("Complete report cannot have required source requests")
-        return report, None
+        return report, None, rejected
     # Incomplete work must request available evidence within the remaining attempt bound.
     if not report.requests:
         raise ValueError("Required context unresolved")
@@ -603,7 +622,11 @@ def advance(
         raise FollowupExhausted(
             len(history) + 1, report.requests, {file.filename for file in context.files}
         )
-    return report, followup_payload(context, assignment, [*history, report], packet_bytes)
+    return (
+        report,
+        followup_payload(context, assignment, [*history, report], packet_bytes),
+        rejected,
+    )
 
 
 def run_assignment(
@@ -632,7 +655,8 @@ def run_assignment(
         OSError: Attempt artifacts cannot be written or read.
         Exception: Provider errors propagate; call_model retains available usage.
 
-    Writes payloads/reports/usage, prints progress, and may make paid provider calls.
+    Writes payloads/reports/usage and rejected-findings.json for invalid nonblockers.
+    Original responses remain untouched. Prints progress and may make paid provider calls.
     """
     history: list[ChunkReview] = []
     payload = assignment.payload
@@ -647,7 +671,7 @@ def run_assignment(
             f"Review attempt: assignment={assignment.id} role={role} attempt={round_}", flush=True
         )
         call_model(role, payload, target, kind=assignment.kind)
-        report, next_payload = advance(
+        report, next_payload, rejected = advance(
             context,
             assignment,
             history,
@@ -655,6 +679,9 @@ def run_assignment(
             anchors,
             packet_bytes,
         )
+        # The directory identifies assignment/provider/attempt; records identify raw indexes.
+        if rejected:
+            (target / "rejected-findings.json").write_text(encode(rejected))
         # Keep prior findings available and stop only on a validated terminal report.
         history.append(report)
         if next_payload is None:
@@ -772,7 +799,7 @@ def read_batch(
         packet_bytes: Plan ceiling for reconstructing continuation inputs.
 
     Returns:
-        Reports keyed by (assignment ID, provider), retaining all attempt findings
+        Reports keyed by (assignment ID, provider), retaining accepted attempt findings
         and the last summary. Performs file reads only, with no provider calls.
 
     Raises:
@@ -797,7 +824,7 @@ def read_batch(
                 target = attempt_directory(directory, assignment.id, role, round_)
                 if (target / "payload.json").read_text() != payload:
                     raise ValueError("Attempt evidence differs from required work")
-                report, next_payload = advance(
+                report, next_payload, _ = advance(
                     context,
                     assignment,
                     history,
@@ -811,7 +838,7 @@ def read_batch(
                     raise ValueError("Recorded attempts disagree with required follow-up protocol")
                 if next_payload is not None:
                     payload = next_payload
-            # Preserve every attempt finding, using only the final assessment as summary.
+            # Preserve accepted attempt findings, using only the final assessment as summary.
             reports[(assignment.id, role)] = CompletedReview(
                 complete=True,
                 summary=history[-1].summary,
