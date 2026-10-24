@@ -71,50 +71,13 @@ planning and integration construction, excluding collection, providers and repla
 They are smoke observations, not before/after speedup or worst-case claims. The
 24 MB input demonstrates bounded rejection, not successful review coverage.
 
-## Historical revision e9434eb: original feedback repair
+## Earlier validation records
 
-The repair removes the obsolete branch-test workflow and uses one manifest-backed
-review/consolidation/publication flow for both packet sizes. Small initial payloads
-remain byte-identical. A provider-counted capacity rejection before generation
-selects a bounded chunk plan. Publication consumes the canonical loader's covered
-reports once, with snapshot binding and the existing live GitHub safeguards.
-
-Relations now use a multi-pattern literal index over each captured version and a
-normalized source/test-name index. The plan reuses that evidence for packing and
-integration. Integration expands indexed file relationships and adjacent units,
-not every unrelated unit pair; expansion fails above 20,000 distinct cross-owner
-pairs. Shared overview and discussion metadata are compiled once per plan.
-Manifest updates contain plan/payload hashes, ownership and completion records,
-not full source packets. Attempt payloads remain the replay evidence.
-
-Validation on the repair: 148 tests passed; 92.87% branch-aware coverage. Ruff,
-Mypy and whitespace checks passed. New cases cover report insertion-order changes,
-compact manifest tampering, both providers' token-overflow fallback before
-generation, count-only calls, overlapping references and renamed paths. Existing
-CLI rejection tests now create real manifest artifacts before corrupting reports,
-so they exercise completeness/anchor rejection rather than missing-file failure.
-
-The static test audit examined 59 test functions in five changed files, with no
-cannot-fail findings or parser gaps. Fresh-context expectation review covered 12
-changed functions in the planner, orchestration and provider tests: 3 PASS,
-9 UNKNOWN, no FLAG. UNKNOWN includes synthetic provider-response provenance and
-exact fixture-size/range expectations. The repeated-reference fixture was then
-tightened to distinguish the first occurrence from later occurrences. Model-family
-independence is unverified; these reviews do not establish live-provider behavior.
-
-Offline reruns used the same historical snapshots below. Their complete indexed
-relationship/evidence results matched the previous implementation exactly.
-PR #9 retained 11 chunks and 24 integration assignments (largest 592,218 bytes);
-PR #18 retained 8 chunks and 15 integration assignments (largest 575,039 bytes).
-Planning/integration took 1.113/0.617 seconds and 0.565/0.149 seconds respectively.
-A separate 3,000-file fixture with 24,000,000 captured source bytes and no matching
-references completed relationship discovery in 0.759 seconds. These are single
-development-Mac measurements, not comparative speedup or worst-case guarantees.
-Dense matching remains bounded by relation/work limits.
-
-The 180-minute Actions job timeout is the effective wall-clock ceiling. Work and
-per-call maxima do not promise completion within it. Cost/evidence steps use
-`always()`, but their completion after cancellation remains unverified.
+The original repair's 148-test run and initial 141-test run are historical, not
+current results. Their complete evidence remains in the
+[e9434eb validation record](https://github.com/njalexander93/ai-reviewer/blob/e9434eb/docs/chunking-validation.md).
+The prior 162-test follow-up remains in the
+[40c4c4e validation record](https://github.com/njalexander93/ai-reviewer/blob/40c4c4e/docs/chunking-validation.md).
 
 ## Historical snapshots
 
@@ -194,28 +157,3 @@ prove semantic fidelity. Original reports and findings remain available in the
 artifacts; finding partition and severity preservation are enforced in code.
 Cross-batch duplicates can appear as separate comments. GitHub's final revision
 check and review write remain non-atomic; stale approval dismissal is required.
-
-## Historical initial implementation checks
-
-Required local checks passed: lock consistency, Ruff formatting/lint, Mypy, and
-141 tests with 92.07% branch-aware coverage. The bounded static test audit examined
-54 functions across five changed test files; no cannot-fail pattern was reported.
-
-A separate read-only safety review found report-overflow, omitted distant-reference
-and consolidation-retry accounting defects. All were repaired and regression-tested,
-including same-chunk references outside changed hunks.
-
-Fresh-context Astra test judges checked 17 functions in the two new test files.
-The evidence validator accepted 10 PASS and 7 UNKNOWN verdicts; no FLAG verdicts.
-Model-family independence from the writer was not established. The nine planner
-PASS verdicts cover whole-packet preservation, patch coverage, metadata overflow,
-Unicode/coordinates, deterministic packing, mode-only source, indivisible lines,
-valid Git patches and partial-patch rejection. Integration report paging also passed.
-
-UNKNOWN remains for the six orchestration tests that use synthetic provider/GitHub
-responses: full pipeline, corrupt manifest, cross-file requests, worker failure,
-many-report source IDs and the known-defect comparison. The distant-reference test
-was also UNKNOWN for its exact one-chunk expectation, although its expected import
-text comes directly from the fixture. These are limits of oracle provenance, not
-observed runtime failures or evidence of live model quality. Other changed test
-files received static audit and execution, not a separate expected-value judge.
