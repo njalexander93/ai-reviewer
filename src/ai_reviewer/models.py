@@ -111,7 +111,8 @@ Preserve disagreements explicitly in the summary. Do not mention pricing.
         "Review every owned section. "
         "Source excerpts carry absolute line starts; patch fragments carry old/new cursors.",
         "integration": "Assess PR-wide compatibility using the actual supplied source "
-        "and reports. "
+        "and reports. Reports contain assignment/provider identity and either "
+        "summary/complete fields or a finding field; paging preserves this shape. "
         "Source excerpts carry absolute line starts; patch fragments carry old/new cursors.",
     }
     instructions += (

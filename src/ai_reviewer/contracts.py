@@ -253,14 +253,24 @@ def reconcile(reviews: list[Review], result: Consolidation) -> list[list[Finding
     return [[sources[key] for key in group.source_ids] for group in result.groups]
 
 
+class IndependentSummary(Contract):
+    """Label an original assessment at the loader, where assignment identity is known."""
+
+    assignment: str
+    provider: Literal["claude", "openai"]
+    summary: str
+
+
 class CoveredReviews(Contract):
     """Carry canonical-loader results to publication without replaying artifacts twice.
 
-    Constructed by load_reviews after exact work and anchor validation. Snapshot
+    Internal application data, not an unforgeable capability or an accepted wire format.
+    The CLI obtains it only from load_reviews after exact work and anchor validation. Snapshot
     binding prevents accidentally publishing these reports against another packet.
     """
 
     reviews: list[Review]
+    independent_summaries: list[IndependentSummary]
     snapshot: str
     summary: str
 

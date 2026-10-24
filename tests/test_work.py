@@ -168,13 +168,13 @@ def test_cross_chunk_source_requests_are_resolved_or_fail_closed(
     if unresolved:
         with pytest.raises(ValueError, match="exhausted"):
             work.run_assignment(
-                context, assignment, "claude", tmp_path, work.compile_anchors(context)
+                context, assignment, "claude", tmp_path, work.compile_anchors(context), 600_000
             )
         assert len(seen) == 3
     else:
         assert (
             work.run_assignment(
-                context, assignment, "claude", tmp_path, work.compile_anchors(context)
+                context, assignment, "claude", tmp_path, work.compile_anchors(context), 600_000
             )
             == 2
         )
@@ -188,6 +188,8 @@ def test_failed_provider_leaves_manifest_incomplete(
 
     def model(role: str, payload: str, directory: Path, **kwargs: object) -> None:
         """Fail OpenAI while allowing all scheduled Claude evidence to finish."""
+        if kwargs.get("preflight"):
+            return
         if role == "openai":
             raise TimeoutError()
         fake_model(role, payload, directory, kind="local")
@@ -305,7 +307,9 @@ def test_known_cross_chunk_defect_matches_whole_packet_fixture(
     def model(role: str, payload: str, directory: Path, **kwargs: object) -> None:
         """Return the recognizer's evidence-backed finding in the application schema."""
         if kwargs.get("preflight"):
-            raise work.CapacityError("Synthetic forced partition")
+            if kwargs.get("kind") == "whole":
+                raise work.CapacityError("Synthetic forced partition")
+            return
         report = ChunkReview(
             complete=True,
             summary="Synthetic evidence comparison",
@@ -361,6 +365,8 @@ def test_accumulated_findings_are_paged_with_actual_integration_source() -> None
     for page in pages:
         packet = json.loads(page.payload)
         assert packet["scope"]["units"] == [u.model_dump() for u in planned.chunks[0].units]
+        assert all(r["assignment"] == planned.chunks[0].id for r in packet["reports"])
+        assert {r["provider"] for r in packet["reports"]} <= {"claude", "openai"}
         findings.extend(r["finding"] for r in packet["reports"] if "finding" in r)
     assert len(findings) == 240
     assert {f["title"] for f in findings} == {
@@ -423,7 +429,7 @@ def test_token_overflow_replans_before_generation(
     ) -> None:
         """Model the capacity response independently of byte size; record generated inputs."""
         if preflight:
-            if role == rejecting_role:
+            if role == rejecting_role and kind == "whole":
                 raise work.CapacityError("Provider input capacity budget exceeded")
             return
         generated.append(payload)
@@ -510,14 +516,16 @@ def test_integration_budget_matches_finished_packets_without_trial_serialization
     assert len(serialized) == len(planned.chunks) + len(edges)
 
 
+@pytest.mark.parametrize("file_count", [1, 2])
 def test_capacity_fallback_bounds_integration_and_followup_payloads(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, file_count: int
 ) -> None:
     """A dense-input counter rejects every oversized call, including later integration."""
     from ai_reviewer.contracts import SourceRequest
 
     context = large_context()
-    context.files = context.files[:1]
+    context.files = context.files[:file_count]
+    assert (plan(context).whole is None) == (file_count == 2)
     generated = []
     requested = set()
 
@@ -577,3 +585,32 @@ def test_small_review_consolidates_once_with_original_assessments(
     work.consolidate_chunks(context, tmp_path)
     assert len(calls) == 1
     assert calls[0]["reviews"] == ["Reviewed actual supplied source."] * 2
+
+
+@pytest.mark.parametrize(
+    "state", ["complete_with_request", "incomplete_without_request", "exhausted"]
+)
+def test_attempt_transition_rejects_invalid_completion(state: str) -> None:
+    """Completion requires no pending requests; incomplete work needs bounded follow-up."""
+    from ai_reviewer.contracts import SourceRequest
+
+    context, _, _ = bundle(Server())
+    assignment = work.local_assignments(context, plan(context))[0]
+    report = ChunkReview(
+        complete=state == "complete_with_request",
+        summary="Need evidence",
+        findings=[],
+        requests=[]
+        if state == "incomplete_without_request"
+        else [SourceRequest(path="app.py", side="RIGHT", start=1, end=1, reason="Check caller")],
+    )
+    history = [report, report] if state == "exhausted" else []
+    with pytest.raises(ValueError):
+        work.advance(
+            context,
+            assignment,
+            history,
+            report.model_dump_json(),
+            work.compile_anchors(context),
+            600_000,
+        )

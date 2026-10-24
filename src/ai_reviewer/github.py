@@ -321,9 +321,9 @@ def publish(
             comments.append({"path": filename, "side": side, "line": line, "body": body})
     # Attach the validated completion summary beneath the consolidated overview.
     body = f"{marker}\n## AI review\n\n{result.summary}\n\n"
-    if len(reviews) == 2:
-        for label, review in zip(("Claude Opus", "OpenAI"), reviews, strict=True):
-            body += f"<details><summary>{label}</summary>\n\n{review.summary}\n\n</details>\n"
+    for assessment in covered.independent_summaries:
+        label = {"claude": "Claude Opus", "openai": "OpenAI"}[assessment.provider]
+        body += f"<details><summary>{label}</summary>\n\n{assessment.summary}\n\n</details>\n"
     body += covered.summary
     # Reject oversized publication atomically; never publish a partial approval.
     if (

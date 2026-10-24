@@ -218,8 +218,9 @@ and [Sol 1.05M context](https://developers.openai.com/api/docs/models/gpt-6.1-so
 and stays below Sol's 272k long-context price threshold. Bytes are not converted
 into guessed tokens. See [Claude token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting)
 and [OpenAI token counting](https://developers.openai.com/api/docs/guides/token-counting).
-For a whole packet, count both provider inputs before either generates a report.
-If either exceeds capacity, re-plan with a 200,000-byte ceiling for every review
+Count both provider inputs for every planned local scope before either generates
+a report, including packets already routed to chunks.
+If any exceeds capacity, re-plan with a 200,000-byte ceiling for every review
 packet, including integration pages and follow-ups. Local chunks target half that
 ceiling and source units at most one quarter, leaving integration headroom.
 Each resulting call still undergoes provider token counting; there is no byte/token

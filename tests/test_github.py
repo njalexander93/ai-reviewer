@@ -29,11 +29,15 @@ def publish(
 
     Real artifact completeness is exercised by test_work and the CLI handoff.
     """
-    from ai_reviewer.contracts import CoveredReviews
+    from ai_reviewer.contracts import CoveredReviews, IndependentSummary
     from ai_reviewer.serialization import digest
 
     covered = CoveredReviews(
         reviews=reports,
+        independent_summaries=[
+            IndependentSummary(assignment="whole", provider=role, summary=report.summary)
+            for role, report in zip(("claude", "openai"), reports)
+        ],
         snapshot=digest(context.model_dump_json()),
         summary="Both providers completed fixture work.",
     )
@@ -655,3 +659,25 @@ def test_preparation_accepts_more_than_eighty_changed_files(
     context = prepare(server.gh, "owner/repo", 1, "reviewer")
     assert len(context.files) == 125
     assert {f.filename for f in context.files} == {f"file-{i}.py" for i in range(125)}
+
+
+def test_summary_provider_labels_follow_explicit_identity() -> None:
+    """Reordered presentation metadata retains the correct provider labels."""
+    from ai_reviewer.contracts import CoveredReviews, IndependentSummary
+    from ai_reviewer.serialization import digest
+
+    server = Server()
+    context, reports, result = bundle(server)
+    covered = CoveredReviews(
+        reviews=reports,
+        snapshot=digest(context.model_dump_json()),
+        summary="Fixture coverage",
+        independent_summaries=[
+            IndependentSummary(assignment="whole", provider="openai", summary="OpenAI assessment"),
+            IndependentSummary(assignment="whole", provider="claude", summary="Claude assessment"),
+        ],
+    )
+    publish_review(server.gh, context, covered, result)
+    body = server.writes[0][1]["body"]
+    assert "<summary>OpenAI</summary>\n\nOpenAI assessment" in body
+    assert "<summary>Claude Opus</summary>\n\nClaude assessment" in body

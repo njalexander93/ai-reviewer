@@ -29,6 +29,7 @@ from ai_reviewer.contracts import (
     CoveredReviews,
     FinalConsolidation,
     Group,
+    IndependentSummary,
     Review,
     ReviewContext,
     SourceRequest,
@@ -47,7 +48,6 @@ from ai_reviewer.limits import (
     MAX_RELATIONS,
     MAX_SUMMARY_CALLS,
     MAX_WORK,
-    PACKET_BYTES,
     SUMMARY_PAGE_SIZE,
 )
 from ai_reviewer.models import AssignmentKind, CapacityError, Role, call_model
@@ -60,7 +60,6 @@ class Assignment(Contract):
 
     id: str
     kind: AssignmentKind
-    packet_bytes: int = PACKET_BYTES
     payload: str
     sections: list[str]
 
@@ -70,7 +69,6 @@ class AssignmentRecord(Contract):
 
     id: str
     kind: AssignmentKind
-    packet_bytes: int = PACKET_BYTES
     payload_digest: str
     sections: list[str]
 
@@ -80,7 +78,6 @@ def assignment_record(assignment: Assignment) -> AssignmentRecord:
     return AssignmentRecord(
         id=assignment.id,
         kind=assignment.kind,
-        packet_bytes=assignment.packet_bytes,
         payload_digest=digest(assignment.payload),
         sections=assignment.sections,
     )
@@ -99,7 +96,7 @@ class Manifest(Contract):
     """Persist exact section ownership and required provider work, including failures."""
 
     plan_digest: str
-    packet_bytes: int = PACKET_BYTES
+    packet_bytes: int
     assignments: list[AssignmentRecord]
     results: list[Completion]
 
@@ -119,11 +116,19 @@ def local_assignments(context: ReviewContext, planned: Plan) -> list[Assignment]
         Assignment(
             id=c.id,
             kind="local",
-            packet_bytes=planned.packet_bytes,
             payload=c.payload(planned.metadata),
             sections=[u.id for u in c.units],
         )
         for c in planned.chunks
+    ]
+
+
+def report_atoms(assignment: str, provider: str, report: Review) -> list[dict[str, Any]]:
+    """Represent each assessment and finding separately, retaining explicit report identity."""
+    identity = {"assignment": assignment, "provider": provider}
+    return [
+        {**identity, "summary": report.summary, "complete": report.complete},
+        *({**identity, "finding": finding.model_dump()} for finding in report.findings),
     ]
 
 
@@ -138,6 +143,11 @@ def integration_assignments(
     """
     if planned.whole is not None:
         return []
+    report_data = {
+        (chunk.id, role): report_atoms(chunk.id, role, local[(chunk.id, role)])
+        for chunk in planned.chunks
+        for role in ("claude", "openai")
+    }
     assignments = []
     links = {(r.left, r.right): r.evidence for r in planned.relations}
 
@@ -170,13 +180,14 @@ def integration_assignments(
     for i, chunk in enumerate(planned.chunks):
         payload = json.loads(chunk.payload(planned.metadata))
         payload["phase"] = "integration: assess PR-wide compatibility; request missing source"
-        payload["reports"] = [local[(chunk.id, role)].model_dump() for role in ("claude", "openai")]
+        payload["reports"] = [
+            atom for role in ("claude", "openai") for atom in report_data[(chunk.id, role)]
+        ]
         payload["reference_source"] = reference_source(chunk.units)
         assignments.append(
             Assignment(
                 id=f"integration-{i:04d}",
                 kind="integration",
-                packet_bytes=planned.packet_bytes,
                 payload=encode(payload),
                 sections=[u.id for u in chunk.units],
             )
@@ -192,9 +203,10 @@ def integration_assignments(
         {
             "reference_source": reference_data,
             "reports": {
-                f"{i}:{role}": local[(chunk.id, role)].model_dump()
+                f"{i}:{role}:{j}": atom
                 for i, chunk in enumerate(planned.chunks)
                 for role in ("claude", "openai")
+                for j, atom in enumerate(report_data[(chunk.id, role)])
             },
         },
     )
@@ -209,7 +221,10 @@ def integration_assignments(
             **sizer.additions(scope),
             "reference_source": reference_keys(paths | added_paths, added_paths - paths),
             "reports": {
-                f"{ownership[u.id]}:{role}" for u in scope for role in ("claude", "openai")
+                f"{ownership[u.id]}:{role}:{j}"
+                for u in scope
+                for role in ("claude", "openai")
+                for j in range(len(report_data[(planned.chunks[ownership[u.id]].id, role)]))
             },
         }
 
@@ -221,14 +236,14 @@ def integration_assignments(
         payload["reference_source"] = reference_source(scope)
         owners = sorted({ownership[u.id] for u in scope})
         payload["reports"] = [
-            local[(planned.chunks[k].id, role)].model_dump()
+            atom
             for k in owners
             for role in ("claude", "openai")
+            for atom in report_data[(planned.chunks[k].id, role)]
         ]
         return Assignment(
             id=pair.id,
             kind="integration",
-            packet_bytes=planned.packet_bytes,
             payload=encode(payload),
             sections=[u.id for u in scope],
         )
@@ -254,7 +269,11 @@ def integration_assignments(
     if pending:
         assignments.append(packet(pending))
     # Large accumulated reports are paged with the same actual source on every page.
-    expanded = [page for assignment in assignments for page in integration_pages(assignment)]
+    expanded = [
+        page
+        for assignment in assignments
+        for page in integration_pages(assignment, planned.packet_bytes)
+    ]
     if len(expanded) + len(planned.chunks) > MAX_WORK:
         raise ValueError("Integration work budget exceeded; review incomplete")
     return expanded
@@ -296,31 +315,25 @@ def integration_edges(planned: Plan) -> tuple[dict[str, int], list[Unit], list[t
     )
 
 
-def integration_pages(assignment: Assignment) -> list[Assignment]:
+def integration_pages(assignment: Assignment, packet_bytes: int) -> list[Assignment]:
     """Partition report evidence while repeating actual source and preserving all findings.
 
     Each page is required work for both providers. Source alone or an indivisible
     report field that cannot fit fails explicitly instead of losing evidence.
     """
-    if len(assignment.payload.encode()) <= assignment.packet_bytes:
+    if len(assignment.payload.encode()) <= packet_bytes:
         return [assignment]
     base = json.loads(assignment.payload)
-    reports = base.pop("reports")
-    atoms = []
-    for index, report in enumerate(reports):
-        atoms.append(
-            {"report_index": index, "summary": report["summary"], "complete": report["complete"]}
-        )
-        atoms.extend({"report_index": index, "finding": finding} for finding in report["findings"])
+    atoms = base.pop("reports")
     pages = []
     pending: list[dict[str, Any]] = []
     for atom in atoms:
         trial = encode({**base, "reports": [*pending, atom]})
-        if len(trial.encode()) > assignment.packet_bytes and pending:
+        if len(trial.encode()) > packet_bytes and pending:
             pages.append(encode({**base, "reports": pending}))
             pending = []
         pending.append(atom)
-        if len(encode({**base, "reports": pending}).encode()) > assignment.packet_bytes:
+        if len(encode({**base, "reports": pending}).encode()) > packet_bytes:
             raise ValueError("Indivisible integration evidence exceeds packet budget")
     if pending:
         pages.append(encode({**base, "reports": pending}))
@@ -328,7 +341,6 @@ def integration_pages(assignment: Assignment) -> list[Assignment]:
         Assignment(
             id=f"{assignment.id}-page-{index:04d}",
             kind=assignment.kind,
-            packet_bytes=assignment.packet_bytes,
             payload=payload,
             sections=assignment.sections,
         )
@@ -358,14 +370,14 @@ def source_sections(context: ReviewContext, requests: list[SourceRequest]) -> li
 
 
 def followup_payload(
-    context: ReviewContext, assignment: Assignment, history: list[ChunkReview]
+    context: ReviewContext, assignment: Assignment, history: list[ChunkReview], packet_bytes: int
 ) -> str:
     """Keep original work and all requested evidence available across bounded rounds."""
     payload = json.loads(assignment.payload)
     payload["prior_attempts"] = [r.model_dump() for r in history]
     payload["requested_source"] = source_sections(context, [q for r in history for q in r.requests])
     serialized = encode(payload)
-    if len(serialized.encode()) > assignment.packet_bytes:
+    if len(serialized.encode()) > packet_bytes:
         raise ValueError("Required follow-up context exceeds packet budget")
     return serialized
 
@@ -375,12 +387,35 @@ def attempt_directory(directory: Path, assignment: str, role: str, round_: int) 
     return directory / "work" / assignment / role / str(round_)
 
 
+def advance(
+    context: ReviewContext,
+    assignment: Assignment,
+    history: list[ChunkReview],
+    report_json: str,
+    anchors: AnchorIndex,
+    packet_bytes: int,
+) -> tuple[ChunkReview, str | None]:
+    """Validate one protocol transition; None marks completion, otherwise return next input."""
+    report = ChunkReview.model_validate_json(report_json)
+    validate_anchors(anchors, [report])
+    if report.complete:
+        if report.requests:
+            raise ValueError("Complete report cannot have required source requests")
+        return report, None
+    if not report.requests:
+        raise ValueError("Required context unresolved")
+    if len(history) + 1 >= MAX_ATTEMPTS:
+        raise ValueError("Required follow-up work exhausted")
+    return report, followup_payload(context, assignment, [*history, report], packet_bytes)
+
+
 def run_assignment(
     context: ReviewContext,
     assignment: Assignment,
     role: Role,
     directory: Path,
     anchors: AnchorIndex,
+    packet_bytes: int,
 ) -> int:
     """Run at most three calls; unresolved or unrequested missing context fails closed."""
     history: list[ChunkReview] = []
@@ -393,16 +428,18 @@ def run_assignment(
             f"Review attempt: assignment={assignment.id} role={role} attempt={round_}", flush=True
         )
         call_model(role, payload, target, kind=assignment.kind)
-        report = ChunkReview.model_validate_json((target / f"{role}.json").read_text())
-        validate_anchors(anchors, [report])
+        report, next_payload = advance(
+            context,
+            assignment,
+            history,
+            (target / f"{role}.json").read_text(),
+            anchors,
+            packet_bytes,
+        )
         history.append(report)
-        if not report.requests:
-            if not report.complete:
-                raise ValueError("Required context unresolved")
+        if next_payload is None:
             return len(history)
-        if report.complete:
-            raise ValueError("Complete report cannot have required source requests")
-        payload = followup_payload(context, assignment, history)
+        payload = next_payload
     raise ValueError("Required follow-up work exhausted")
 
 
@@ -419,6 +456,7 @@ def run_batch(
     assignments: list[Assignment],
     directory: Path,
     anchors: AnchorIndex,
+    packet_bytes: int,
 ) -> None:
     """Schedule two workers, recording all terminal results even if one fails."""
     if len(manifest.assignments) + len(assignments) > MAX_WORK:
@@ -433,7 +471,13 @@ def run_batch(
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {
             pool.submit(
-                run_assignment, context, assignment, completion.role, directory, anchors
+                run_assignment,
+                context,
+                assignment,
+                completion.role,
+                directory,
+                anchors,
+                packet_bytes,
             ): completion
             for assignment in assignments
             for completion in completions
@@ -461,6 +505,7 @@ def read_batch(
     manifest: Manifest,
     directory: Path,
     anchors: AnchorIndex,
+    packet_bytes: int,
 ) -> dict[tuple[str, str], Review]:
     """Replay attempt inputs and require complete results with no unresolved requests."""
     reports: dict[tuple[str, str], Review] = {}
@@ -478,17 +523,20 @@ def read_batch(
                 target = attempt_directory(directory, assignment.id, role, round_)
                 if (target / "payload.json").read_text() != payload:
                     raise ValueError("Attempt evidence differs from required work")
-                report = ChunkReview.model_validate_json((target / f"{role}.json").read_text())
-                validate_anchors(anchors, [report])
+                report, next_payload = advance(
+                    context,
+                    assignment,
+                    history,
+                    (target / f"{role}.json").read_text(),
+                    anchors,
+                    packet_bytes,
+                )
                 history.append(report)
                 terminal = round_ == completion.attempts - 1
-                if terminal:
-                    if not report.complete or report.requests:
-                        raise ValueError("Unresolved required work")
-                elif report.complete or not report.requests:
-                    raise ValueError("Unexpected follow-up attempt")
-                else:
-                    payload = followup_payload(context, assignment, history)
+                if terminal != (next_payload is None):
+                    raise ValueError("Recorded attempts disagree with required follow-up protocol")
+                if next_payload is not None:
+                    payload = next_payload
             reports[(assignment.id, role)] = CompletedReview(
                 complete=True,
                 summary=history[-1].summary,
@@ -497,21 +545,30 @@ def read_batch(
     return reports
 
 
+def preflight(context: ReviewContext, planned: Plan, directory: Path) -> None:
+    """Count both providers on every local scope before purchasing any review."""
+    for assignment in local_assignments(context, planned):
+        for role in ("claude", "openai"):
+            call_model(
+                role,
+                assignment.payload,
+                directory / "preflight" / assignment.id,
+                kind=assignment.kind,
+                preflight=True,
+            )
+
+
 def review_chunks(context: ReviewContext, directory: Path) -> None:
     """Run one manifest-backed review flow, using the whole packet when capacity permits."""
     # Reject reused workspaces instead of mixing attempts and their cost accounting.
     if (directory / "manifest.json").exists() or (directory / "work").exists():
         raise ValueError("Review run requires a fresh artifact directory")
     planned = plan(context)
-    if planned.whole is not None:
-        try:
-            # Count both provider inputs before either provider can generate a report.
-            for role in ("claude", "openai"):
-                call_model(
-                    role, planned.whole, directory / "preflight", kind="whole", preflight=True
-                )
-        except CapacityError:
-            planned = plan(context, packet_bytes=CAPACITY_PACKET_BYTES)
+    try:
+        preflight(context, planned, directory)
+    except CapacityError:
+        planned = plan(context, packet_bytes=CAPACITY_PACKET_BYTES)
+        preflight(context, planned, directory)
     manifest = Manifest(
         plan_digest=digest(planned.model_dump_json()),
         packet_bytes=planned.packet_bytes,
@@ -520,11 +577,11 @@ def review_chunks(context: ReviewContext, directory: Path) -> None:
     )
     anchors = compile_anchors(context)
     local = local_assignments(context, planned)
-    run_batch(context, manifest, local, directory, anchors)
-    reports = read_batch(context, local, manifest, directory, anchors)
+    run_batch(context, manifest, local, directory, anchors, planned.packet_bytes)
+    reports = read_batch(context, local, manifest, directory, anchors, planned.packet_bytes)
     integration = integration_assignments(context, planned, reports)
-    run_batch(context, manifest, integration, directory, anchors)
-    read_batch(context, integration, manifest, directory, anchors)
+    run_batch(context, manifest, integration, directory, anchors, planned.packet_bytes)
+    read_batch(context, integration, manifest, directory, anchors, planned.packet_bytes)
 
 
 def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
@@ -535,7 +592,7 @@ def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
         raise ValueError("Coverage plan does not match the captured snapshot")
     anchors = compile_anchors(context)
     local = local_assignments(context, planned)
-    reports = read_batch(context, local, manifest, directory, anchors)
+    reports = read_batch(context, local, manifest, directory, anchors, planned.packet_bytes)
     integration = integration_assignments(context, planned, reports)
     expected = local + integration
     keys = [(a.id, role) for a in expected for role in ("claude", "openai")]
@@ -544,10 +601,22 @@ def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
         actual
     ):
         raise ValueError("Coverage assignments are missing, duplicated or unexpected")
-    reports.update(read_batch(context, integration, manifest, directory, anchors))
+    reports.update(
+        read_batch(context, integration, manifest, directory, anchors, planned.packet_bytes)
+    )
     return CoveredReviews(
         reviews=[reports[key] for key in keys],
         snapshot=planned.snapshot,
+        independent_summaries=[
+            IndependentSummary(
+                assignment=assignment.id,
+                provider=role,
+                summary=reports[(assignment.id, role)].summary,
+            )
+            for assignment in local
+            if assignment.kind == "whole"
+            for role in ("claude", "openai")
+        ],
         summary=f"{len(local)} local scopes; {len(expected)} local/integration assignments "
         f"completed by both providers. Snapshot `{planned.snapshot}`. "
         "Exact section ownership and follow-up evidence are in the workflow coverage manifest. "

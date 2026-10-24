@@ -163,7 +163,7 @@ class Plan(Contract):
     """Describe whole or partitioned assignments with reusable snapshot evidence."""
 
     snapshot: str
-    packet_bytes: int = PACKET_BYTES
+    packet_bytes: int
     whole: str | None
     chunks: list[Chunk] = Field(max_length=MAX_CHUNKS)
     metadata: PacketMetadata
@@ -463,6 +463,7 @@ def plan(context: ReviewContext, *, packet_bytes: int = PACKET_BYTES) -> Plan:
         return Plan(
             snapshot=digest(serialized),
             whole=serialized,
+            packet_bytes=packet_bytes,
             chunks=[],
             metadata=metadata,
             relations=[],
