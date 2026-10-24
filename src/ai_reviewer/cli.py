@@ -9,6 +9,7 @@ from ai_reviewer.contracts import (
     FinalConsolidation,
     ReviewContext,
 )
+from ai_reviewer.diagnostics import report_failure
 from ai_reviewer.github import GitHub, publish
 from ai_reviewer.models import print_costs
 from ai_reviewer.work import consolidate_chunks, load_reviews, review_chunks
@@ -19,7 +20,7 @@ def main() -> None:
 
     Reads the selected stage's environment credentials and JSON artifacts, then
     writes artifacts, calls external APIs or prints costs as that stage requires.
-    Stage failures print only their exception type to avoid exposing input data.
+    Stage failures record redacted metadata without exposing input data.
 
     Raises:
         SystemExit: Argument parsing rejects the invocation, or a stage fails
@@ -73,8 +74,8 @@ def main() -> None:
                     ),
                 )
     except Exception as error:
-        # SDK errors can echo request bodies. Log only the exception type.
-        print(f"Review stage {args.stage} failed ({type(error).__name__}); no clean verdict.")
+        # Keep stage failures diagnosable without printing arbitrary exception text.
+        report_failure(error, directory / f"{args.stage}.error.json", stage=args.stage)
         raise SystemExit(1) from None
 
 

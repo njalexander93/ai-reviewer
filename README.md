@@ -321,3 +321,18 @@ upstream commit, immutable source URLs, SHA-256 hashes and local modifications.
 - [ ] Confirm the bootstrap base gate still pins the initial main commit. It
       automatically disables candidate execution once main advances.
 - [ ] Keep required code-quality checks passing on the final revision.
+
+### Failure diagnostics
+
+Failed stages and model calls emit bounded JSON diagnostics to Actions logs and
+`*.error.json` files in the evidence artifact. Model records identify the role,
+model and phase (`preflight`, `generation`, or `validate_response`). Worker logs
+identify assignment, provider and zero-based attempt. Numeric HTTP status and up
+to 20 schema errors include known field names, array indexes and validation codes.
+Unknown field names are redacted; response bodies, exception messages, validation
+inputs/context, credentials and headers are never included. SDK parse failures
+can still leave token usage unknown. Logging does not make a failed review pass.
+
+These diagnostics run only when the workflow uses this implementation revision.
+The production caller uses the implementation on `main`; updating an unmerged PR
+does not change the reviewer executing against that PR.

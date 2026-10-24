@@ -232,3 +232,35 @@ def test_preflight_never_generates_or_records_usage(
     call_model(role, "context", tmp_path, chunked=True, preflight=True)
     assert generated == []
     assert list(tmp_path.iterdir()) == []
+
+
+def test_provider_validation_failure_saves_redacted_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """An SDK parse failure records provider and schema location before propagating."""
+    from pydantic import ValidationError
+
+    error = ValidationError.from_exception_data(
+        "Review", [{"type": "string_type", "loc": ("summary",), "input": {"secret": "content"}}]
+    )
+
+    def parse(**kwargs: object) -> None:
+        """Inject a real validation exception at the SDK parsing boundary."""
+        raise error
+
+    client = SimpleNamespace(
+        messages=SimpleNamespace(
+            parse=parse, count_tokens=lambda **kwargs: SimpleNamespace(input_tokens=1000)
+        )
+    )
+    monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
+    with pytest.raises(ValidationError):
+        call_model("claude", "private-payload", tmp_path)
+    data = json.loads((tmp_path / "claude.error.json").read_text())
+    assert data["role"] == "claude"
+    assert data["model"] == "claude-opus-5-5"
+    assert data["phase"] == "generation"
+    assert data["validation_errors"] == [{"location": ["summary"], "code": "string_type"}]
+    assert (tmp_path / "claude.usage.json").read_text() == "null"
+    assert not (tmp_path / "claude.json").exists()
+    assert "secret" not in capsys.readouterr().out

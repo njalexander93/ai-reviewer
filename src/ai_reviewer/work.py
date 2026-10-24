@@ -39,6 +39,7 @@ from ai_reviewer.contracts import (
     source_findings,
     validate_anchors,
 )
+from ai_reviewer.diagnostics import report_failure
 from ai_reviewer.models import CapacityError, Role, call_model
 
 
@@ -278,6 +279,9 @@ def run_assignment(
         target = attempt_directory(directory, assignment.id, role, round_)
         target.mkdir(parents=True, exist_ok=True)
         (target / "payload.json").write_text(payload)
+        print(
+            f"Review attempt: assignment={assignment.id} role={role} attempt={round_}", flush=True
+        )
         call_model(role, payload, target, chunked=True)
         report = ChunkReview.model_validate_json((target / f"{role}.json").read_text())
         validate_anchors(context, [report])
@@ -324,7 +328,10 @@ def run_batch(
             try:
                 completion.attempts = future.result()
                 completion.status = "complete"
-            except Exception:
+            except Exception as error:
+                report_failure(
+                    error, assignment=completion.assignment, role=completion.role, phase="worker"
+                )
                 completion.status = "failed"
                 failed = True
             save_manifest(directory, manifest)
