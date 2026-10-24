@@ -239,7 +239,7 @@ def test_many_reports_preserve_global_source_ids(
     ids = [source for group in result.groups for source in group.source_ids]
     assert len(ids) == len(set(ids)) == 120
     assert "0:0" in ids and "11:9" in ids
-    grouped = work.reconcile(reports, result, len(reports))
+    grouped = work.reconcile(reports, result)
     assert sum(f.blocking for group in grouped for f in group) == 60
     assert {f.title for group in grouped for f in group} == {
         f"Original {i}:{j}" for i in range(12) for j in range(10)
@@ -299,12 +299,13 @@ def test_known_cross_chunk_defect_matches_whole_packet_fixture(
     whole_findings = recognize(context.model_dump_json())
     assert whole_findings == [expected]
     # Force partitioning only for this small comparison fixture.
-    monkeypatch.setattr(chunking, "PACKET_BYTES", 500)
     monkeypatch.setattr(chunking, "CHUNK_BYTES", 5000)
-    assert len(plan(context).chunks) == 2
+    assert len(plan(context, packet_bytes=200_000).chunks) == 2
 
     def model(role: str, payload: str, directory: Path, **kwargs: object) -> None:
         """Return the recognizer's evidence-backed finding in the application schema."""
+        if kwargs.get("preflight"):
+            raise work.CapacityError("Synthetic forced partition")
         report = ChunkReview(
             complete=True,
             summary="Synthetic evidence comparison",
@@ -435,9 +436,9 @@ def test_token_overflow_replans_before_generation(
     assert original not in generated
     assert all("scope" in json.loads(payload) for payload in generated)
     manifest = json.loads((tmp_path / "manifest.json").read_text())
-    assert manifest["force_chunks"] is True
+    assert manifest["packet_bytes"] == 200_000
     # Replay cannot silently switch back to the byte-only whole assignment.
-    manifest["force_chunks"] = False
+    manifest["packet_bytes"] = 600_000
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="Coverage plan"):
         work.load_reviews(context, tmp_path)
@@ -507,3 +508,72 @@ def test_integration_budget_matches_finished_packets_without_trial_serialization
         assert budgets[assignment.id].size == len(assignment.payload.encode())
         assert len(assignment.payload.encode()) <= 600_000
     assert len(serialized) == len(planned.chunks) + len(edges)
+
+
+def test_capacity_fallback_bounds_integration_and_followup_payloads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A dense-input counter rejects every oversized call, including later integration."""
+    from ai_reviewer.contracts import SourceRequest
+
+    context = large_context()
+    context.files = context.files[:1]
+    generated = []
+    requested = set()
+
+    def model(
+        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
+    ) -> None:
+        """Enforce the fallback ceiling on every call and request one small source range."""
+        if len(payload.encode()) > 200_000:
+            raise work.CapacityError("Dense synthetic input exceeds capacity")
+        if preflight:
+            return
+        generated.append((kind, payload))
+        key = (directory.parent, role)
+        if kind == "local" and key not in requested:
+            requested.add(key)
+            report = ChunkReview(
+                complete=False,
+                summary="Need source",
+                findings=[],
+                requests=[
+                    SourceRequest(
+                        path=context.files[0].filename,
+                        side="RIGHT",
+                        start=1,
+                        end=2,
+                        reason="Check caller",
+                    )
+                ],
+            )
+            (directory / f"{role}.json").write_text(report.model_dump_json())
+        else:
+            fake_model(role, payload, directory, kind=kind)
+
+    monkeypatch.setattr(work, "call_model", model)
+    work.review_chunks(context, tmp_path)
+    assert work.load_reviews(context, tmp_path).reviews
+    assert any(kind == "integration" for kind, _ in generated)
+    assert any("requested_source" in json.loads(payload) for _, payload in generated)
+    assert all(len(payload.encode()) <= 200_000 for _, payload in generated)
+
+
+def test_small_review_consolidates_once_with_original_assessments(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A small complete review includes both independent summaries in its one Sonnet call."""
+    context, _, _ = bundle(Server())
+    calls = []
+
+    def model(role: str, payload: str, directory: Path, **kwargs: object) -> None:
+        """Record consolidation inputs while retaining real artifact replay."""
+        if role == "consolidate":
+            calls.append(json.loads(payload))
+        fake_model(role, payload, directory, **kwargs)
+
+    monkeypatch.setattr(work, "call_model", model)
+    work.review_chunks(context, tmp_path)
+    work.consolidate_chunks(context, tmp_path)
+    assert len(calls) == 1
+    assert calls[0]["reviews"] == ["Reviewed actual supplied source."] * 2

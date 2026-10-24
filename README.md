@@ -128,6 +128,21 @@ against Linear's [published SDK schema](https://github.com/linear/linear/blob/61
 not a flat attachment list. Mock fixtures preserve that provider contract;
 authenticated live validation remains deferred.
 
+## Failure diagnostics
+
+Failed stages and model calls emit bounded JSON diagnostics to Actions logs and
+`*.error.json` files in the evidence artifact. Model records identify the role,
+model and phase (`preflight`, `generation`, or `validate_response`). Worker logs
+identify assignment, provider and zero-based attempt. Numeric HTTP status and up
+to 20 schema errors include known field names, array indexes and validation codes.
+Unknown field names are redacted; response bodies, exception messages, validation
+inputs/context, credentials and headers are never included. SDK parse failures
+can still leave token usage unknown. Logging does not make a failed review pass.
+
+These diagnostics run only when the workflow uses this implementation revision.
+The production caller uses the implementation on `main`; updating an unmerged PR
+does not change the reviewer executing against that PR.
+
 ## Security and limits
 
 The workflow checks out only its pinned reviewer implementation. It reads PR
@@ -204,7 +219,9 @@ and stays below Sol's 272k long-context price threshold. Bytes are not converted
 into guessed tokens. See [Claude token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting)
 and [OpenAI token counting](https://developers.openai.com/api/docs/guides/token-counting).
 For a whole packet, count both provider inputs before either generates a report.
-If either exceeds capacity, re-plan into chunks targeting at most 200,000 bytes.
+If either exceeds capacity, re-plan with a 200,000-byte ceiling for every review
+packet, including integration pages and follow-ups. Local chunks target half that
+ceiling and source units at most one quarter, leaving integration headroom.
 Each resulting call still undergoes provider token counting; there is no byte/token
 conversion or guarantee that required metadata can fit. The fallback plan is bound
 to the manifest and replayed by downstream stages. Other provider failures remain
@@ -223,10 +240,9 @@ Operational defaults are deliberate finite safeguards, not performance optima:
 | Publication | 1,000 comments; 8 MB comment payload; 60,000-byte body | Fail before any oversized or partial review write |
 | Job | 2 workers; 180 minutes; no automatic API retries | Bound concurrency and execution time |
 
-Limits live in `chunking.py`, `work.py`, `models.py` and the workflow. Increasing
-one requires reviewing downstream bounds. Numeric policies live in
-`src/ai_reviewer/limits.py`; equal values with different purposes remain separate. The work limits are **not a dollar
-budget**. Large PRs can cost substantially more through repeated overview/source,
+Application work limits live in `src/ai_reviewer/limits.py`; the job timeout lives
+in the workflow. Increasing one requires reviewing downstream bounds. Equal values
+with different purposes remain separate. The work limits are **not a dollar budget**. Large PRs can cost substantially more through repeated overview/source,
 follow-ups and integration. There is no promise that an accepted snapshot will
 finish: required evidence, output or total work may exceed a later bound, which
 blocks approval. The **180-minute job timeout is the effective wall-clock limit**;
@@ -322,21 +338,4 @@ upstream commit, immutable source URLs, SHA-256 hashes and local modifications.
 ## Final merge checklist
 
 - [ ] Complete the last candidate review and record its passing run.
-- [ ] Confirm the bootstrap base gate still pins the initial main commit. It
-      automatically disables candidate execution once main advances.
 - [ ] Keep required code-quality checks passing on the final revision.
-
-### Failure diagnostics
-
-Failed stages and model calls emit bounded JSON diagnostics to Actions logs and
-`*.error.json` files in the evidence artifact. Model records identify the role,
-model and phase (`preflight`, `generation`, or `validate_response`). Worker logs
-identify assignment, provider and zero-based attempt. Numeric HTTP status and up
-to 20 schema errors include known field names, array indexes and validation codes.
-Unknown field names are redacted; response bodies, exception messages, validation
-inputs/context, credentials and headers are never included. SDK parse failures
-can still leave token usage unknown. Logging does not make a failed review pass.
-
-These diagnostics run only when the workflow uses this implementation revision.
-The production caller uses the implementation on `main`; updating an unmerged PR
-does not change the reviewer executing against that PR.

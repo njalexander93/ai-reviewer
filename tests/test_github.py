@@ -29,8 +29,8 @@ def publish(
 
     Real artifact completeness is exercised by test_work and the CLI handoff.
     """
-    from ai_reviewer.chunking import digest
     from ai_reviewer.contracts import CoveredReviews
+    from ai_reviewer.serialization import digest
 
     covered = CoveredReviews(
         reviews=reports,
@@ -231,6 +231,8 @@ def test_publish_verdict_preserves_severity(blocking: bool, event: str) -> None:
         }
     ]
     assert "$" not in posted["body"]
+    assert "Reviewed independently" in posted["body"]
+    assert "\n\nReviewed\n\n" in posted["body"]
 
 
 @pytest.mark.parametrize(

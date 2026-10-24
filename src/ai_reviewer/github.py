@@ -14,15 +14,21 @@ from typing import Any
 
 import httpx
 
-from ai_reviewer.chunking import MAX_BLOB_BYTES, digest
 from ai_reviewer.contracts import (
     Consolidation,
     CoveredReviews,
     ReviewContext,
     reconcile,
 )
-from ai_reviewer.limits import GITHUB_BODY_BYTES
+from ai_reviewer.limits import (
+    GITHUB_BODY_BYTES,
+    MAX_BLOB_BYTES,
+    MAX_GITHUB_COMMENTS,
+    MAX_GITHUB_PAYLOAD_BYTES,
+    MAX_GITHUB_REQUESTS,
+)
 from ai_reviewer.patch import diff_lines
+from ai_reviewer.serialization import digest
 
 
 class GitHub:
@@ -40,7 +46,7 @@ class GitHub:
         Args:
             token: GitHub credential for the operations this job performs.
         """
-        self.requests_remaining = 10_000
+        self.requests_remaining = MAX_GITHUB_REQUESTS
         # Keep credentials on the configured host when callers use relative paths.
         self.client = httpx.Client(
             base_url="https://api.github.com",
@@ -272,7 +278,7 @@ def publish(
     if covered.snapshot != digest(context.model_dump_json()):
         raise ValueError("Publication snapshot differs from covered work")
     reviews = covered.reviews
-    groups = reconcile(reviews, result, len(reviews))
+    groups = reconcile(reviews, result)
     repo, number = context.repo, context.number
     path = pr_path(repo, number)
     login = gh.request("GET", "/user")["login"]
@@ -315,12 +321,15 @@ def publish(
             comments.append({"path": filename, "side": side, "line": line, "body": body})
     # Attach the validated completion summary beneath the consolidated overview.
     body = f"{marker}\n## AI review\n\n{result.summary}\n\n"
+    if len(reviews) == 2:
+        for label, review in zip(("Claude Opus", "OpenAI"), reviews, strict=True):
+            body += f"<details><summary>{label}</summary>\n\n{review.summary}\n\n</details>\n"
     body += covered.summary
     # Reject oversized publication atomically; never publish a partial approval.
     if (
         len(body.encode()) > GITHUB_BODY_BYTES
-        or len(comments) > 1000
-        or len(json.dumps(comments, ensure_ascii=False).encode()) > 8_000_000
+        or len(comments) > MAX_GITHUB_COMMENTS
+        or len(json.dumps(comments, ensure_ascii=False).encode()) > MAX_GITHUB_PAYLOAD_BYTES
     ):
         raise ValueError("Publication exceeds bounded payload; manual review required")
     # Derive the verdict from original findings, never from Sonnet's prose.

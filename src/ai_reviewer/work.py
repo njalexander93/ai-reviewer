@@ -14,15 +14,10 @@ from typing import Any, Literal
 from pydantic import Field
 
 from ai_reviewer.chunking import (
-    MAX_WORK,
-    PACKET_BYTES,
     Chunk,
     PacketSizer,
     Plan,
     Unit,
-    digest,
-    encode,
-    lines,
     plan,
 )
 from ai_reviewer.contracts import (
@@ -43,8 +38,21 @@ from ai_reviewer.contracts import (
     validate_anchors,
 )
 from ai_reviewer.diagnostics import report_failure
-from ai_reviewer.limits import CONSOLIDATION_BYTES, MAX_RELATIONS
+from ai_reviewer.limits import (
+    CAPACITY_PACKET_BYTES,
+    CONSOLIDATION_BYTES,
+    MAX_ATTEMPTS,
+    MAX_CONSOLIDATION_CALLS,
+    MAX_FINDINGS,
+    MAX_RELATIONS,
+    MAX_SUMMARY_CALLS,
+    MAX_WORK,
+    PACKET_BYTES,
+    SUMMARY_PAGE_SIZE,
+)
 from ai_reviewer.models import AssignmentKind, CapacityError, Role, call_model
+from ai_reviewer.patch import lines
+from ai_reviewer.serialization import digest, encode
 
 
 class Assignment(Contract):
@@ -52,6 +60,7 @@ class Assignment(Contract):
 
     id: str
     kind: AssignmentKind
+    packet_bytes: int = PACKET_BYTES
     payload: str
     sections: list[str]
 
@@ -61,6 +70,7 @@ class AssignmentRecord(Contract):
 
     id: str
     kind: AssignmentKind
+    packet_bytes: int = PACKET_BYTES
     payload_digest: str
     sections: list[str]
 
@@ -70,6 +80,7 @@ def assignment_record(assignment: Assignment) -> AssignmentRecord:
     return AssignmentRecord(
         id=assignment.id,
         kind=assignment.kind,
+        packet_bytes=assignment.packet_bytes,
         payload_digest=digest(assignment.payload),
         sections=assignment.sections,
     )
@@ -81,14 +92,14 @@ class Completion(Contract):
     assignment: str
     role: Literal["claude", "openai"]
     status: Literal["pending", "complete", "failed"] = "pending"
-    attempts: int = Field(default=0, ge=0, le=3)
+    attempts: int = Field(default=0, ge=0, le=MAX_ATTEMPTS)
 
 
 class Manifest(Contract):
     """Persist exact section ownership and required provider work, including failures."""
 
     plan_digest: str
-    force_chunks: bool = False
+    packet_bytes: int = PACKET_BYTES
     assignments: list[AssignmentRecord]
     results: list[Completion]
 
@@ -108,6 +119,7 @@ def local_assignments(context: ReviewContext, planned: Plan) -> list[Assignment]
         Assignment(
             id=c.id,
             kind="local",
+            packet_bytes=planned.packet_bytes,
             payload=c.payload(planned.metadata),
             sections=[u.id for u in c.units],
         )
@@ -164,52 +176,28 @@ def integration_assignments(
             Assignment(
                 id=f"integration-{i:04d}",
                 kind="integration",
+                packet_bytes=planned.packet_bytes,
                 payload=encode(payload),
                 sections=[u.id for u in chunk.units],
             )
         )
-    # Directory and split-file neighbors establish bounded integration scopes.
-    # Explicit source/test and textual references add non-adjacent relationships.
-    ownership = {u.id: i for i, c in enumerate(planned.chunks) for u in c.units}
-    all_units = sorted(
-        (u for c in planned.chunks for u in c.units), key=lambda u: (u.filename, u.patch_start)
-    )
-    by_file: dict[str, list[Unit]] = defaultdict(list)
-    for unit in all_units:
-        by_file[unit.filename].append(unit)
-    edges: dict[tuple[str, str], tuple[Unit, Unit]] = {}
-
-    def add_edge(a: Unit, b: Unit) -> None:
-        """Keep distinct cross-owner pairs bounded before packet construction."""
-        if ownership[a.id] != ownership[b.id]:
-            edges[(a.id, b.id)] = (a, b)
-            if len(edges) > MAX_RELATIONS:
-                raise ValueError("Integration relationship budget exceeded")
-
-    for a, b in zip(all_units, all_units[1:]):
-        if PurePosixPath(a.filename).parent == PurePosixPath(b.filename).parent:
-            add_edge(a, b)
-    for left, right in links:
-        for a in by_file[left]:
-            for b in by_file[right]:
-                add_edge(a, b)
+    ownership, all_units, edges = integration_edges(planned)
     # Pack relationship pairs together, preserving both actual source endpoints.
     pending: list[Unit] = []
     paths: set[str] = set()
     phase = "integration: check cross-chunk relationships using actual source"
-    sizer = PacketSizer(planned.metadata, all_units)
-    sizer.sizes["reference_source"] = {
-        key: len(encode(value).encode()) for key, value in reference_data.items()
-    }
-    sizer.sizes["reports"] = {
-        str(i): sum(
-            len(encode(local[(chunk.id, role)].model_dump()).encode())
-            for role in ("claude", "openai")
-        )
-        + 1
-        for i, chunk in enumerate(planned.chunks)
-    }
-    # Each owner contributes a contiguous pair of reports, including their internal comma.
+    sizer = PacketSizer(
+        planned.metadata,
+        all_units,
+        {
+            "reference_source": reference_data,
+            "reports": {
+                f"{i}:{role}": local[(chunk.id, role)].model_dump()
+                for i, chunk in enumerate(planned.chunks)
+                for role in ("claude", "openai")
+            },
+        },
+    )
     budget = sizer.budget(
         f"edge-{len(assignments):04d}", {"phase": phase, "reference_source": [], "reports": []}
     )
@@ -220,7 +208,9 @@ def integration_assignments(
         return {
             **sizer.additions(scope),
             "reference_source": reference_keys(paths | added_paths, added_paths - paths),
-            "reports": {str(ownership[u.id]) for u in scope},
+            "reports": {
+                f"{ownership[u.id]}:{role}" for u in scope for role in ("claude", "openai")
+            },
         }
 
     def packet(scope: list[Unit]) -> Assignment:
@@ -236,14 +226,17 @@ def integration_assignments(
             for role in ("claude", "openai")
         ]
         return Assignment(
-            id=pair.id, kind="integration", payload=encode(payload), sections=[u.id for u in scope]
+            id=pair.id,
+            kind="integration",
+            packet_bytes=planned.packet_bytes,
+            payload=encode(payload),
+            sections=[u.id for u in scope],
         )
 
-    order = {unit.id: i for i, unit in enumerate(all_units)}
-    for a, b in sorted(edges.values(), key=lambda edge: (order[edge[0].id], order[edge[1].id])):
+    for a, b in edges:
         extra = [u for u in (a, b) if u.id not in budget.selected["units"]]
         delta = additions(extra)
-        if pending and budget.size + budget.growth(delta) > PACKET_BYTES:
+        if pending and budget.size + budget.growth(delta) > planned.packet_bytes:
             assignments.append(packet(pending))
             pending = []
             paths = set()
@@ -267,13 +260,49 @@ def integration_assignments(
     return expanded
 
 
+def integration_edges(planned: Plan) -> tuple[dict[str, int], list[Unit], list[tuple[Unit, Unit]]]:
+    """Enumerate bounded cross-owner neighbors and captured file relationships."""
+    # Directory and split-file neighbors establish bounded integration scopes.
+    # Explicit source/test and textual references add non-adjacent relationships.
+    ownership = {u.id: i for i, c in enumerate(planned.chunks) for u in c.units}
+    all_units = sorted(
+        (u for c in planned.chunks for u in c.units), key=lambda u: (u.filename, u.patch_start)
+    )
+    by_file: dict[str, list[Unit]] = defaultdict(list)
+    for unit in all_units:
+        by_file[unit.filename].append(unit)
+    edges: dict[tuple[str, str], tuple[Unit, Unit]] = {}
+
+    def add_edge(a: Unit, b: Unit) -> None:
+        """Keep distinct cross-owner pairs bounded before packet construction."""
+        if ownership[a.id] != ownership[b.id]:
+            edges[(a.id, b.id)] = (a, b)
+            if len(edges) > MAX_RELATIONS:
+                raise ValueError("Integration relationship budget exceeded")
+
+    for a, b in zip(all_units, all_units[1:]):
+        if PurePosixPath(a.filename).parent == PurePosixPath(b.filename).parent:
+            add_edge(a, b)
+    for relation in planned.relations:
+        left, right = relation.left, relation.right
+        for a in by_file[left]:
+            for b in by_file[right]:
+                add_edge(a, b)
+    order = {unit.id: i for i, unit in enumerate(all_units)}
+    return (
+        ownership,
+        all_units,
+        sorted(edges.values(), key=lambda edge: (order[edge[0].id], order[edge[1].id])),
+    )
+
+
 def integration_pages(assignment: Assignment) -> list[Assignment]:
     """Partition report evidence while repeating actual source and preserving all findings.
 
     Each page is required work for both providers. Source alone or an indivisible
     report field that cannot fit fails explicitly instead of losing evidence.
     """
-    if len(assignment.payload.encode()) <= PACKET_BYTES:
+    if len(assignment.payload.encode()) <= assignment.packet_bytes:
         return [assignment]
     base = json.loads(assignment.payload)
     reports = base.pop("reports")
@@ -287,11 +316,11 @@ def integration_pages(assignment: Assignment) -> list[Assignment]:
     pending: list[dict[str, Any]] = []
     for atom in atoms:
         trial = encode({**base, "reports": [*pending, atom]})
-        if len(trial.encode()) > PACKET_BYTES and pending:
+        if len(trial.encode()) > assignment.packet_bytes and pending:
             pages.append(encode({**base, "reports": pending}))
             pending = []
         pending.append(atom)
-        if len(encode({**base, "reports": pending}).encode()) > PACKET_BYTES:
+        if len(encode({**base, "reports": pending}).encode()) > assignment.packet_bytes:
             raise ValueError("Indivisible integration evidence exceeds packet budget")
     if pending:
         pages.append(encode({**base, "reports": pending}))
@@ -299,6 +328,7 @@ def integration_pages(assignment: Assignment) -> list[Assignment]:
         Assignment(
             id=f"{assignment.id}-page-{index:04d}",
             kind=assignment.kind,
+            packet_bytes=assignment.packet_bytes,
             payload=payload,
             sections=assignment.sections,
         )
@@ -335,7 +365,7 @@ def followup_payload(
     payload["prior_attempts"] = [r.model_dump() for r in history]
     payload["requested_source"] = source_sections(context, [q for r in history for q in r.requests])
     serialized = encode(payload)
-    if len(serialized.encode()) > PACKET_BYTES:
+    if len(serialized.encode()) > assignment.packet_bytes:
         raise ValueError("Required follow-up context exceeds packet budget")
     return serialized
 
@@ -355,7 +385,7 @@ def run_assignment(
     """Run at most three calls; unresolved or unrequested missing context fails closed."""
     history: list[ChunkReview] = []
     payload = assignment.payload
-    for round_ in range(3):
+    for round_ in range(MAX_ATTEMPTS):
         target = attempt_directory(directory, assignment.id, role, round_)
         target.mkdir(parents=True, exist_ok=True)
         (target / "payload.json").write_text(payload)
@@ -473,7 +503,6 @@ def review_chunks(context: ReviewContext, directory: Path) -> None:
     if (directory / "manifest.json").exists() or (directory / "work").exists():
         raise ValueError("Review run requires a fresh artifact directory")
     planned = plan(context)
-    force_chunks = False
     if planned.whole is not None:
         try:
             # Count both provider inputs before either provider can generate a report.
@@ -482,11 +511,10 @@ def review_chunks(context: ReviewContext, directory: Path) -> None:
                     role, planned.whole, directory / "preflight", kind="whole", preflight=True
                 )
         except CapacityError:
-            force_chunks = True
-            planned = plan(context, force_chunks=True)
+            planned = plan(context, packet_bytes=CAPACITY_PACKET_BYTES)
     manifest = Manifest(
         plan_digest=digest(planned.model_dump_json()),
-        force_chunks=force_chunks,
+        packet_bytes=planned.packet_bytes,
         assignments=[],
         results=[],
     )
@@ -502,7 +530,7 @@ def review_chunks(context: ReviewContext, directory: Path) -> None:
 def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
     """Recompute exact required work before consolidation and again before publication."""
     manifest = Manifest.model_validate_json((directory / "manifest.json").read_text())
-    planned = plan(context, force_chunks=manifest.force_chunks)
+    planned = plan(context, packet_bytes=manifest.packet_bytes)
     if manifest.plan_digest != digest(planned.model_dump_json()):
         raise ValueError("Coverage plan does not match the captured snapshot")
     anchors = compile_anchors(context)
@@ -537,7 +565,7 @@ def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
         raise ValueError("Consolidation requires fresh artifacts; earlier usage must be retained")
     covered = load_reviews(context, directory)
     reports = covered.reviews
-    sources = source_findings(reports, len(reports))
+    sources = source_findings(reports)
     items = list(sources.items())
     groups: list[Group] = []
     summaries = [r.summary for r in reports]
@@ -546,17 +574,24 @@ def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
     batch: dict[str, Any] = {}
     for key, finding in items:
         trial = {**batch, key: finding.model_dump()}
-        if len(trial) > 40 or len(encode({"sources": trial}).encode()) > CONSOLIDATION_BYTES:
+        if (
+            len(trial) > MAX_FINDINGS
+            or len(encode({"sources": trial}).encode()) > CONSOLIDATION_BYTES
+        ):
             batches.append(batch)
             batch = {}
         batch[key] = finding.model_dump()
     if batch or not batches:
         batches.append(batch)
-    if len(batches) > 128:
+    if len(batches) > MAX_CONSOLIDATION_CALLS:
         raise ValueError("Consolidation work budget exceeded")
+    combined = encode({"sources": batches[0], "reviews": summaries})
+    include_summaries = len(batches) == 1 and len(combined.encode()) <= CONSOLIDATION_BYTES
+    if include_summaries:
+        summaries = []
     for index, sources_batch in enumerate(batches):
         target = directory / "consolidation" / str(index)
-        payload = encode({"sources": sources_batch})
+        payload = combined if include_summaries else encode({"sources": sources_batch})
         call_model("consolidate", payload, target)
         result = Consolidation.model_validate_json((target / "consolidate.json").read_text())
         flattened = [key for group in result.groups for key in group.source_ids]
@@ -569,14 +604,14 @@ def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
     summary_calls = 0
     while len(summaries) > 1:
         reduced = []
-        for start in range(0, len(summaries), 8):
+        for start in range(0, len(summaries), SUMMARY_PAGE_SIZE):
             target = directory / "consolidation-summaries" / str(summary_calls)
             summary_calls += 1
-            if summary_calls > 128:
+            if summary_calls > MAX_SUMMARY_CALLS:
                 raise ValueError("Summary work budget exceeded")
             call_model(
                 "consolidate",
-                encode({"sources": {}, "reviews": summaries[start : start + 8]}),
+                encode({"sources": {}, "reviews": summaries[start : start + SUMMARY_PAGE_SIZE]}),
                 target,
             )
             result = Consolidation.model_validate_json((target / "consolidate.json").read_text())
@@ -585,6 +620,6 @@ def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
             reduced.append(result.summary)
         summaries = reduced
     result = FinalConsolidation(summary=summaries[0], groups=groups)
-    reconcile(reports, result, len(reports))
+    reconcile(reports, result)
     (directory / "consolidate.json").write_text(result.model_dump_json())
     (directory / "coverage.txt").write_text(covered.summary)

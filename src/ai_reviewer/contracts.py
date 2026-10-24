@@ -12,7 +12,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ai_reviewer.limits import MAX_FILES
+from ai_reviewer.limits import (
+    MAX_COMPLETED_FINDINGS,
+    MAX_CONSOLIDATION_GROUPS,
+    MAX_FILES,
+    MAX_FINAL_GROUPS,
+    MAX_FINDINGS,
+    MAX_GROUP_SOURCES,
+    MAX_SOURCE_REQUESTS,
+)
 from ai_reviewer.patch import diff_lines
 
 
@@ -53,7 +61,7 @@ class Review(Contract):
 
     complete: bool
     summary: str = Field(min_length=1, max_length=6000)
-    findings: list[Finding] = Field(max_length=40)
+    findings: list[Finding] = Field(max_length=MAX_FINDINGS)
 
 
 class SourceRequest(Contract):
@@ -69,13 +77,13 @@ class SourceRequest(Contract):
 class ChunkReview(Review):
     """Review assigned sections; required missing evidence must be requested explicitly."""
 
-    requests: list[SourceRequest] = Field(max_length=8)
+    requests: list[SourceRequest] = Field(max_length=MAX_SOURCE_REQUESTS)
 
 
 class CompletedReview(Review):
     """Preserve findings from up to three attempts of one assigned provider review."""
 
-    findings: list[Finding] = Field(max_length=120)
+    findings: list[Finding] = Field(max_length=MAX_COMPLETED_FINDINGS)
 
 
 class Group(Contract):
@@ -86,7 +94,7 @@ class Group(Contract):
             Reconciliation validates membership and uniqueness.
     """
 
-    source_ids: list[str] = Field(min_length=1, max_length=80)
+    source_ids: list[str] = Field(min_length=1, max_length=MAX_GROUP_SOURCES)
 
 
 class Consolidation(Contract):
@@ -99,13 +107,13 @@ class Consolidation(Contract):
     """
 
     summary: str = Field(min_length=1, max_length=6000)
-    groups: list[Group] = Field(max_length=80)
+    groups: list[Group] = Field(max_length=MAX_CONSOLIDATION_GROUPS)
 
 
 class FinalConsolidation(Consolidation):
     """Hold bounded batches after each Sonnet response preserves its source partition."""
 
-    groups: list[Group] = Field(max_length=61440)
+    groups: list[Group] = Field(max_length=MAX_FINAL_GROUPS)
 
 
 class ChangedFile(Contract):
@@ -198,12 +206,11 @@ class ReviewContext(Contract):
     issues: list[IssueContext] = Field(default_factory=list, max_length=40)
 
 
-def source_findings(reviews: list[Review], expected_count: int = 2) -> dict[str, Finding]:
-    """Validate the required complete reports and assign stable source IDs.
+def source_findings(reviews: list[Review]) -> dict[str, Finding]:
+    """Validate completeness and assign stable IDs; load_reviews enforces exact coverage.
 
     Args:
         reviews: Complete reports in deterministic assignment/provider order.
-        expected_count: Required report count from validated coverage; two for whole packets.
 
     Returns:
         Original findings keyed by zero-based review:finding IDs.
@@ -212,11 +219,7 @@ def source_findings(reviews: list[Review], expected_count: int = 2) -> dict[str,
         ValueError: The required report count is wrong or a report is incomplete.
     """
     # Enforce the same completeness boundary before consolidation and publication.
-    if (
-        expected_count < 2
-        or len(reviews) != expected_count
-        or not all(review.complete for review in reviews)
-    ):
+    if len(reviews) < 2 or not all(review.complete for review in reviews):
         raise ValueError("Incomplete review; approval prohibited")
     # Index original objects once for both the payload and reconciliation contract.
     return {
@@ -226,15 +229,12 @@ def source_findings(reviews: list[Review], expected_count: int = 2) -> dict[str,
     }
 
 
-def reconcile(
-    reviews: list[Review], result: Consolidation, expected_count: int = 2
-) -> list[list[Finding]]:
+def reconcile(reviews: list[Review], result: Consolidation) -> list[list[Finding]]:
     """Require complete reviews and an exact partition of all source findings.
 
     Args:
         reviews: Complete reports in deterministic assignment/provider order.
         result: Proposed duplicate groups from Sonnet.
-        expected_count: Required report count from validated coverage; two for whole packets.
 
     Returns:
         Original findings grouped for publication, with their severity unchanged.
@@ -244,7 +244,7 @@ def reconcile(
             repeated or invented.
     """
     # Reuse the canonical completeness check and source-index contract.
-    sources = source_findings(reviews, expected_count)
+    sources = source_findings(reviews)
     # Require an exact partition so grouping cannot discard or invent evidence.
     ids = [source for group in result.groups for source in group.source_ids]
     if Counter(ids) != Counter({key: 1 for key in sources}):

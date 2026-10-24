@@ -6,8 +6,6 @@ No reviewed code is imported or executed. Coverage establishes work, not judgmen
 """
 
 import ast
-import hashlib
-import json
 from bisect import bisect_right
 from collections import defaultdict, deque
 from pathlib import PurePosixPath
@@ -17,7 +15,7 @@ from pydantic import Field
 
 from ai_reviewer.contracts import ChangedFile, Contract, ReviewContext, SourceRequest
 from ai_reviewer.limits import (
-    CAPACITY_CHUNK_BYTES,
+    CAPACITY_PACKET_BYTES,
     CHUNK_BYTES,
     MAX_CHUNKS,
     MAX_RELATIONS,
@@ -25,23 +23,8 @@ from ai_reviewer.limits import (
     PACKET_BYTES,
     UNIT_BYTES,
 )
-from ai_reviewer.limits import (
-    MAX_BLOB_BYTES as MAX_BLOB_BYTES,
-)
-from ai_reviewer.limits import (
-    MAX_WORK as MAX_WORK,
-)
 from ai_reviewer.patch import lines, walk_patch
-
-
-def encode(value: Any) -> str:
-    """Serialize exact Unicode evidence consistently without ASCII expansion."""
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def digest(text: str) -> str:
-    """Bind persisted work to the exact UTF-8 payload."""
-    return hashlib.sha256(text.encode()).hexdigest()
+from ai_reviewer.serialization import digest, encode
 
 
 class Unit(Contract):
@@ -124,7 +107,12 @@ class ArrayBudget:
 class PacketSizer:
     """Precompute serialized unit/comment sizes and shared packet overhead once."""
 
-    def __init__(self, metadata: PacketMetadata, units: list[Unit]) -> None:
+    def __init__(
+        self,
+        metadata: PacketMetadata,
+        units: list[Unit],
+        sections: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         """Compile byte lengths without retaining another copy of source payloads."""
         self.metadata = metadata
         self.sizes = {
@@ -133,22 +121,22 @@ class PacketSizer:
                 str(i): len(encode(comment).encode()) for i, comment in enumerate(metadata.comments)
             },
         }
-        self.base = len(
-            encode(
-                {
-                    "overview": metadata.overview,
-                    "scope": {"id": "", "units": []},
-                    "previous_comments": [],
-                }
-            ).encode()
+        self.sizes.update(
+            {
+                name: {key: len(encode(value).encode()) for key, value in values.items()}
+                for name, values in (sections or {}).items()
+            }
         )
 
     def budget(self, id: str, extra: dict[str, Any] | None = None) -> ArrayBudget:
-        """Start an empty packet, including optional integration fields."""
-        size = self.base + len(encode(id).encode()) - 2
-        if extra:
-            size += len(encode(extra).encode()) - 1
-        budget = ArrayBudget(size, self.sizes)
+        """Serialize the empty packet shape once, then count only array growth."""
+        empty = {
+            "overview": self.metadata.overview,
+            "scope": {"id": id, "units": []},
+            **{name: [] for name in self.sizes if name != "units"},
+            **(extra or {}),
+        }
+        budget = ArrayBudget(len(encode(empty).encode()), self.sizes)
         budget.include({"previous_comments": {str(i) for i in self.metadata.global_comments}})
         return budget
 
@@ -175,6 +163,7 @@ class Plan(Contract):
     """Describe whole or partitioned assignments with reusable snapshot evidence."""
 
     snapshot: str
+    packet_bytes: int = PACKET_BYTES
     whole: str | None
     chunks: list[Chunk] = Field(max_length=MAX_CHUNKS)
     metadata: PacketMetadata
@@ -233,7 +222,7 @@ def declarations(filename: str, text: str) -> list[tuple[int, int]]:
     )
 
 
-def units(file: ChangedFile) -> list[Unit]:
+def units(file: ChangedFile, unit_bytes: int = UNIT_BYTES) -> list[Unit]:
     """Prefer a whole file, then declarations, hunks and bounded patch fragments.
 
     Every original patch record belongs to one unit, even newline markers and
@@ -293,7 +282,7 @@ def units(file: ChangedFile) -> list[Unit]:
         )
 
     whole = make(0, len(records), whole=True)
-    if len(whole.model_dump_json().encode()) <= UNIT_BYTES:
+    if len(whole.model_dump_json().encode()) <= unit_bytes:
         return [whole]
     if not records:
         # Mode-only changes and identical renames still review all blob text.
@@ -312,7 +301,7 @@ def units(file: ChangedFile) -> list[Unit]:
                         "after": "".join(new[start:end]),
                     }
                 )
-                if len(unit.model_dump_json().encode()) <= UNIT_BYTES:
+                if len(unit.model_dump_json().encode()) <= unit_bytes:
                     break
                 if end - start <= 1:
                     raise ValueError("Indivisible source line exceeds unit budget")
@@ -326,9 +315,9 @@ def units(file: ChangedFile) -> list[Unit]:
     while pending:
         start, end = pending.pop()
         candidate = make(start, end, expand=True)
-        if len(candidate.model_dump_json().encode()) > UNIT_BYTES:
+        if len(candidate.model_dump_json().encode()) > unit_bytes:
             candidate = make(start, end)
-        if len(candidate.model_dump_json().encode()) <= UNIT_BYTES:
+        if len(candidate.model_dump_json().encode()) <= unit_bytes:
             result.append(candidate)
             continue
         if end - start <= 1:
@@ -456,19 +445,21 @@ def related(a: Unit, b: Unit, links: dict[tuple[str, str], list[SourceRequest]])
     )
 
 
-def plan(context: ReviewContext, *, force_chunks: bool = False) -> Plan:
+def plan(context: ReviewContext, *, packet_bytes: int = PACKET_BYTES) -> Plan:
     """Plan exact ownership without fetching, calling models or modifying the snapshot.
 
     Reject duplicate paths, oversized shared metadata or exhausted collection/work
     budgets. Small packets preserve the existing serialization and two-call path.
     """
+    if packet_bytes not in (PACKET_BYTES, CAPACITY_PACKET_BYTES):
+        raise ValueError("Unknown plan packet budget")
     serialized = context.model_dump_json()
     if len(serialized.encode()) > MAX_SNAPSHOT_BYTES:
         raise ValueError("Snapshot exceeds 32 MB collection budget")
     if len({f.filename for f in context.files}) != len(context.files):
         raise ValueError("Duplicate changed-file path")
     metadata = packet_metadata(context)
-    if not force_chunks and len(serialized.encode()) <= PACKET_BYTES:
+    if packet_bytes == PACKET_BYTES and len(serialized.encode()) <= packet_bytes:
         return Plan(
             snapshot=digest(serialized),
             whole=serialized,
@@ -476,11 +467,17 @@ def plan(context: ReviewContext, *, force_chunks: bool = False) -> Plan:
             metadata=metadata,
             relations=[],
         )
-    pending = [u for f in sorted(context.files, key=lambda f: f.filename) for u in units(f)]
+    # Reserve space for two source endpoints, their reports and reference evidence.
+    unit_bytes = min(UNIT_BYTES, packet_bytes // 4) if packet_bytes < PACKET_BYTES else UNIT_BYTES
+    pending = [
+        u for f in sorted(context.files, key=lambda f: f.filename) for u in units(f, unit_bytes)
+    ]
     links = direct_relations(context)
     chunks: list[Chunk] = []
     sizer = PacketSizer(metadata, pending)
-    target_bytes = min(CHUNK_BYTES, CAPACITY_CHUNK_BYTES) if force_chunks else CHUNK_BYTES
+    target_bytes = (
+        min(CHUNK_BYTES, packet_bytes // 2) if packet_bytes < PACKET_BYTES else CHUNK_BYTES
+    )
     # Start with the stable first unit, then prefer visible related evidence.
     while pending:
         chunk = Chunk(id=f"chunk-{len(chunks):04d}", units=[pending.pop(0)])
@@ -516,6 +513,7 @@ def plan(context: ReviewContext, *, force_chunks: bool = False) -> Plan:
     return Plan(
         snapshot=digest(serialized),
         whole=None,
+        packet_bytes=packet_bytes,
         chunks=chunks,
         metadata=metadata,
         relations=[Relation(left=a, right=b, evidence=e) for (a, b), e in links.items()],

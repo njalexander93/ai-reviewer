@@ -3,7 +3,37 @@
 These measurements cover preparation and deterministic planning, not paid model
 judgment. No benchmark review was posted. No repository code was executed.
 
-## Follow-up review: packing and validation cost
+## Current follow-up: shared capacity policy and small-review behavior
+
+The plan now binds one packet ceiling into every assignment and the manifest.
+Capacity fallback uses 200,000 bytes for local, edge, per-chunk integration, report
+pages and follow-ups. Local scopes target 100,000 bytes; source units target 50,000.
+This leaves space for integration evidence without converting bytes into a token
+guarantee. Each provider still counts the final payload; required evidence that
+cannot fit fails explicitly. Existing artifacts require a fresh review run.
+
+A synthetic counter now rejects every call above 200,000 bytes and verifies a
+complete fallback run including integration and requested source. Small reviews
+include both assessments in their one consolidation call when the batch fits,
+and publication retains their original summaries under the body limit.
+
+The packet sizer declares all array sections at construction and measures an empty
+packet for fixed overhead. It no longer patches in keys or manually counts report
+pair punctuation. Edge enumeration is separate. Provider-specific wire formats
+remain explicit, while prompt selection and the capacity/artifact sequence are
+shared. Whole preflight still counts before either provider generates; generation
+recounts its final input rather than trusting a cached count across calls.
+
+Current checks: 163 tests pass with 93.88% branch-aware coverage. Ruff, Mypy,
+lockfile and whitespace checks pass. The static audit examined 14 orchestration
+test functions without findings. A fresh-context expectation review of five
+changed orchestration tests returned UNKNOWN due to synthetic provider responses,
+with no FLAG; model-family independence is unverified. Other changed test files
+were not included in that judge pass.
+Older counts below describe named historical revisions, not the current candidate.
+No live-provider quality comparison was performed.
+
+## Historical revision 40c4c4e: packing and validation cost
 
 Local fit checks now add precomputed unit/comment byte lengths. Cross-chunk fit
 checks add only new units, indexed reference ranges and owner report pairs.
@@ -41,7 +71,7 @@ planning and integration construction, excluding collection, providers and repla
 They are smoke observations, not before/after speedup or worst-case claims. The
 24 MB input demonstrates bounded rejection, not successful review coverage.
 
-## PR #3 feedback repair
+## Historical revision e9434eb: original feedback repair
 
 The repair removes the obsolete branch-test workflow and uses one manifest-backed
 review/consolidation/publication flow for both packet sizes. Small initial payloads
@@ -165,7 +195,7 @@ artifacts; finding partition and severity preservation are enforced in code.
 Cross-batch duplicates can appear as separate comments. GitHub's final revision
 check and review write remain non-atomic; stale approval dismissal is required.
 
-## Review checks
+## Historical initial implementation checks
 
 Required local checks passed: lock consistency, Ruff formatting/lint, Mypy, and
 141 tests with 92.07% branch-aware coverage. The bounded static test audit examined

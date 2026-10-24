@@ -6,11 +6,11 @@ check. It requests a reviewer only after all provider context is validated.
 
 from typing import Any
 
-from ai_reviewer.chunking import MAX_SNAPSHOT_BYTES, plan, validate_patch
+from ai_reviewer.chunking import plan, validate_patch
 from ai_reviewer.contracts import ChangedFile, PriorComment, ReviewContext
 from ai_reviewer.github import GitHub, pr_path, read_version, rebuild_patch
 from ai_reviewer.issues import github_issues, linear_issues
-from ai_reviewer.limits import MAX_FILES
+from ai_reviewer.limits import MAX_FILES, MAX_SNAPSHOT_BYTES
 
 
 def prepare(
