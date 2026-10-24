@@ -176,14 +176,14 @@ def test_parallel_review_waits_for_both_calls(
         ).read_text() == "recorded"
 
 
-def test_invalid_anchor_stops_before_consolidator_purchase(
+def test_invalid_blocking_anchor_stops_before_consolidator_purchase(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A valid report contract with an invalid diff line never reaches the paid API."""
+    """An invalid blocking location prevents replay from purchasing consolidation."""
     # Capture a real fixture packet, then move its finding beyond the available hunk.
     server = Server()
     context = cli.prepare(server.gh, "owner/repo", 1, "reviewer")
-    _, reviews, _ = bundle(server)
+    _, reviews, _ = bundle(server, blocking=True)
     reviews[0].findings[0].line = 999
     (tmp_path / "context.json").write_text(context.model_dump_json())
     from tests.test_work import fake_model

@@ -37,7 +37,7 @@ from ai_reviewer.contracts import (
     ReviewContext,
     SourceRequest,
     compile_anchors,
-    validate_anchors,
+    filter_report,
 )
 from ai_reviewer.diagnostics import (
     FollowupExhausted,
@@ -570,32 +570,27 @@ def advance(
     context: ReviewContext,
     assignment: Assignment,
     history: list[ChunkReview],
-    report_json: str,
-    anchors: AnchorIndex,
+    report: ChunkReview,
     packet_bytes: int,
 ) -> tuple[ChunkReview, str | None]:
-    """Validate one report and determine the next protocol step without I/O.
+    """Determine the next protocol step for a filtered report without I/O.
 
     Args:
         context: Immutable snapshot supplying requested source.
         assignment: Original work whose payload remains in every continuation.
-        history: Prior validated reports in order, excluding report_json; not mutated.
-        report_json: Current provider response or recorded artifact to parse.
-        anchors: Read-only diff coordinates compiled from the same snapshot.
+        history: Prior validated reports in order, excluding report; not mutated.
+        report: Schema-validated response returned by filter_report; not mutated.
         packet_bytes: Maximum UTF-8 size of a continuation payload.
 
     Returns:
-        Parsed report and next JSON payload, or None for the payload when complete.
+        Accepted report and next JSON payload, or None for the payload when complete.
 
     Raises:
         FollowupExhausted: The final allowed report remains incomplete, with or without requests.
         IncompleteWithoutRequests: An earlier incomplete report omits source requests.
-        ValueError: Schema or anchors are invalid, completion conflicts with requests,
-            requested source is unavailable, or the continuation exceeds the packet ceiling.
+        ValueError: Completion conflicts with requests, requested source is unavailable,
+            or the continuation exceeds the packet ceiling.
     """
-    # Parse and anchor-check before interpreting a provider completion claim.
-    report = ChunkReview.model_validate_json(report_json)
-    validate_anchors(anchors, [report])
     # Complete work must have no outstanding required source requests.
     if report.complete:
         if report.requests:
@@ -637,7 +632,8 @@ def run_assignment(
         OSError: Attempt artifacts cannot be written or read.
         Exception: Provider errors propagate; call_model retains available usage.
 
-    Writes payloads/reports/usage, prints progress, and may make paid provider calls.
+    Writes payloads/reports/usage and rejected-findings.json for invalid nonblockers.
+    Original responses remain untouched. Prints progress and may make paid provider calls.
     """
     history: list[ChunkReview] = []
     payload = assignment.payload
@@ -652,14 +648,15 @@ def run_assignment(
             f"Review attempt: assignment={assignment.id} role={role} attempt={round_}", flush=True
         )
         call_model(role, payload, target, kind=assignment.kind)
-        report, next_payload = advance(
-            context,
-            assignment,
-            history,
-            (target / f"{role}.json").read_text(),
-            anchors,
-            packet_bytes,
+        report, rejected = filter_report(
+            anchors, ChunkReview.model_validate_json((target / f"{role}.json").read_text())
         )
+        # Persist diagnostics before completion or continuation checks can fail.
+        if rejected:
+            (target / "rejected-findings.json").write_text(
+                encode([record.model_dump() for record in rejected])
+            )
+        report, next_payload = advance(context, assignment, history, report, packet_bytes)
         # Keep prior findings available and stop only on a validated terminal report.
         history.append(report)
         if next_payload is None:
@@ -777,7 +774,7 @@ def read_batch(
         packet_bytes: Plan ceiling for reconstructing continuation inputs.
 
     Returns:
-        Reports keyed by (assignment ID, provider), retaining all attempt findings
+        Reports keyed by (assignment ID, provider), retaining accepted attempt findings
         and the last summary. Performs file reads only, with no provider calls.
 
     Raises:
@@ -802,21 +799,17 @@ def read_batch(
                 target = attempt_directory(directory, assignment.id, role, round_)
                 if (target / "payload.json").read_text() != payload:
                     raise ValueError("Attempt evidence differs from required work")
-                report, next_payload = advance(
-                    context,
-                    assignment,
-                    history,
-                    (target / f"{role}.json").read_text(),
-                    anchors,
-                    packet_bytes,
+                report, _ = filter_report(
+                    anchors, ChunkReview.model_validate_json((target / f"{role}.json").read_text())
                 )
+                report, next_payload = advance(context, assignment, history, report, packet_bytes)
                 history.append(report)
                 terminal = round_ == completion.attempts - 1
                 if terminal != (next_payload is None):
                     raise ValueError("Recorded attempts disagree with required follow-up protocol")
                 if next_payload is not None:
                     payload = next_payload
-            # Preserve every attempt finding, using only the final assessment as summary.
+            # Preserve accepted attempt findings, using only the final assessment as summary.
             reports[(assignment.id, role)] = CompletedReview(
                 complete=True,
                 summary=history[-1].summary,

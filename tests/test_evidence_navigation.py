@@ -40,8 +40,7 @@ def test_attempt_transition_rejects_invalid_completion(state: str) -> None:
             context,
             assignment,
             history,
-            report.model_dump_json(),
-            work.compile_anchors(context),
+            report,
             600_000,
         )
 
@@ -277,8 +276,7 @@ def test_early_incomplete_without_requests_is_protocol_failure(prior_attempts: i
             context,
             assignment,
             [report] * prior_attempts,
-            report.model_dump_json(),
-            work.compile_anchors(context),
+            report,
             100_000,
         )
     assert failure_details(caught.value) == {

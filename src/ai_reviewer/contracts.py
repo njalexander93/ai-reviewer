@@ -319,19 +319,56 @@ def compile_anchors(context: ReviewContext) -> AnchorIndex:
     )
 
 
-def validate_anchors(anchors: AnchorIndex, reviews: list[Review]) -> None:
-    """Reject invalid model locations before purchasing consolidation.
+INVALID_LOCATION = "Finding is outside the captured diff"
+
+
+class RejectedFinding(Contract):
+    """Retain an advisory finding and its original response index for diagnosis.
+
+    The enclosing attempt directory identifies provider, assignment and attempt.
+    This internal artifact contract is not part of the provider response schema.
+    """
+
+    finding_index: int = Field(ge=0)
+    finding: Finding
+    reason: str = INVALID_LOCATION
+
+
+def filter_report(
+    anchors: AnchorIndex, report: ChunkReview
+) -> tuple[ChunkReview, list[RejectedFinding]]:
+    """Filter advisory locations and neutralize prose that could repeat them.
 
     Args:
-        anchors: Precompiled immutable snapshot coordinates.
-        reviews: Independent reports with locations to validate.
+        anchors: Immutable captured diff coordinates, not full source lines.
+        report: Schema-validated response, never mutated.
+
+    Returns:
+        Report with accepted findings in original order, plus typed rejection records
+        indexed into the raw response. Affected summaries become neutral; callers
+        retain the raw response and persist diagnostics before protocol validation.
 
     Raises:
-        ValueError: A finding is outside the captured diff. Reports remain on disk
-            for diagnosis; this fails the run rather than silently dropping findings.
+        ValueError: Any blocking finding is outside the captured diff.
     """
-    # Reject any unsupported location rather than filtering findings out of the verdict.
-    for review in reviews:
-        for finding in review.findings:
-            if (finding.side, finding.line) not in anchors.get(finding.path, frozenset()):
-                raise ValueError("Finding is outside the captured diff")
+    accepted = []
+    rejected = []
+    # Only advisory location errors are recoverable; blockers must still fail closed.
+    for index, finding in enumerate(report.findings):
+        if (finding.side, finding.line) in anchors.get(finding.path, frozenset()):
+            accepted.append(finding)
+        elif finding.blocking:
+            raise ValueError(INVALID_LOCATION)
+        else:
+            rejected.append(RejectedFinding(finding_index=index, finding=finding))
+    # Raw prose may repeat a rejected finding; keep it only in the original artifact.
+    if rejected:
+        report = report.model_copy(
+            update={
+                "findings": accepted,
+                "summary": "Review completed."
+                if report.complete
+                else "Review requires more context.",
+            }
+        )
+    return report, rejected
