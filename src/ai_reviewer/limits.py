@@ -24,6 +24,7 @@ GITHUB_BODY_BYTES = 60_000
 PROVIDER_TIMEOUT_SECONDS = 300
 
 # Work fan-out and schema bounds keep all original findings representable.
+# Maximum supported providers; schema bounds accommodate either enabled set.
 PROVIDERS = 2
 MAX_ATTEMPTS = 3
 MAX_FINDINGS = 40

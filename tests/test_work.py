@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_reviewer import work
+from ai_reviewer import consolidation, work
 from ai_reviewer.chunking import plan
 from ai_reviewer.contracts import (
     ChangedFile,
@@ -18,9 +18,17 @@ from ai_reviewer.contracts import (
     FinalConsolidation,
     Group,
     ReviewContext,
+    reconcile,
 )
 from ai_reviewer.github import publish
 from tests.test_github import Server, bundle
+
+
+@pytest.fixture(autouse=True)
+def configured_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep existing dual-provider fixtures independent of developer credentials."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-anthropic")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
 
 
 def large_context() -> ReviewContext:
@@ -70,7 +78,7 @@ def fake_model(
             summary="Assessments agree.",
             groups=[Group(source_ids=[key]) for key in data.get("sources", {})],
         )
-        if role == "consolidate"
+        if role in ("haiku", "luna")
         else ChunkReview(
             complete=True, summary="Reviewed actual supplied source.", findings=[], requests=[]
         )
@@ -85,6 +93,7 @@ def test_large_pipeline_requires_both_providers_and_actual_integration_source(
     """All sections reach both providers and cross-chunk pairs carry actual source."""
     context = large_context()
     monkeypatch.setattr(work, "call_model", fake_model)
+    monkeypatch.setattr(consolidation, "call_model", fake_model)
     work.review_chunks(context, tmp_path)
     covered = work.load_reviews(context, tmp_path)
     reports = covered.reviews
@@ -99,11 +108,11 @@ def test_large_pipeline_requires_both_providers_and_actual_integration_source(
         )
         assert packet["reports"]
         assert all(unit["after"] for unit in packet["scope"]["units"])
-    work.consolidate_chunks(context, tmp_path)
+    consolidation.consolidate_chunks(context, tmp_path)
     result = FinalConsolidation.model_validate_json((tmp_path / "consolidate.json").read_text())
     usage_before = {str(p): p.read_text() for p in tmp_path.rglob("*.usage.json")}
     with pytest.raises(ValueError, match="fresh artifacts"):
-        work.consolidate_chunks(context, tmp_path)
+        consolidation.consolidate_chunks(context, tmp_path)
     assert {str(p): p.read_text() for p in tmp_path.rglob("*.usage.json")} == usage_before
     server = Server()
     server.files = [{"filename": f.filename, "patch": f.patch} for f in context.files]
@@ -239,6 +248,7 @@ def test_many_reports_preserve_global_source_ids(
 
     context = large_context()
     monkeypatch.setattr(work, "call_model", fake_model)
+    monkeypatch.setattr(consolidation, "call_model", fake_model)
     work.review_chunks(context, tmp_path)
     covered = work.load_reviews(context, tmp_path)
     # Independent fixture: 12 reports with 10 distinct original observations each.
@@ -261,14 +271,14 @@ def test_many_reports_preserve_global_source_ids(
         for i in range(12)
     ]
     monkeypatch.setattr(
-        work, "load_reviews", lambda *args: covered.model_copy(update={"reviews": reports})
+        consolidation, "load_reviews", lambda *args: covered.model_copy(update={"reviews": reports})
     )
-    work.consolidate_chunks(context, tmp_path)
+    consolidation.consolidate_chunks(context, tmp_path)
     result = FinalConsolidation.model_validate_json((tmp_path / "consolidate.json").read_text())
     ids = [source for group in result.groups for source in group.source_ids]
     assert len(ids) == len(set(ids)) == 120
     assert "0:0" in ids and "11:9" in ids
-    grouped = work.reconcile(reports, result)
+    grouped = reconcile(reports, result)
     assert sum(f.blocking for group in grouped for f in group) == 60
     assert {f.title for group in grouped for f in group} == {
         f"Original {i}:{j}" for i in range(12) for j in range(10)
@@ -394,6 +404,7 @@ def test_accumulated_findings_are_paged_with_actual_integration_source() -> None
             for i, c in enumerate(planned.chunks)
             for j, role in enumerate(("claude", "openai"))
         },
+        ("claude", "openai"),
     )
     pages = [a for a in assignments if a.id.startswith("integration-0000")]
     assert len(pages) > 1
@@ -424,14 +435,14 @@ def test_reordered_reports_keep_assignment_identity() -> None:
     }
     # Reorder storage only; scope/report identity must remain unchanged.
     reversed_reports = dict(reversed(list(reports.items())))
-    actual = work.integration_assignments(context, planned, reversed_reports)
+    actual = work.integration_assignments(context, planned, reversed_reports, ("claude", "openai"))
     for i, chunk in enumerate(planned.chunks):
         packet = json.loads(next(a.payload for a in actual if a.id == f"integration-{i:04d}"))
         assert [r["summary"] for r in packet["reports"]] == [
             f"{chunk.id}/claude",
             f"{chunk.id}/openai",
         ]
-    assert actual == work.integration_assignments(context, planned, reports)
+    assert actual == work.integration_assignments(context, planned, reports, ("claude", "openai"))
 
 
 def test_manifest_retains_hashes_and_rejects_tampered_assignment(
@@ -563,7 +574,7 @@ def test_integration_budget_matches_finished_packets_without_trial_serialization
     # Observe final serialization and compare its bytes to the retained incremental budget.
     monkeypatch.setattr(PacketSizer, "budget", budget)
     monkeypatch.setattr(Chunk, "payload", payload)
-    assignments = work.integration_assignments(context, planned, reports)
+    assignments = work.integration_assignments(context, planned, reports, ("claude", "openai"))
     edges = [a for a in assignments if a.id.startswith("edge-")]
     assert edges
     assert any(json.loads(a.payload)["reference_source"] for a in edges)
@@ -634,7 +645,7 @@ def test_capacity_fallback_bounds_integration_and_followup_payloads(
 def test_small_review_consolidates_once_with_original_assessments(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A small complete review includes both independent summaries in its one Sonnet call."""
+    """A small complete review includes both independent summaries in its one Haiku call."""
     context, _, _ = bundle(Server())
     calls = []
 
@@ -644,14 +655,15 @@ def test_small_review_consolidates_once_with_original_assessments(
         Role/payload/directory and kwargs follow fake_model's contract. The calls list
         changes only for consolidation; artifact creation and preflight behavior remain shared.
         """
-        if role == "consolidate":
+        if role in ("haiku", "luna"):
             calls.append(json.loads(payload))
         fake_model(role, payload, directory, **kwargs)
 
     # Run the real small-review flow and inspect the single consolidation request.
     monkeypatch.setattr(work, "call_model", model)
+    monkeypatch.setattr(consolidation, "call_model", model)
     work.review_chunks(context, tmp_path)
-    work.consolidate_chunks(context, tmp_path)
+    consolidation.consolidate_chunks(context, tmp_path)
     assert len(calls) == 1
     assert calls[0]["reviews"] == ["Reviewed actual supplied source."] * 2
 

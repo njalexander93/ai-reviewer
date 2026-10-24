@@ -14,7 +14,8 @@ from ai_reviewer.contracts import (
 from tests.test_github import Server, bundle
 
 
-def test_consolidator_cannot_discard_a_blocker() -> None:
+@pytest.mark.parametrize("reviewer_count", [1, 2])
+def test_consolidator_cannot_discard_a_blocker(reviewer_count: int) -> None:
     """A clean summary must not erase an independently reported blocker."""
     # Create an independent report containing a concrete blocking finding.
     review = Review(
@@ -34,7 +35,7 @@ def test_consolidator_cannot_discard_a_blocker() -> None:
     # Reject a clean consolidation that omits the original blocker.
     with pytest.raises(ValueError, match="exactly once"):
         reconcile(
-            [review, Review(complete=True, summary="Independent", findings=[])],
+            [review, Review(complete=True, summary="Independent", findings=[])][:reviewer_count],
             Consolidation(summary="Looks good", groups=[]),
         )
 
@@ -57,7 +58,7 @@ def test_consolidation_requires_exact_partition(ids: list[str]) -> None:
 
 
 def test_merged_duplicates_retain_both_original_findings() -> None:
-    """Sonnet grouping cannot overwrite the severity or evidence of either reviewer."""
+    """Consolidator grouping cannot overwrite the severity or evidence of either reviewer."""
     # Give two reviewers different evidence and severity for a grouped issue.
     one = Finding(path="app.py", line=1, side="RIGHT", title="Bug", body="Evidence", blocking=True)
     two = Finding(path="app.py", line=2, side="RIGHT", title="Maybe", body="Other", blocking=False)
@@ -71,11 +72,12 @@ def test_merged_duplicates_retain_both_original_findings() -> None:
     ) == [[one, two]]
 
 
-@pytest.mark.parametrize("count", [0, 1])
-def test_source_index_requires_at_least_two_reports(count: int) -> None:
-    """The shared source-index boundary rejects missing reviewer reports."""
-    # Empty findings do not make an incorrect reviewer count acceptable.
-    reports = [Review(complete=True, summary="Complete", findings=[]) for _ in range(count)]
+@pytest.mark.parametrize("incomplete", [False, True])
+def test_source_index_requires_complete_reports(incomplete: bool) -> None:
+    """No reports or an incomplete sole reviewer cannot yield approval."""
+    reports = (
+        [Review(complete=False, summary="Missing evidence", findings=[])] if incomplete else []
+    )
     with pytest.raises(ValueError, match="Incomplete"):
         source_findings(reports)
 
