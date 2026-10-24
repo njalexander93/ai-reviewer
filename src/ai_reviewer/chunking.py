@@ -2,6 +2,7 @@
 
 Units own contiguous original patch records exactly once. Source excerpts retain
 Git line coordinates; additional source can only come from the same snapshot.
+Shared metadata locates Python declarations for source requests across all packets.
 No reviewed code is imported or executed. Coverage establishes work, not judgment.
 """
 
@@ -107,7 +108,7 @@ class PacketMetadata(Contract):
     """Cache inventory and indexed discussion for one immutable snapshot.
 
     Attributes:
-        overview: Revision/requirement metadata and complete changed-file inventory.
+        overview: Revision/requirement metadata, file inventory and side-specific declarations.
         comments: Original-order discussion dictionaries, shared read-only by builders.
         comments_by_path: Current/old discussion path to indices in comments.
         global_comments: Indices whose path is not a current changed path; included everywhere.
@@ -282,7 +283,8 @@ def packet_metadata(context: ReviewContext) -> PacketMetadata:
 
     Discussion retains original order. Comments outside current changed paths are
     global, including comments attached to old rename paths. Overview creation scans
-    captured blobs once for line counts; no repository or provider reads occur.
+    captured blobs once for line counts and declaration navigation. No repository or
+    provider reads occur.
     """
     # Index discussion once; non-current paths become mandatory global context.
     changed = {f.filename for f in context.files}
@@ -306,7 +308,8 @@ def overview(context: ReviewContext) -> dict[str, Any]:
 
     Files and prior discussion are excluded from the copied metadata. Inventory line
     counts use only LF boundaries and count a final unterminated line. Context remains
-    unchanged; actual blob text is supplied separately in unit evidence.
+    unchanged; actual blob text is supplied separately in unit evidence. Declaration
+    locations use current paths for both sides, even when the old path selected the parser.
     """
     # Keep revisions and requirements intact while replacing blobs with line counts.
     data = context.model_dump(exclude={"files", "previous_comments"})
@@ -315,6 +318,10 @@ def overview(context: ReviewContext) -> dict[str, Any]:
             "filename": f.filename,
             "previous_filename": f.previous_filename,
             "status": f.status,
+            "declarations": {
+                "LEFT": declaration_index(f.previous_filename or f.filename, f.before),
+                "RIGHT": declaration_index(f.filename, f.after),
+            },
             "before_lines": f.before.count("\n")
             + int(bool(f.before) and not f.before.endswith("\n")),
             "after_lines": f.after.count("\n") + int(bool(f.after) and not f.after.endswith("\n")),
@@ -322,6 +329,46 @@ def overview(context: ReviewContext) -> dict[str, Any]:
         for f in sorted(context.files, key=lambda f: f.filename)
     ]
     return data
+
+
+def declaration_index(filename: str, text: str) -> dict[str, Any]:
+    """Locate Python classes/functions without executing captured text.
+
+    Args:
+        filename: Version's path, used only to select the Python parser.
+        text: Captured blob; never imported or evaluated.
+
+    Returns:
+        Status and source-ordered entries with qualified names and one-based inclusive
+        LF ranges, including decorators. Empty valid Python is indexed with no entries.
+        Unsupported syntax/languages or bare-CR coordinates have explicit statuses and
+        no entries; callers retain physical-line source requests as their fallback.
+    """
+    # Never guess syntax or coordinates that the parser cannot represent faithfully.
+    if not filename.endswith(".py"):
+        return {"status": "unsupported_language", "entries": []}
+    if "\r" in text.replace("\r\n", "\n"):
+        return {"status": "unsupported_line_endings", "entries": []}
+    try:
+        tree = ast.parse(text)
+    except SyntaxError, ValueError, RecursionError:
+        return {"status": "parse_error", "entries": []}
+    # Iterative traversal retains lexical owners without a second recursion limit.
+    entries = []
+    pending: list[tuple[ast.AST, str]] = [(tree, "")]
+    while pending:
+        node, owner = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            owner = f"{owner}.{node.name}" if owner else node.name
+            entries.append(
+                {
+                    "name": owner,
+                    "start": min([node.lineno, *(d.lineno for d in node.decorator_list)]),
+                    "end": node.end_lineno or node.lineno,
+                }
+            )
+        pending.extend((child, owner) for child in ast.iter_child_nodes(node))
+    return {"status": "indexed", "entries": sorted(entries, key=lambda entry: entry["start"])}
 
 
 def declarations(filename: str, text: str) -> list[tuple[int, int]]:

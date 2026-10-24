@@ -1,6 +1,6 @@
 """Record bounded failure metadata without exception messages or response content.
 
-Only schema-owned field names and built-in validation codes reach logs/artifacts.
+Only schema-owned fields, validation codes and bounded exhaustion coordinates reach logs/artifacts.
 Unknown locations are redacted because extra keys can contain untrusted text.
 """
 
@@ -11,7 +11,36 @@ from typing import Any, get_args
 from pydantic import ValidationError
 from pydantic_core import ErrorType
 
-from ai_reviewer.contracts import ChunkReview, Consolidation, ReviewContext
+from ai_reviewer.contracts import ChunkReview, Consolidation, ReviewContext, SourceRequest
+
+
+class FollowupExhausted(ValueError):
+    """Identify incomplete work after the last allowed report.
+
+    Attributes:
+        attempts: Number of validated reports, including the final incomplete report.
+        requests: Bounded safe coordinates; provider reasons and source are omitted.
+        request_count: Full outstanding count, before diagnostic truncation.
+    """
+
+    def __init__(self, attempts: int, requests: list[SourceRequest], paths: set[str]) -> None:
+        """Retain at most 20 requests, accepting paths only from the captured snapshot.
+
+        Long paths are truncated to 240 characters. Unknown paths are redacted.
+        Requests and paths are read without mutation; no source is fetched.
+        """
+        super().__init__("Required follow-up work exhausted")
+        self.attempts = attempts
+        self.request_count = len(requests)
+        self.requests = [
+            {
+                "path": request.path[:240] if request.path in paths else "<outside_snapshot>",
+                "side": request.side,
+                "start": request.start,
+                "end": request.end,
+            }
+            for request in requests[:20]
+        ]
 
 
 def failure_details(error: Exception) -> dict[str, Any]:
@@ -20,10 +49,18 @@ def failure_details(error: Exception) -> dict[str, Any]:
     Includes its class name, an integer HTTP status in 100..599 when present, and
     at most 20 Pydantic errors with at most 12 location components each. Only known
     schema field names, integer indices and built-in validation codes are retained.
+    Exhaustion adds validated-report counts and bounded snapshot request coordinates.
     Exception messages, inputs, contexts, URLs, bodies and headers are omitted.
     """
     # Admit only a class name and numeric HTTP status from generic exceptions.
     details: dict[str, Any] = {"error": type(error).__name__}
+    if isinstance(error, FollowupExhausted):
+        details.update(
+            attempts=error.attempts,
+            completed_followups=max(0, error.attempts - 1),
+            outstanding_request_count=error.request_count,
+            outstanding_requests=error.requests,
+        )
     status = getattr(error, "status_code", None)
     if type(status) is int and 100 <= status <= 599:
         details["http_status"] = status

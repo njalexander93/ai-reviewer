@@ -40,7 +40,7 @@ from ai_reviewer.contracts import (
     source_findings,
     validate_anchors,
 )
-from ai_reviewer.diagnostics import report_failure
+from ai_reviewer.diagnostics import FollowupExhausted, report_failure
 from ai_reviewer.limits import (
     CAPACITY_PACKET_BYTES,
     CONSOLIDATION_BYTES,
@@ -110,8 +110,8 @@ class Completion(Contract):
         assignment: Planned assignment ID.
         role: Independent provider required to complete that assignment.
         status: Pending before execution; complete or failed after its future settles.
-        attempts: Successful run's persisted attempt count, at most MAX_ATTEMPTS.
-            Remains zero on failure even if partial attempt artifacts exist.
+        attempts: Validated report count for success or follow-up exhaustion, at most
+            MAX_ATTEMPTS. Zero on other failures means unknown, not no provider calls.
     """
 
     assignment: str
@@ -558,8 +558,9 @@ def advance(
         Parsed report and next JSON payload, or None for the payload when complete.
 
     Raises:
+        FollowupExhausted: The final allowed report still requests required evidence.
         ValueError: Schema or anchors are invalid, completion conflicts with requests,
-            incomplete work has no request, attempts are exhausted, requested source
+            incomplete work has no request, requested source
             is unavailable, or the continuation exceeds the packet ceiling.
     """
     # Parse and anchor-check before interpreting a provider completion claim.
@@ -574,7 +575,9 @@ def advance(
     if not report.requests:
         raise ValueError("Required context unresolved")
     if len(history) + 1 >= MAX_ATTEMPTS:
-        raise ValueError("Required follow-up work exhausted")
+        raise FollowupExhausted(
+            len(history) + 1, report.requests, {file.filename for file in context.files}
+        )
     return report, followup_payload(context, assignment, [*history, report], packet_bytes)
 
 
@@ -669,7 +672,8 @@ def run_batch(
         OSError: Manifest persistence fails; already-started workers still finish.
 
     Work is recorded before submission. Worker errors are logged and converted to
-    failed completions; queued work is not cancelled after a failure. All in-flight
+    failed completions with best-effort failure.json diagnostics. Exhaustion preserves
+    its validated report count; queued work is not cancelled after a failure. All in-flight
     calls finish so available usage is retained before the batch can fail.
     """
     # Record the full required batch before any provider can start spending.
@@ -705,8 +709,14 @@ def run_batch(
                 completion.attempts = future.result()
                 completion.status = "complete"
             except Exception as error:
+                if isinstance(error, FollowupExhausted):
+                    completion.attempts = error.attempts
                 report_failure(
-                    error, assignment=completion.assignment, role=completion.role, phase="worker"
+                    error,
+                    directory / "work" / completion.assignment / completion.role / "failure.json",
+                    assignment=completion.assignment,
+                    role=completion.role,
+                    phase="worker",
                 )
                 completion.status = "failed"
                 failed = True

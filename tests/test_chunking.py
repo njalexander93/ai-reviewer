@@ -413,3 +413,50 @@ def test_incremental_packet_sizes_match_serialized_unicode_and_shared_comments()
         assert budget.size == len(chunk.payload(metadata).encode())
         budget.include(sizer.additions([unit]))
         assert budget.size == len(chunk.payload(metadata).encode())
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_declaration_navigation_keeps_lexical_names_and_git_ranges(newline: str) -> None:
+    """Decorators, nested async methods and duplicate names retain distinct LF ranges."""
+    from ai_reviewer.chunking import declaration_index
+
+    source = newline.join(
+        [
+            "raise RuntimeError('must never execute')",
+            "@decorate",
+            "class Adapter:",
+            "    @decorate",
+            "    async def handle(self):",
+            "        def nested():",
+            "            return 1",
+            "        return nested()",
+            "def handle():",
+            "    return 2",
+        ]
+    )
+    assert declaration_index("adapter.py", source) == {
+        "status": "indexed",
+        "entries": [
+            {"name": "Adapter", "start": 2, "end": 8},
+            {"name": "Adapter.handle", "start": 4, "end": 8},
+            {"name": "Adapter.handle.nested", "start": 6, "end": 7},
+            {"name": "handle", "start": 9, "end": 10},
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "filename,source,status",
+    [
+        ("app.js", "function handle() {}", "unsupported_language"),
+        ("app.py", "def handle(:", "parse_error"),
+        ("app.py", "\x00", "parse_error"),
+        ("app.py", "pass\rdef handle(): pass", "unsupported_line_endings"),
+        ("app.py", "", "indexed"),
+    ],
+)
+def test_unavailable_navigation_is_explicit(filename: str, source: str, status: str) -> None:
+    """An empty valid file differs from unsupported or malformed captured source."""
+    from ai_reviewer.chunking import declaration_index
+
+    assert declaration_index(filename, source) == {"status": status, "entries": []}

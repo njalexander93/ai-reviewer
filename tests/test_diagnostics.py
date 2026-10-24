@@ -82,3 +82,24 @@ def test_transport_diagnostics_keep_status_without_exception_body(
     assert '"http_status": 429' in output
     assert '"error": "RateLimitError"' in output
     assert "secret" not in output
+
+
+def test_exhaustion_diagnostics_bound_and_redact_provider_requests() -> None:
+    """Unknown paths and provider prose cannot enter the bounded coordinate report."""
+    from ai_reviewer.contracts import SourceRequest
+    from ai_reviewer.diagnostics import FollowupExhausted
+
+    requests = [
+        SourceRequest(path="secret-path", side="RIGHT", start=1, end=2, reason="secret-reason")
+        for _ in range(25)
+    ]
+    details = failure_details(FollowupExhausted(3, requests, {"app.py"}))
+    assert details["outstanding_request_count"] == 25
+    assert len(details["outstanding_requests"]) == 20
+    assert details["outstanding_requests"][0] == {
+        "path": "<outside_snapshot>",
+        "side": "RIGHT",
+        "start": 1,
+        "end": 2,
+    }
+    assert "secret" not in json.dumps(details)
