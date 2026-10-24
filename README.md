@@ -56,45 +56,28 @@ and [stale approval dismissal](https://docs.github.com/en/repositories/configuri
 Private targets need a credential with access to them; a `public_repo` token is
 insufficient.
 
-## Test the implementation branch
-
-[Branch review test](.github/workflows/review-branch.yml) runs on non-draft PR
-updates from the same-repository `feat/automated-pr-review` branch. It calls the
-local reusable workflow and checks out the same PR merge commit, so both workflow
-logic and Python implementation come from the candidate revision. This exercises
-real provider calls, posts a real review and incurs API charges. Fork PRs and
-other branches do not qualify. The base must also equal the initial main commit
-`01a7a031a2762b35bcbec7c0280ed1a60eee3469`; once main advances, this bootstrap
-job is ineligible. It cannot duplicate the production caller after merge.
-The ordinary Checks workflow still runs separately.
-
-GitHub resolves [local reusable workflows from the caller's commit](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
-This bootstrap caller does not need to exist on `main` before its PR event runs.
-The immutable base gate permits the final candidate review without relying on
-a manual pre-merge deletion for safety. This repository's production
-caller uses its local reusable workflow and the same trusted commit for checkout.
-External repositories use the release-pinned installation template. Re-running a test can incur model costs
-even when publication detects an existing review.
-
 ## Review policy
 
 - Runs on PR opening, reopening, publication from draft, and new commits.
 - Same-repository PRs run automatically. Fork PRs require a maintainer to select
   **Run workflow** and enter the PR number. Draft, closed and reviewer-authored
   PRs are rejected. Requests serialize per repository and PR.
-- Each model receives the same diff, complete before/after versions of changed
-  text files, PR description, linked issue requirements and previous inline discussion. Before versions
-  come from the merge base, matching the PR diff.
+- Small packets retain two independent whole-packet reviews with complete before/after
+  text. Both sizes use the same manifest, source validation and consolidation flow.
+  Larger snapshots use deterministic chunks and two reviews of every required
+  local/integration assignment. Each packet includes PR metadata, the full issue
+  requirements, a changed-file inventory and relevant previous inline discussion.
+  Before versions come from the merge base, matching the PR diff.
 - Context uses validated file/comment records and omits repeated GitHub diff hunks
   and URL/user metadata. Symlinks retain their actual link text and Git mode.
 - The imported [thermo-nuclear review skill](src/ai_reviewer/prompts/review.md)
   supplies the structural quality standard. Correctness and security findings
   also count. Models must report insufficient context explicitly.
-- Sonnet sees both completed reports. It must preserve every finding exactly
+- Sonnet sees completed reports and findings in bounded batches. It must preserve every finding exactly
   once. Original wording and explicit severity labels remain in feedback. Different
   locations receive separate threads; large groups split between findings at a
   conservative 60,000 UTF-8 byte limit per inline comment.
-- Any blocking finding means **REQUEST_CHANGES**. Two complete reports with no
+- Any blocking finding means **REQUEST_CHANGES**. All required complete reports with no
   blockers mean **APPROVE**. Nonblocking observations may accompany approval.
 - Missing, invalid or incomplete results fail the run. They never become a clean
   verdict. Both head and base commits are rechecked immediately before posting.
@@ -124,7 +107,7 @@ within a provider produce one issue record.
 - **Failures:** configured-provider errors, inaccessible referenced issues and
   truncated results fail preparation. They never silently mean "no issue."
   Collection allows at most 20 issues and 20 explicit references per provider;
-  issue text counts toward the existing 600 KB context limit.
+  issue text counts toward every packet’s 600,000-byte context limit.
 - **Scope:** refreshes on review runs, not on issue edits alone. Does not crawl
   project boards, infer tickets from similar wording, or read issue comments.
   A GitHub token must have access to every referenced repository; the default
@@ -145,6 +128,21 @@ against Linear's [published SDK schema](https://github.com/linear/linear/blob/61
 not a flat attachment list. Mock fixtures preserve that provider contract;
 authenticated live validation remains deferred.
 
+## Failure diagnostics
+
+Failed stages and model calls emit bounded JSON diagnostics to Actions logs and
+`*.error.json` files in the evidence artifact. Model records identify the role,
+model and phase (`preflight`, `generation`, or `validate_response`). Worker logs
+identify assignment, provider and zero-based attempt. Numeric HTTP status and up
+to 20 schema errors include known field names, array indexes and validation codes.
+Unknown field names are redacted; response bodies, exception messages, validation
+inputs/context, credentials and headers are never included. SDK parse failures
+can still leave token usage unknown. Logging does not make a failed review pass.
+
+These diagnostics run only when the workflow uses this implementation revision.
+The production caller uses the implementation on `main`; updating an unmerged PR
+does not change the reviewer executing against that PR.
+
 ## Security and limits
 
 The workflow checks out only its pinned reviewer implementation. It reads PR
@@ -155,19 +153,106 @@ and publication receive the reviewer credential. All stages share the runner and
 workspace, so step-scoped environment variables are not a sandbox boundary.
 
 **This is a bounded static review, not a replacement for the interactive agents.**
-It cannot inspect unchanged dependencies, run tests, browse links or verify an
+It can retrieve captured changed-file sections, but cannot inspect unchanged dependencies,
+run tests, browse links or verify an
 entire repository architecture. When those are necessary, models should mark the
 review incomplete. Model judgment can still be wrong or affected by malicious
 instructions in source; structured output does not eliminate that risk.
 
-Limits are 80 changed files, 150 KB per file version and 600 KB of total serialized
-context. Missing text patches are reconstructed with Git from inert temporary
-blob files; no repository code or external diff driver is executed. Findings
-are checked against captured diff anchors before purchasing consolidation. Invalid
-anchors fail the run and preserve report artifacts instead of dropping findings.
-Binary files, unavailable content and oversized changes fail without
-approval. Each model may return up to 40 findings. Output is capped at 16,000
-tokens per call. No automatic provider retries are performed.
+### Large PRs
+
+The **600,000-byte ceiling applies to serialized UTF-8 context per call**, including
+source, patches, requirements, replies and the shared overview. It is a starting
+safeguard, not a measured optimum. Preparation now permits up to 3,000 changed
+files, 8 MB per blob and 32 MB per serialized snapshot. These collection bounds
+replace the old 80-file and 150 KB per-version rejection.
+
+1. Capture immutable head, base and merge-base evidence. Validate that original
+   patches account for the complete before/after change. Reconstruct missing
+   text patches with Git over inert blobs. Binary, unreadable, truncated or
+   unsupported objects still fail without approval.
+2. Keep a whole file when it fits the unit budget. For oversized text, prefer
+   Python function/class boundaries, then diff sections, then physical patch
+   lines. Other languages use diff boundaries. Retain original patch records,
+   old/new cursors, source offsets, modes, renames and final-newline state.
+3. Compile the inventory and discussion index once per plan. Scan each captured
+   version with a shared reference index using complete path/module tokens. Join
+   normalized names only between test and non-test files. Reuse this relationship evidence during packing and integration.
+   Pack direct references, source/test pairs and directory peers together using
+   stable ordering. Fit checks count precomputed item bytes incrementally; full
+   packets are serialized only after their scopes are chosen. A unit is capped at 160,000 bytes so two actual source units
+   can accompany reports during integration. Local packets target 420,000 bytes,
+   leaving 180,000 bytes for required follow-ups under the 600,000-byte ceiling.
+   Indivisible oversized lines or required metadata fail explicitly; nothing is
+   silently removed to fit.
+4. Run Opus and Sol, both at medium effort, on every chunk with **two concurrent
+   workers** in the same Actions job. Each provider can request up to eight source
+   ranges per response from the captured changed files. Allow two follow-up rounds.
+   All earlier findings and requested source remain available. Unresolved context,
+   an unavailable range or an oversized follow-up makes the run incomplete.
+5. Both providers perform integration passes with actual source and reports.
+   Every chunk gets an integration pass. Additional packets join direct references,
+   source/test pairs and neighboring directory/file sections across chunks. Direct
+   references come from full captured blobs, with their actual source lines included
+   even outside changed hunks. Accumulated reports are paged into additional required
+   integration assignments. This
+   is a bounded heuristic, **not a complete dependency graph**. Models must request
+   missing source and remain incomplete if the snapshot cannot answer.
+6. Recompute the plan and validate the coverage manifest once before consolidation
+   and once before publication. The manifest stores assignment and plan hashes;
+   full payloads stay in attempt artifacts. Reports are keyed by assignment and
+   provider. Compile immutable diff anchors once per stage and reuse them across
+   workers and replay. Whole, local and integration assignments receive explicit
+   scope instructions with the same source-request contract. Require both providers for all assignments and all follow-ups.
+   Coverage proves assignment/completion; it does not prove model understanding.
+7. Sonnet groups up to 40 original findings per batch with global source IDs.
+   All findings, locations and severity survive exactly once. Cross-batch duplicate
+   findings remain separate. Bounded summary passes carry original assessments
+   and disagreements into one overview. Publication submits **one GitHub review**.
+
+Provider token counts are checked before generation, including instructions and
+output schemas. Each call allows at most **250,000 input tokens** and **16,000
+output/reasoning tokens**. This conservative policy leaves headroom below the
+verified [Claude 1M context](https://platform.claude.com/docs/en/models/overview)
+and [Sol 1.05M context](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
+and stays below Sol's 272k long-context price threshold. Bytes are not converted
+into guessed tokens. See [Claude token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting)
+and [OpenAI token counting](https://developers.openai.com/api/docs/guides/token-counting).
+Count both provider inputs for every planned local scope before either generates
+a report, including packets already routed to chunks.
+If any exceeds capacity, re-plan with a 200,000-byte ceiling for every review
+packet, including integration pages and follow-ups. Local chunks target half that
+ceiling and source units at most one quarter, leaving integration headroom.
+Each resulting call still undergoes provider token counting; there is no byte/token
+conversion or guarantee that required metadata can fit. The fallback plan is bound
+to the manifest and replayed by downstream stages. Other provider failures remain
+failures, not partitioning signals.
+
+Operational defaults are deliberate finite safeguards, not performance optima:
+
+| Boundary | Default | Reason |
+| --- | --- | --- |
+| Collection | 3,000 files; 8 MB/blob; 32 MB snapshot; 10,000 API requests/client; 20,000 direct relations | Bound fetching and memory while admitting both historical examples |
+| Local planning | 64 chunks | Bound partition growth |
+| Local + integration work | 128 assignments, each reviewed by both providers | Bound relationship expansion and spending |
+| Follow-ups | 3 total attempts/provider/assignment | Resolve missing evidence without an open-ended loop |
+| Provider output | 40 findings and 60,000 serialized bytes/attempt | Bound report handling and integration input |
+| Sonnet work | 128 finding batches + 128 summary calls | Bound aggregate consolidation |
+| Publication | 1,000 comments; 8 MB comment payload; 60,000-byte body | Fail before any oversized or partial review write |
+| Job | 2 workers; 180 minutes; no automatic API retries | Bound concurrency and execution time |
+
+Application work limits live in `src/ai_reviewer/limits.py`; the job timeout lives
+in the workflow. Increasing one requires reviewing downstream bounds. Equal values
+with different purposes remain separate. The work limits are **not a dollar budget**. Large PRs can cost substantially more through repeated overview/source,
+follow-ups and integration. There is no promise that an accepted snapshot will
+finish: required evidence, output or total work may exceed a later bound, which
+blocks approval. The **180-minute job timeout is the effective wall-clock limit**;
+the assignment and per-call maxima cannot all be exhausted within it. Timeout may
+interrupt a stage. Cost reporting and artifact upload use `always()`, but their
+completion after job cancellation is not established. A timed-out run may therefore
+lose usage/evidence and must never be treated as a clean review. A new run needs a fresh
+artifact directory, as supplied by a new Actions job.
+
 
 GitHub review submission is not atomic with the final revision check. A push in
 that small interval can leave a review attached to the old commit. Enable stale
@@ -181,7 +266,8 @@ secrets. The CLI deliberately suppresses provider exception bodies.
 
 ## Cost reporting
 
-The final **Report API costs** step prints Opus, Sol and Sonnet estimates, Claude/OpenAI
+The final **Report API costs** step reads every nested attempt artifact and prints
+Opus, Sol and Sonnet estimates, Claude/OpenAI
 subtotals and a combined total. It runs after success or failure. An attempted
 call with unavailable usage is **unknown**, never silently counted as free. A
 stage never attempted is reported as **not run ($0)**. Review comments contain
@@ -252,6 +338,4 @@ upstream commit, immutable source URLs, SHA-256 hashes and local modifications.
 ## Final merge checklist
 
 - [ ] Complete the last candidate review and record its passing run.
-- [ ] Confirm the bootstrap base gate still pins the initial main commit. It
-      automatically disables candidate execution once main advances.
 - [ ] Keep required code-quality checks passing on the final revision.

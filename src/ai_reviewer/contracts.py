@@ -1,14 +1,27 @@
 """Define model-output contracts and preserve findings through consolidation.
 
-Pydantic rejects extra fields and type coercion. Reconciliation checks the two
+Pydantic rejects extra fields and type coercion. Reconciliation checks required
 reports and source-ID partition without performing I/O or changing findings.
 Class docstrings also become descriptions in provider-facing JSON schemas.
 """
 
 from collections import Counter
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from ai_reviewer.limits import (
+    MAX_COMPLETED_FINDINGS,
+    MAX_CONSOLIDATION_GROUPS,
+    MAX_FILES,
+    MAX_FINAL_GROUPS,
+    MAX_FINDINGS,
+    MAX_GROUP_SOURCES,
+    MAX_SOURCE_REQUESTS,
+)
+from ai_reviewer.patch import diff_lines
 
 
 class Contract(BaseModel):
@@ -48,7 +61,34 @@ class Review(Contract):
 
     complete: bool
     summary: str = Field(min_length=1, max_length=6000)
-    findings: list[Finding] = Field(max_length=40)
+    findings: list[Finding] = Field(max_length=MAX_FINDINGS)
+
+
+class SourceRequest(Contract):
+    """Request inclusive Git lines from a captured changed-file version only."""
+
+    # Current captured filename; LEFT reads before, RIGHT reads after, including renames.
+    path: str
+    side: Literal["LEFT", "RIGHT"]
+    # One-based inclusive bounds; source_sections checks ordering and availability.
+    start: int = Field(ge=1)
+    end: int = Field(ge=1)
+    # Nonempty explanation of the evidence needed; never executable instructions.
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class ChunkReview(Review):
+    """Review assigned sections; required missing evidence must be requested explicitly."""
+
+    # Required missing ranges. advance rejects complete reports with outstanding requests.
+    requests: list[SourceRequest] = Field(max_length=MAX_SOURCE_REQUESTS)
+
+
+class CompletedReview(Review):
+    """Preserve findings from up to three attempts of one assigned provider review."""
+
+    # Retain findings from all successful attempts; summary/complete follow Review.
+    findings: list[Finding] = Field(max_length=MAX_COMPLETED_FINDINGS)
 
 
 class Group(Contract):
@@ -59,7 +99,7 @@ class Group(Contract):
             Reconciliation validates membership and uniqueness.
     """
 
-    source_ids: list[str] = Field(min_length=1, max_length=80)
+    source_ids: list[str] = Field(min_length=1, max_length=MAX_GROUP_SOURCES)
 
 
 class Consolidation(Contract):
@@ -72,7 +112,14 @@ class Consolidation(Contract):
     """
 
     summary: str = Field(min_length=1, max_length=6000)
-    groups: list[Group] = Field(max_length=80)
+    groups: list[Group] = Field(max_length=MAX_CONSOLIDATION_GROUPS)
+
+
+class FinalConsolidation(Consolidation):
+    """Hold bounded batches after each Sonnet response preserves its source partition."""
+
+    # Aggregate partition across bounded batches; summary retains Consolidation semantics.
+    groups: list[Group] = Field(max_length=MAX_FINAL_GROUPS)
 
 
 class ChangedFile(Contract):
@@ -160,25 +207,26 @@ class ReviewContext(Contract):
     reviewer: str = Field(min_length=1)
     title: str
     description: str | None
-    files: list[ChangedFile] = Field(max_length=80)
+    files: list[ChangedFile] = Field(max_length=MAX_FILES)
     previous_comments: list[PriorComment]
     issues: list[IssueContext] = Field(default_factory=list, max_length=40)
 
 
 def source_findings(reviews: list[Review]) -> dict[str, Finding]:
-    """Validate the independent pair and assign stable source IDs.
+    """Validate completeness and assign stable IDs; load_reviews enforces exact coverage.
 
     Args:
-        reviews: Exactly two complete reports, ordered Claude then OpenAI.
+        reviews: Complete reports in deterministic assignment/provider order.
 
     Returns:
         Original findings keyed by zero-based review:finding IDs.
 
     Raises:
-        ValueError: The pair is missing or either report is incomplete.
+        ValueError: Fewer than two reports are supplied or a report is incomplete.
+            Exact assignment/provider coverage is enforced by load_reviews, not here.
     """
     # Enforce the same completeness boundary before consolidation and publication.
-    if len(reviews) != 2 or not all(review.complete for review in reviews):
+    if len(reviews) < 2 or not all(review.complete for review in reviews):
         raise ValueError("Incomplete review; approval prohibited")
     # Index original objects once for both the payload and reconciliation contract.
     return {
@@ -192,14 +240,14 @@ def reconcile(reviews: list[Review], result: Consolidation) -> list[list[Finding
     """Require complete reviews and an exact partition of all source findings.
 
     Args:
-        reviews: Exactly two complete reports, ordered Claude then OpenAI.
+        reviews: Complete reports in deterministic assignment/provider order.
         result: Proposed duplicate groups from Sonnet.
 
     Returns:
         Original findings grouped for publication, with their severity unchanged.
 
     Raises:
-        ValueError: There are not two complete reports, or a source is missing,
+        ValueError: Required complete reports are absent, or a source is missing,
             repeated or invented.
     """
     # Reuse the canonical completeness check and source-index contract.
@@ -210,3 +258,70 @@ def reconcile(reviews: list[Review], result: Consolidation) -> list[list[Finding
         raise ValueError("Consolidation must preserve every source exactly once")
     # Return original objects, preserving wording and blocker flags.
     return [[sources[key] for key in group.source_ids] for group in result.groups]
+
+
+class IndependentSummary(Contract):
+    """Label an original assessment where assignment/provider identity is known.
+
+    Attributes:
+        assignment: Whole-work assignment ID supplied by the canonical loader.
+        provider: Independent reviewer whose label publication must display.
+        summary: Original report assessment, without consolidation rewriting.
+    """
+
+    assignment: str
+    provider: Literal["claude", "openai"]
+    summary: str
+
+
+class CoveredReviews(Contract):
+    """Carry trusted canonical-loader data without replaying artifacts in publication.
+
+    The CLI obtains this only after exact work and anchor validation. It is internal
+    application data, not an unforgeable capability or accepted wire format.
+
+    Attributes:
+        reviews: Complete reports in stable assignment/provider order for source IDs.
+        independent_summaries: Explicit whole-review identity and original assessments.
+        snapshot: Hash binding these reports to the captured context's exact JSON.
+        summary: Human-readable coverage statement; not evidence of model understanding.
+    """
+
+    reviews: list[Review]
+    independent_summaries: list[IndependentSummary]
+    snapshot: str
+    summary: str
+
+
+# Read-only current path to immutable (LEFT/RIGHT, one-based line) coordinates.
+AnchorIndex = Mapping[str, frozenset[tuple[str, int]]]
+
+
+def compile_anchors(context: ReviewContext) -> AnchorIndex:
+    """Return a read-only path-to-frozen-coordinate index for context's captured patches.
+
+    Context must have unique current paths; callers validate patch completeness during
+    preparation. The index is shared across workers without mutation and contains
+    LEFT/RIGHT one-based inline locations, not a proof of model understanding.
+    """
+    return MappingProxyType(
+        {file.filename: frozenset(diff_lines(file.patch)) for file in context.files}
+    )
+
+
+def validate_anchors(anchors: AnchorIndex, reviews: list[Review]) -> None:
+    """Reject invalid model locations before purchasing consolidation.
+
+    Args:
+        anchors: Precompiled immutable snapshot coordinates.
+        reviews: Independent reports with locations to validate.
+
+    Raises:
+        ValueError: A finding is outside the captured diff. Reports remain on disk
+            for diagnosis; this fails the run rather than silently dropping findings.
+    """
+    # Reject any unsupported location rather than filtering findings out of the verdict.
+    for review in reviews:
+        for finding in review.findings:
+            if (finding.side, finding.line) not in anchors.get(finding.path, frozenset()):
+                raise ValueError("Finding is outside the captured diff")

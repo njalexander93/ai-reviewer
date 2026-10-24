@@ -71,9 +71,9 @@ def test_merged_duplicates_retain_both_original_findings() -> None:
     ) == [[one, two]]
 
 
-@pytest.mark.parametrize("count", [0, 1, 3])
-def test_source_index_requires_exactly_two_reports(count: int) -> None:
-    """The shared source-index boundary rejects missing or extra reviewer reports."""
+@pytest.mark.parametrize("count", [0, 1])
+def test_source_index_requires_at_least_two_reports(count: int) -> None:
+    """The shared source-index boundary rejects missing reviewer reports."""
     # Empty findings do not make an incorrect reviewer count acceptable.
     reports = [Review(complete=True, summary="Complete", findings=[]) for _ in range(count)]
     with pytest.raises(ValueError, match="Incomplete"):

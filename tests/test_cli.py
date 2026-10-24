@@ -7,8 +7,8 @@ from threading import Barrier
 
 import pytest
 
-from ai_reviewer import cli
-from ai_reviewer.contracts import Consolidation, Review
+from ai_reviewer import cli, work
+from ai_reviewer.contracts import ChunkReview, Consolidation
 from tests.test_github import Server, bundle
 
 
@@ -37,26 +37,33 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
         monkeypatch.setenv(key, value)
     payloads: dict[str, dict] = {}
 
-    def model(role: str, payload: str, directory: Path) -> None:
+    def model(
+        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
+    ) -> None:
         """Write deterministic reports at the paid-provider boundary.
 
         Args:
             role: Reviewer or consolidator selected by the CLI stage.
             payload: JSON context or review pair, retained for assertions.
             directory: Isolated stage directory receiving the synthetic report.
+            kind: Assignment scope framing.
+            preflight: Count-only phase; no report is generated.
         """
+        if preflight:
+            return
+        directory.mkdir(parents=True, exist_ok=True)
         # Retain the actual stage input before selecting its response contract.
         payloads[role] = json.loads(payload)
         report = (
             Consolidation(summary="Both reviewers found no blockers.", groups=[])
             if role == "consolidate"
-            else Review(complete=True, summary=f"{role} completed", findings=[])
+            else ChunkReview(complete=True, summary=f"{role} completed", findings=[], requests=[])
         )
         # Match the artifact interface consumed by the next real CLI stage.
         (directory / f"{role}.json").write_text(report.model_dump_json())
 
     # Run the real stage dispatcher with only external boundaries replaced.
-    monkeypatch.setattr(cli, "call_model", model)
+    monkeypatch.setattr(work, "call_model", model)
     for stage in ["prepare", "review", "consolidate", "publish", "costs"]:
         monkeypatch.setattr(sys, "argv", ["review", stage, "--directory", str(tmp_path)])
         cli.main()
@@ -64,7 +71,7 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     assert payloads["claude"] == payloads["openai"]
     assert payloads["claude"]["head"] == "a" * 40
     assert payloads["claude"]["issues"][0]["description"] == "Retain prior edits."
-    assert [r["summary"] for r in payloads["consolidate"]["reviews"]] == [
+    assert payloads["consolidate"]["reviews"][:2] == [
         "claude completed",
         "openai completed",
     ]
@@ -84,13 +91,18 @@ def test_incomplete_report_blocks_later_stages(
     capsys: pytest.CaptureFixture,
 ) -> None:
     """Insufficient context cannot turn into a clean review in either downstream stage."""
-    # Write one complete report and one report declaring insufficient context.
-    for role in ("claude", "openai"):
-        (tmp_path / f"{role}.json").write_text(
-            Review(
-                complete=role == "claude", summary="secret-content", findings=[]
-            ).model_dump_json()
-        )
+    from tests.test_work import fake_model
+
+    context, _, _ = bundle(Server())
+    (tmp_path / "context.json").write_text(context.model_dump_json())
+    monkeypatch.setattr(work, "call_model", fake_model)
+    work.review_chunks(context, tmp_path)
+    target = work.attempt_directory(tmp_path, "whole", "openai", 0) / "openai.json"
+    target.write_text(
+        ChunkReview(
+            complete=False, summary="secret-content", findings=[], requests=[]
+        ).model_dump_json()
+    )
     monkeypatch.setattr(sys, "argv", ["review", stage, "--directory", str(tmp_path)])
     # Require a failed stage without exposing report text or creating consolidation.
     with pytest.raises(SystemExit) as error:
@@ -110,17 +122,26 @@ def test_parallel_review_waits_for_both_calls(
     context, _, _ = bundle(Server())
     (tmp_path / "context.json").write_text(context.model_dump_json())
 
-    def model(role: str, payload: str, directory: Path) -> None:
+    def model(
+        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
+    ) -> None:
         """Synchronize provider calls and record completion before a selected failure.
 
         Args:
             role: Provider under test; selects its independent usage artifact.
             payload: Context text shared by both concurrent calls.
             directory: Isolated artifact directory.
+            kind: Assignment scope framing.
+            preflight: Count-only phase; no report is generated.
 
         Raises:
             RuntimeError: The selected provider fails after recording usage.
         """
+        if preflight:
+            return
+        (directory / f"{role}.json").write_text(
+            ChunkReview(complete=True, summary="Done", findings=[], requests=[]).model_dump_json()
+        )
         # Require overlap rather than inferring parallelism from execution duration.
         assert json.loads(payload)["head"] == "a" * 40
         started.wait()
@@ -130,7 +151,7 @@ def test_parallel_review_waits_for_both_calls(
             raise RuntimeError("synthetic provider failure")
 
     # Exercise the real CLI dispatcher with the paid boundary replaced.
-    monkeypatch.setattr(cli, "call_model", model)
+    monkeypatch.setattr(work, "call_model", model)
     monkeypatch.setattr(sys, "argv", ["reviewer", "review", "--directory", str(tmp_path)])
     if failed_role:
         with pytest.raises(SystemExit) as error:
@@ -140,7 +161,9 @@ def test_parallel_review_waits_for_both_calls(
         cli.main()
     # Returning from the stage must mean both calls have finished, including failure paths.
     for role in ("claude", "openai"):
-        assert (tmp_path / f"{role}.usage.json").read_text() == "recorded"
+        assert (
+            work.attempt_directory(tmp_path, "whole", role, 0) / f"{role}.usage.json"
+        ).read_text() == "recorded"
 
 
 def test_invalid_anchor_stops_before_consolidator_purchase(
@@ -153,14 +176,42 @@ def test_invalid_anchor_stops_before_consolidator_purchase(
     _, reviews, _ = bundle(server)
     reviews[0].findings[0].line = 999
     (tmp_path / "context.json").write_text(context.model_dump_json())
-    for role, review in zip(("claude", "openai"), reviews, strict=True):
-        (tmp_path / f"{role}.json").write_text(review.model_dump_json())
+    from tests.test_work import fake_model
+
+    monkeypatch.setattr(work, "call_model", fake_model)
+    work.review_chunks(context, tmp_path)
+    target = work.attempt_directory(tmp_path, "whole", "claude", 0) / "claude.json"
+    target.write_text(ChunkReview(**reviews[0].model_dump(), requests=[]).model_dump_json())
     calls = []
-    monkeypatch.setattr(cli, "call_model", lambda *args: calls.append(args))
+    monkeypatch.setattr(work, "call_model", lambda *args: calls.append(args))
     monkeypatch.setattr(sys, "argv", ["review", "consolidate", "--directory", str(tmp_path)])
     # Reject rather than discard the finding or pay for a useless consolidation.
     with pytest.raises(SystemExit) as error:
         cli.main()
     assert error.value.code == 1
     assert calls == []
-    assert (tmp_path / "claude.json").exists()
+    assert target.exists()
+
+
+def test_chunked_cli_handoff_uses_manifest_and_large_consolidation_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The deployed stage commands validate chunk coverage before the single review write."""
+    from ai_reviewer import work
+    from tests.test_work import fake_model, large_context
+
+    # Bind synthetic providers and GitHub to real stage/artifact handling.
+    context = large_context()
+    (tmp_path / "context.json").write_text(context.model_dump_json())
+    server = Server()
+    server.files = [{"filename": f.filename, "patch": f.patch} for f in context.files]
+    monkeypatch.setattr(work, "call_model", fake_model)
+    monkeypatch.setattr(cli, "GitHub", lambda token: server.gh)
+    monkeypatch.setenv("AI_REVIEWER_TOKEN", "fixture-token")
+    # Run all downstream commands, then require exactly one completed publication.
+    for stage in ("review", "consolidate", "publish"):
+        monkeypatch.setattr(sys, "argv", ["review", stage, "--directory", str(tmp_path)])
+        cli.main()
+    assert len(server.writes) == 1
+    assert server.writes[0][1]["event"] == "APPROVE"
+    assert (tmp_path / "manifest.json").exists()

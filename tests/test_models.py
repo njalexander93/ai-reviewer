@@ -53,7 +53,13 @@ def test_model_completion_and_usage_artifacts(
 
     # Replace client construction so no API key or network request is needed.
     client = SimpleNamespace(
-        responses=SimpleNamespace(parse=parse), messages=SimpleNamespace(parse=parse)
+        responses=SimpleNamespace(
+            parse=parse,
+            input_tokens=SimpleNamespace(count=lambda **kwargs: SimpleNamespace(input_tokens=1000)),
+        ),
+        messages=SimpleNamespace(
+            parse=parse, count_tokens=lambda **kwargs: SimpleNamespace(input_tokens=1000)
+        ),
     )
     monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
     monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
@@ -84,9 +90,9 @@ def test_model_completion_and_usage_artifacts(
 def test_failed_call_records_unknown_cost(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A failed network call must never be reported as free."""
 
-    # Replace the provider boundary with a deterministic transport failure.
+    # Fail generation after a successful token-count preflight.
     def fail(**kwargs: object) -> None:
-        """Reject provider construction with a deterministic transport failure.
+        """Reject generation with a deterministic transport failure.
 
         Args:
             **kwargs: Ignored SDK constructor options.
@@ -96,7 +102,13 @@ def test_failed_call_records_unknown_cost(monkeypatch: pytest.MonkeyPatch, tmp_p
         """
         raise TimeoutError("request interrupted")
 
-    monkeypatch.setattr(models.openai, "OpenAI", fail)
+    client = SimpleNamespace(
+        responses=SimpleNamespace(
+            parse=fail,
+            input_tokens=SimpleNamespace(count=lambda **kwargs: SimpleNamespace(input_tokens=1000)),
+        )
+    )
+    monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
     # Require failed calls to leave an explicitly unknown usage record.
     with pytest.raises(TimeoutError):
         call_model("openai", "context", tmp_path)
@@ -149,3 +161,162 @@ def test_unattempted_calls_cost_zero(tmp_path: Path, capsys: pytest.CaptureFixtu
     assert "consolidate: not run ($0)" in output
     assert "Estimated API total: $0.0000\n" in output
     assert "unknown" not in output
+
+
+@pytest.mark.parametrize("role", ["claude", "openai"])
+def test_provider_count_blocks_generation_before_capacity_overflow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str
+) -> None:
+    """A provider count above 250k blocks generation even for a tiny byte payload."""
+    # Expose a provider count over policy and observe whether generation starts.
+    generated = []
+    client = SimpleNamespace(
+        responses=SimpleNamespace(
+            parse=lambda **kwargs: generated.append(kwargs),
+            input_tokens=SimpleNamespace(
+                count=lambda **kwargs: SimpleNamespace(input_tokens=250_001)
+            ),
+        ),
+        messages=SimpleNamespace(
+            parse=lambda **kwargs: generated.append(kwargs),
+            count_tokens=lambda **kwargs: SimpleNamespace(input_tokens=250_001),
+        ),
+    )
+    monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
+    monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
+    with pytest.raises(ValueError, match="capacity"):
+        call_model(role, "tiny", tmp_path, kind="local")
+    assert generated == []
+    assert not (tmp_path / f"{role}.json").exists()
+    assert not (tmp_path / f"{role}.usage.json").exists()
+
+
+def test_costs_include_every_isolated_attempt(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Three Opus attempts at $0.40 and two Sol attempts at $0.20 total $1.60."""
+    # Create nested successful attempts plus unknown usage before aggregating costs.
+    for role, count in (("claude", 3), ("openai", 2)):
+        for index in range(count):
+            target = tmp_path / "work" / str(index) / role
+            target.mkdir(parents=True)
+            (target / f"{role}.usage.json").write_text(
+                Usage(input=100_000, output=0, cached=0, cache_write=0).model_dump_json()
+            )
+    failed = tmp_path / "work" / "failed"
+    failed.mkdir()
+    (failed / "claude.usage.json").write_text("null")
+    print_costs(tmp_path)
+    output = capsys.readouterr().out
+    assert "Claude subtotal: $1.2000 + unknown" in output
+    assert "OpenAI subtotal: $0.4000" in output
+    assert "Estimated API total: $1.6000 + unknown" in output
+
+
+@pytest.mark.parametrize("role", ["claude", "openai"])
+def test_preflight_never_generates_or_records_usage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str
+) -> None:
+    """Counting-only requests must not cross the paid-generation boundary."""
+    # Keep counting successful while making generation observable.
+    generated = []
+    client = SimpleNamespace(
+        responses=SimpleNamespace(
+            parse=lambda **kwargs: generated.append(kwargs),
+            input_tokens=SimpleNamespace(count=lambda **kwargs: SimpleNamespace(input_tokens=1000)),
+        ),
+        messages=SimpleNamespace(
+            parse=lambda **kwargs: generated.append(kwargs),
+            count_tokens=lambda **kwargs: SimpleNamespace(input_tokens=1000),
+        ),
+    )
+    monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
+    monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
+    call_model(role, "context", tmp_path, kind="local", preflight=True)
+    assert generated == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_provider_validation_failure_saves_redacted_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """An SDK parse failure records provider and schema location before propagating."""
+    from pydantic import ValidationError
+
+    # Inject a real validation exception carrying private input at the SDK boundary.
+    error = ValidationError.from_exception_data(
+        "Review", [{"type": "string_type", "loc": ("summary",), "input": {"secret": "content"}}]
+    )
+
+    def parse(**kwargs: object) -> None:
+        """Raise the captured real ValidationError at the SDK parse boundary.
+
+        All SDK keyword options are accepted but ignored. No provider/network call occurs;
+        the exception intentionally carries private input for the diagnostic assertion.
+        """
+        raise error
+
+    client = SimpleNamespace(
+        messages=SimpleNamespace(
+            parse=parse, count_tokens=lambda **kwargs: SimpleNamespace(input_tokens=1000)
+        )
+    )
+    monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
+    with pytest.raises(ValidationError):
+        call_model("claude", "private-payload", tmp_path)
+    data = json.loads((tmp_path / "claude.error.json").read_text())
+    assert data["role"] == "claude"
+    assert data["model"] == "claude-opus-5-5"
+    assert data["phase"] == "generation"
+    assert data["validation_errors"] == [{"location": ["summary"], "code": "string_type"}]
+    assert (tmp_path / "claude.usage.json").read_text() == "null"
+    assert not (tmp_path / "claude.json").exists()
+    assert "secret" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("role", ["claude", "openai"])
+@pytest.mark.parametrize(
+    "kind,framing",
+    [
+        ("whole", "complete captured PR"),
+        ("local", "bounded local assignment"),
+        ("integration", "Assess PR-wide compatibility"),
+    ],
+)
+def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str, kind: str, framing: str
+) -> None:
+    """Both providers receive accurate scope framing and the same request-capable contract."""
+    from ai_reviewer.contracts import ChunkReview
+
+    # Capture count requests for each role/scope without purchasing a completion.
+    calls = []
+
+    def count(**kwargs: object) -> SimpleNamespace:
+        """Capture kwargs and return an SDK-shaped synthetic count of 100 input tokens.
+
+        The calls list retains the actual request options for assertions. No generation,
+        network access or artifact writes occur in this replacement count endpoint.
+        """
+        calls.append(kwargs)
+        return SimpleNamespace(input_tokens=100)
+
+    client = SimpleNamespace(
+        responses=SimpleNamespace(input_tokens=SimpleNamespace(count=count)),
+        messages=SimpleNamespace(count_tokens=count),
+    )
+    monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
+    monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
+    call_model(role, "unchanged payload", tmp_path, kind=kind, preflight=True)
+    call = calls[0]
+    instructions = call["instructions"] if role == "openai" else call["system"]
+    assert framing in instructions
+    assert "Request missing evidence" in instructions
+    if kind == "whole":
+        assert "within a larger PR" not in instructions
+    schema = (
+        call["text"]["format"]["schema"]
+        if role == "openai"
+        else call["output_format"].model_json_schema()
+    )
+    assert schema == ChunkReview.model_json_schema()

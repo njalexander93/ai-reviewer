@@ -5,6 +5,7 @@ fixed GitHub API host; untrusted paths are encoded, not interpolated as URLs.
 """
 
 import base64
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -15,16 +16,26 @@ import httpx
 
 from ai_reviewer.contracts import (
     Consolidation,
-    Review,
+    CoveredReviews,
     ReviewContext,
     reconcile,
 )
+from ai_reviewer.limits import (
+    GITHUB_BODY_BYTES,
+    MAX_BLOB_BYTES,
+    MAX_GITHUB_COMMENTS,
+    MAX_GITHUB_PAYLOAD_BYTES,
+    MAX_GITHUB_REQUESTS,
+)
+from ai_reviewer.patch import diff_lines
+from ai_reviewer.serialization import digest
 
 
 class GitHub:
     """Make bounded GitHub REST requests without automatic write retries.
 
     Attributes:
+        requests_remaining: Per-client cap on requests, including pagination and redirects.
         client: Authenticated HTTP client with a 60-second timeout and redirects
             disabled. Callers must supply GitHub-relative paths to its methods.
     """
@@ -35,6 +46,7 @@ class GitHub:
         Args:
             token: GitHub credential for the operations this job performs.
         """
+        self.requests_remaining = MAX_GITHUB_REQUESTS
         # Keep credentials on the configured host when callers use relative paths.
         self.client = httpx.Client(
             base_url="https://api.github.com",
@@ -61,10 +73,13 @@ class GitHub:
             RuntimeError: GitHub fails, redirects a write, exceeds five redirects,
                 or redirects outside its HTTPS API host. Messages omit response bodies.
             httpx.HTTPError: A transport or timeout failure prevents completion.
-            ValueError: A nonempty response cannot be decoded as JSON.
+            ValueError: Request budget is exhausted or a nonempty response is invalid JSON.
         """
         # Follow moved read resources without forwarding credentials outside GitHub.
         for redirect in range(6):
+            if self.requests_remaining <= 0:
+                raise ValueError("GitHub collection request budget exceeded")
+            self.requests_remaining -= 1
             response = self.client.request(method, path, **kwargs)
             if not response.is_redirect:
                 break
@@ -131,45 +146,6 @@ def pr_path(repo: str, number: int) -> str:
     return f"/repos/{repo}/pulls/{number}"
 
 
-def diff_lines(patch: str) -> set[tuple[str, int]]:
-    """Extract inline coordinates from GitHub unified-diff hunks.
-
-    Args:
-        patch: Unified patch text; content outside recognized hunks is ignored.
-
-    Returns:
-        Pairs of side and one-based line number. Context lines occur on both
-        sides, deletions on LEFT and additions on RIGHT. No hunks means no anchors.
-        This parser extracts coordinates; it does not validate patch completeness.
-    """
-    # Track old and new line counters independently across each hunk.
-    anchors: set[tuple[str, int]] = set()
-    left = right = 0
-    in_hunk = False
-    # Reset counters at hunk headers and advance the side consumed by each line.
-    for line in patch.split("\n"):
-        match = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-        # Headers establish coordinates; file headers and metadata add no anchors.
-        if match:
-            left, right = map(int, match.groups())
-            in_hunk = True
-        # Added lines exist only in the new file.
-        elif in_hunk and line.startswith("+"):
-            anchors.add(("RIGHT", right))
-            right += 1
-        # Deleted lines exist only in the old file.
-        elif in_hunk and line.startswith("-"):
-            anchors.add(("LEFT", left))
-            left += 1
-        # Unchanged context advances both files at once.
-        elif in_hunk and line.startswith(" "):
-            anchors.update({("LEFT", left), ("RIGHT", right)})
-            left += 1
-            right += 1
-    # Collapse repeated coordinates across overlapping hunks.
-    return anchors
-
-
 def read_version(
     gh: GitHub, repo: str, tree: str, filename: str, cache: dict[str, Any]
 ) -> tuple[str, str]:
@@ -210,12 +186,15 @@ def read_version(
         # Bound and classify the object before requesting its bytes.
         if entry["type"] != "blob" or entry["mode"] not in ("100644", "100755", "120000"):
             raise ValueError("Unsupported Git object")
-        if entry["size"] > 150_000:
+        if entry["size"] > MAX_BLOB_BYTES:
             raise ValueError("Changed file exceeds context limit")
         blob = gh.request("GET", f"/repos/{repo}/git/blobs/{entry['sha']}")
-        if blob.get("encoding") != "base64" or blob["size"] > 150_000:
+        if blob.get("encoding") != "base64" or blob["size"] > MAX_BLOB_BYTES:
             raise ValueError("Unavailable or oversized Git blob")
-        text = base64.b64decode(blob["content"]).decode("utf-8")
+        raw = base64.b64decode(blob["content"])
+        if len(raw) > MAX_BLOB_BYTES:
+            raise ValueError("Decoded blob exceeds collection budget")
+        text = raw.decode("utf-8")
         if "\0" in text:
             raise ValueError("Binary file; automatic approval prohibited")
         return text, entry["mode"]
@@ -270,26 +249,11 @@ def rebuild_patch(before: str, after: str) -> str:
         return result.stdout.decode("utf-8")
 
 
-def validate_anchors(context: ReviewContext, reviews: list[Review]) -> None:
-    """Reject invalid model locations before purchasing consolidation.
-
-    Args:
-        context: Immutable changed-file packet supplied to both reviewers.
-        reviews: Independent reports with locations to validate.
-
-    Raises:
-        ValueError: A finding is outside the captured diff. Reports remain on disk
-            for diagnosis; this fails the run rather than silently dropping findings.
-    """
-    anchors = {file.filename: diff_lines(file.patch) for file in context.files}
-    for review in reviews:
-        for finding in review.findings:
-            if (finding.side, finding.line) not in anchors.get(finding.path, set()):
-                raise ValueError("Finding is outside the captured diff")
-
-
 def publish(
-    gh: GitHub, context: ReviewContext, reviews: list[Review], result: Consolidation
+    gh: GitHub,
+    context: ReviewContext,
+    covered: CoveredReviews,
+    result: Consolidation,
 ) -> bool:
     """Submit a consolidated review after checking evidence and current PR state.
 
@@ -300,17 +264,21 @@ def publish(
     Args:
         gh: Client authenticated as the reviewer recorded in context.
         context: Packet from prepare, including repository, PR and revision IDs.
-        reviews: Exactly two complete reports, ordered Claude then OpenAI.
+        covered: Reports and coverage summary from the canonical artifact loader.
         result: Consolidated summary and an exact partition of source findings.
 
     Returns:
         False if this revision was already published; True after a new submission.
 
     Raises:
-        ValueError: Results, identity, diff anchors or current PR state are invalid.
+        ValueError: Results, identity, diff anchors or current PR state are invalid,
+            or the assembled review exceeds comment-count/body/payload bounds.
         RuntimeError: GitHub rejects a request; transport errors also propagate.
     """
-    # Validate both reports and ensure the publishing credential owns the request.
+    # Coverage was replayed once by the canonical loader; bind it to this snapshot.
+    if covered.snapshot != digest(context.model_dump_json()):
+        raise ValueError("Publication snapshot differs from covered work")
+    reviews = covered.reviews
     groups = reconcile(reviews, result)
     repo, number = context.repo, context.number
     path = pr_path(repo, number)
@@ -346,16 +314,25 @@ def publish(
             body = ""
             for fragment in fragments:
                 combined = body + "\n\n---\n\n" + fragment if body else fragment
-                if len(combined.encode()) > 60_000:
+                if len(combined.encode()) > GITHUB_BODY_BYTES:
                     comments.append({"path": filename, "side": side, "line": line, "body": body})
                     body = fragment
                 else:
                     body = combined
             comments.append({"path": filename, "side": side, "line": line, "body": body})
-    # Attach both independent summaries beneath the consolidated overview.
+    # Attach the validated completion summary beneath the consolidated overview.
     body = f"{marker}\n## AI review\n\n{result.summary}\n\n"
-    for name, review in zip(["Claude Opus 5.5", "GPT-6.1 Sol"], reviews, strict=True):
-        body += f"<details><summary>{name}</summary>\n\n{review.summary}\n\n</details>\n"
+    for assessment in covered.independent_summaries:
+        label = {"claude": "Claude Opus", "openai": "OpenAI"}[assessment.provider]
+        body += f"<details><summary>{label}</summary>\n\n{assessment.summary}\n\n</details>\n"
+    body += covered.summary
+    # Reject oversized publication atomically; never publish a partial approval.
+    if (
+        len(body.encode()) > GITHUB_BODY_BYTES
+        or len(comments) > MAX_GITHUB_COMMENTS
+        or len(json.dumps(comments, ensure_ascii=False).encode()) > MAX_GITHUB_PAYLOAD_BYTES
+    ):
+        raise ValueError("Publication exceeds bounded payload; manual review required")
     # Derive the verdict from original findings, never from Sonnet's prose.
     blocking = any(f.blocking for review in reviews for f in review.findings)
     # Recheck immediately before the one write. GitHub has no conditional-review API.
