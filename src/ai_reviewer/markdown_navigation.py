@@ -54,7 +54,7 @@ def section_index(filename: str, text: str) -> dict[str, Any]:
         if skip_block:
             skip_block = bool(line.strip())
             continue
-        if line.lstrip().startswith("<!--"):
+        if re.match(r" {0,3}<!--", line):
             comment = "-->" not in line
             paragraph = []
             continue

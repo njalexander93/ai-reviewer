@@ -126,3 +126,12 @@ def test_short_setext_and_fence_interrupting_list(underline: str) -> None:
         {"name": "Title", "level": 1 if underline.startswith("=") else 2, "start": 1, "end": 7},
         {"name": "Real", "level": 1, "start": 8, "end": 8},
     ]
+
+
+@pytest.mark.parametrize("indent", ["    ", "\t"])
+def test_indented_comment_example_does_not_hide_following_heading(indent: str) -> None:
+    """An unterminated comment in indented code must not enter HTML comment mode."""
+    source = indent + "<!-- begin template\n\n# Real heading\n"
+    assert section_index("guide.md", source)["entries"] == [
+        {"name": "Real heading", "level": 1, "start": 3, "end": 3},
+    ]
