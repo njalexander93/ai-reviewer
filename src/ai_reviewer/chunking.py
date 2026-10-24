@@ -2,10 +2,13 @@
 
 Units own contiguous original patch records exactly once. Source excerpts retain
 Git line coordinates; additional source can only come from the same snapshot.
+Shared metadata locates Python declarations for source requests across all packets.
 No reviewed code is imported or executed. Coverage establishes work, not judgment.
 """
 
 import ast
+import io
+import tokenize
 from bisect import bisect_right
 from collections import defaultdict, deque
 from pathlib import PurePosixPath
@@ -20,6 +23,7 @@ from ai_reviewer.limits import (
     MAX_CHUNKS,
     MAX_RELATIONS,
     MAX_SNAPSHOT_BYTES,
+    NAVIGATION_BYTES,
     PACKET_BYTES,
     UNIT_BYTES,
 )
@@ -107,7 +111,7 @@ class PacketMetadata(Contract):
     """Cache inventory and indexed discussion for one immutable snapshot.
 
     Attributes:
-        overview: Revision/requirement metadata and complete changed-file inventory.
+        overview: Revision/requirement metadata, file inventory and side-specific declarations.
         comments: Original-order discussion dictionaries, shared read-only by builders.
         comments_by_path: Current/old discussion path to indices in comments.
         global_comments: Indices whose path is not a current changed path; included everywhere.
@@ -282,7 +286,9 @@ def packet_metadata(context: ReviewContext) -> PacketMetadata:
 
     Discussion retains original order. Comments outside current changed paths are
     global, including comments attached to old rename paths. Overview creation scans
-    captured blobs once for line counts; no repository or provider reads occur.
+    captured blobs once for line counts and declaration navigation. No repository or
+    provider reads occur. Navigation remains complete here; plan projects a bounded
+    copy only after compiling units from these captured declarations.
     """
     # Index discussion once; non-current paths become mandatory global context.
     changed = {f.filename for f in context.files}
@@ -306,7 +312,8 @@ def overview(context: ReviewContext) -> dict[str, Any]:
 
     Files and prior discussion are excluded from the copied metadata. Inventory line
     counts use only LF boundaries and count a final unterminated line. Context remains
-    unchanged; actual blob text is supplied separately in unit evidence.
+    unchanged; actual blob text is supplied separately in unit evidence. Declaration
+    locations use current paths for both sides, even when the old path selected the parser.
     """
     # Keep revisions and requirements intact while replacing blobs with line counts.
     data = context.model_dump(exclude={"files", "previous_comments"})
@@ -315,6 +322,7 @@ def overview(context: ReviewContext) -> dict[str, Any]:
             "filename": f.filename,
             "previous_filename": f.previous_filename,
             "status": f.status,
+            "declarations": file_declarations(f),
             "before_lines": f.before.count("\n")
             + int(bool(f.before) and not f.before.endswith("\n")),
             "after_lines": f.after.count("\n") + int(bool(f.after) and not f.after.endswith("\n")),
@@ -324,38 +332,134 @@ def overview(context: ReviewContext) -> dict[str, Any]:
     return data
 
 
-def declarations(filename: str, text: str) -> list[tuple[int, int]]:
-    """Return sorted one-based inclusive Python declaration ranges without imports.
+def omit_navigation(data: dict[str, Any]) -> dict[str, Any]:
+    """Return an overview without advisory declaration fields, leaving data unchanged.
+
+    Required inventory fields and all other overview metadata survive. The explicit
+    truncated status reserves its full byte cost even before navigation is selected.
+    """
+    return {
+        **data,
+        "inventory": [
+            {key: value for key, value in item.items() if key != "declarations"}
+            for item in data["inventory"]
+        ],
+        "declaration_navigation": "truncated",
+    }
+
+
+def bound_navigation(data: dict[str, Any], byte_limit: int) -> dict[str, Any]:
+    """Project complete captured declarations into a bounded overview without mutation.
+
+    data must contain the complete discovery result, never a previously truncated
+    projection. byte_limit caps added UTF-8 bytes across all declaration fields,
+    including field overhead. Required metadata survives unchanged. A truncated
+    status means missing entries are unavailable, not proof of no declarations.
+    """
+    result = omit_navigation(data)
+    remaining = max(0, byte_limit)
+    truncated = False
+    for source, item in zip(data["inventory"], result["inventory"], strict=True):
+        navigation = source["declarations"]
+        # Admit side statuses first, then as many source-ordered entries as fit.
+        selected = {
+            side: {"status": index["status"], "entries": []} for side, index in navigation.items()
+        }
+        cost = len(encode({"declarations": selected}).encode()) - 1
+        if cost > remaining:
+            truncated = True
+            continue
+        remaining -= cost
+        item["declarations"] = selected
+        for side, index in navigation.items():
+            for entry in index["entries"]:
+                cost = len(encode(entry).encode()) + bool(selected[side]["entries"])
+                if cost > remaining:
+                    truncated = True
+                    break
+                selected[side]["entries"].append(entry)
+                remaining -= cost
+    result["declaration_navigation"] = "truncated" if truncated else "complete"
+    return result
+
+
+def file_declarations(file: ChangedFile) -> dict[str, Any]:
+    """Discover both captured versions using each version's original parser path.
+
+    Returns complete LEFT/RIGHT indexes without executing source or mutating file.
+    Call once per file, then share the result with splitting and navigation projection.
+    """
+    return {
+        "LEFT": declaration_index(file.previous_filename or file.filename, file.before),
+        "RIGHT": declaration_index(file.filename, file.after),
+    }
+
+
+def declaration_index(filename: str, text: str) -> dict[str, Any]:
+    """Locate Python classes/functions without executing captured text.
 
     Args:
-        filename: Path used only to select the .py parser.
-        text: Captured source to parse, never execute.
+        filename: Version's path, used only to select the Python parser.
+        text: Captured blob; never imported or evaluated.
 
     Returns:
-        Function, async-function and class ranges, including nested declarations.
-        Unsupported paths or syntax/parser failures return no boundaries, allowing
-        the caller to fall back to diff and physical-line splitting.
+        Status and source-ordered entries with qualified names and one-based inclusive
+        LF ranges, including decorators. Empty valid Python is indexed with no entries.
+        Unsupported syntax/languages or bare-CR coordinates have explicit statuses and
+        no entries; callers retain physical-line source requests as their fallback.
     """
-    # Unsupported or unparsable source uses the caller's non-syntax splitting fallback.
+    # Never guess syntax or coordinates that the parser cannot represent faithfully.
     if not filename.endswith(".py"):
-        return []
+        return {"status": "unsupported_language", "entries": []}
+    if "\r" in text.replace("\r\n", "\n"):
+        return {"status": "unsupported_line_endings", "entries": []}
     try:
         tree = ast.parse(text)
     except SyntaxError, ValueError, RecursionError:
-        return []
-    # Include nested declarations without importing or executing the source.
-    return sorted(
-        (node.lineno, node.end_lineno or node.lineno)
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    )
+        return {"status": "parse_error", "entries": []}
+    # AST expression positions omit a parenthesized decorator's opening @ token.
+    decorators = []
+    statement_start = True
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if token.type in (tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT):
+            statement_start = True
+        elif token.type not in (tokenize.NL, tokenize.COMMENT):
+            if statement_start and token.string == "@":
+                decorators.append(token.start[0])
+            statement_start = False
+    # Iterative traversal retains lexical owners without a second recursion limit.
+    entries = []
+    pending: list[tuple[ast.AST, str]] = [(tree, "")]
+    while pending:
+        node, owner = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            owner = f"{owner}.{node.name}" if owner else node.name
+            entries.append(
+                {
+                    "name": owner,
+                    "start": (
+                        decorators[bisect_right(decorators, node.decorator_list[0].lineno) - 1]
+                        if node.decorator_list
+                        else node.lineno
+                    ),
+                    "end": node.end_lineno or node.lineno,
+                }
+            )
+        pending.extend((child, owner) for child in ast.iter_child_nodes(node))
+    return {"status": "indexed", "entries": sorted(entries, key=lambda entry: entry["start"])}
 
 
-def units(file: ChangedFile, unit_bytes: int = UNIT_BYTES) -> list[Unit]:
+def units(
+    file: ChangedFile,
+    declarations: dict[str, Any],
+    unit_bytes: int = UNIT_BYTES,
+) -> list[Unit]:
     """Split one captured file into bounded units with exact patch-record ownership.
 
     Args:
         file: Complete captured patch and before/after blobs, already validated.
+        declarations: Complete LEFT/RIGHT indexes from file_declarations for this file.
+            This required cache is read without reparsing source.
         unit_bytes: Maximum UTF-8 bytes for each unit's model_dump_json serialization.
             Defaults to UNIT_BYTES; enclosing packet overhead is budgeted separately.
 
@@ -371,8 +475,8 @@ def units(file: ChangedFile, unit_bytes: int = UNIT_BYTES) -> list[Unit]:
     records = lines(file.patch)
     old, new = lines(file.before), lines(file.after)
     old_defs, new_defs = (
-        declarations(file.filename, file.before),
-        declarations(file.filename, file.after),
+        [(d["start"], d["end"]) for d in declarations[side]["entries"]]
+        for side in ("LEFT", "RIGHT")
     )
     cursors: list[tuple[int, int]] = []
     boundaries = []
@@ -642,27 +746,47 @@ def plan(context: ReviewContext, *, packet_bytes: int = PACKET_BYTES) -> Plan:
     if len({f.filename for f in context.files}) != len(context.files):
         raise ValueError("Duplicate changed-file path")
     # Keep the whole-context serialization unchanged when the default ceiling permits it.
-    metadata = packet_metadata(context)
+    captured = packet_metadata(context)
     if packet_bytes == PACKET_BYTES and len(serialized.encode()) <= packet_bytes:
         return Plan(
             snapshot=digest(serialized),
             whole=serialized,
             packet_bytes=packet_bytes,
             chunks=[],
-            metadata=metadata,
+            metadata=captured.model_copy(
+                update={"overview": bound_navigation(captured.overview, NAVIGATION_BYTES)}
+            ),
             relations=[],
         )
     # Reserve space for two source endpoints, their reports and reference evidence.
     unit_bytes = min(UNIT_BYTES, packet_bytes // 4) if packet_bytes < PACKET_BYTES else UNIT_BYTES
+    discovery = {item["filename"]: item["declarations"] for item in captured.overview["inventory"]}
     pending = [
-        u for f in sorted(context.files, key=lambda f: f.filename) for u in units(f, unit_bytes)
+        u
+        for f in sorted(context.files, key=lambda f: f.filename)
+        for u in units(f, discovery[f.filename], unit_bytes)
     ]
     links = direct_relations(context)
     chunks: list[Chunk] = []
-    sizer = PacketSizer(metadata, pending)
     target_bytes = (
         min(CHUNK_BYTES, packet_bytes // 2) if packet_bytes < PACKET_BYTES else CHUNK_BYTES
     )
+    # Measure required evidence first, reserving the longer truncated-status spelling.
+    required_metadata = captured.model_copy(update={"overview": omit_navigation(captured.overview)})
+    required_sizer = PacketSizer(required_metadata, pending)
+    required = required_sizer.budget("chunk-0000")
+    headroom = min(
+        (
+            target_bytes - required.size - required.growth(required_sizer.additions([unit]))
+            for unit in pending
+        ),
+        default=0,
+    )
+    # Project complete discovery once; both sizers retain unchanged metadata objects.
+    metadata = captured.model_copy(
+        update={"overview": bound_navigation(captured.overview, min(NAVIGATION_BYTES, headroom))}
+    )
+    sizer = PacketSizer(metadata, pending)
     # Start with the stable first unit, then prefer visible related evidence.
     while pending:
         chunk = Chunk(id=f"chunk-{len(chunks):04d}", units=[pending.pop(0)])

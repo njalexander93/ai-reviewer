@@ -210,6 +210,31 @@ replace the old 80-file and 150 KB per-version rejection.
    findings remain separate. Bounded summary passes carry original assessments
    and disagreements into one overview. Publication submits **one GitHub review**.
 
+Chunked local and integration packets include a declaration index in
+`overview.inventory[].declarations`. Python classes, functions and async functions
+have qualified names and one-based inclusive LEFT/RIGHT ranges, including decorators.
+Use the inventory's current filename for either side of a renamed file. The index
+is compiled once per plan; unit splitting and packet navigation share that discovery.
+Navigation fields are capped at 16,000 UTF-8 bytes across the inventory and trimmed
+further when needed to fit a required source unit. Oversized integration and follow-up
+packets omit navigation before paging reports or rejecting required evidence.
+`declaration_navigation: truncated` means entries or entire file indexes were omitted; absence is not evidence that a
+function does not exist. Unit splitting consumes complete discovery before navigation
+is projected. Projections return new metadata; packet sizers retain unchanged inputs.
+Discovery never executes source and does not replace reading it. Unsupported languages, malformed Python and
+bare-CR line endings have explicit unavailable statuses; ordinary source requests
+still work. Whole-context payload bytes remain unchanged. Index bytes count toward
+existing packet limits; required source and review metadata still fail closed if oversized.
+
+Follow-up exhaustion records `FollowupExhausted` in worker logs and
+`work/<assignment>/<provider>/failure.json`, with validated attempt count, completed
+follow-up rounds and bounded outstanding coordinates. Reasons, summaries, source and
+provider error bodies are excluded. Unknown paths are redacted. The manifest retains
+the exhausted attempt count and failed status. For other failures, zero attempts
+still means unknown; per-attempt artifacts remain the evidence of provider activity.
+Incomplete work cannot proceed to approval. Offline navigation tests do not guarantee
+that a model will finish within the three-attempt budget.
+
 Provider token counts are checked before generation, including instructions and
 output schemas. Each call allows at most **250,000 input tokens** and **16,000
 output/reasoning tokens**. This conservative policy leaves headroom below the
