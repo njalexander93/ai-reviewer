@@ -14,6 +14,9 @@ import openai
 from ai_reviewer.chunking import PACKET_BYTES
 from ai_reviewer.contracts import ChunkReview, Consolidation, Contract, Review
 from ai_reviewer.diagnostics import report_failure
+from ai_reviewer.limits import MAX_INPUT_TOKENS, MODEL_REPORT_BYTES, PROVIDER_TIMEOUT_SECONDS
+
+AssignmentKind = Literal["whole", "local", "integration"]
 
 Role = Literal["claude", "openai", "consolidate"]
 MODELS: dict[Role, str] = {
@@ -81,7 +84,12 @@ class CapacityError(ValueError):
 
 
 def call_model(
-    role: Role, payload: str, directory: Path, *, chunked: bool = False, preflight: bool = False
+    role: Role,
+    payload: str,
+    directory: Path,
+    *,
+    kind: AssignmentKind = "whole",
+    preflight: bool = False,
 ) -> None:
     """Write validated output and usage artifacts, including usage on invalid completions.
 
@@ -89,7 +97,7 @@ def call_model(
         role: Independent reviewer or consolidator.
         payload: Immutable context or completed review pair.
         directory: Output directory unique to this provider attempt.
-        chunked: Enable bounded source requests for all planned review work.
+        kind: Explicit whole, local or integration scope supplied by the planner.
         preflight: Count input only; never generate or write usage artifacts.
 
     Raises:
@@ -105,21 +113,30 @@ def call_model(
         usage_path.unlink(missing_ok=True)
         (directory / f"{role}.error.json").unlink(missing_ok=True)
         # Default to independent review; consolidation receives a narrower contract.
-        schema: type[Review] | type[Consolidation] = ChunkReview if chunked else Review
+        schema: type[Review] | type[Consolidation] = ChunkReview
         instructions = (
             SAFETY + Path(__file__).with_name("prompts").joinpath("review.md").read_text()
         )
-        if chunked:
-            instructions += """
-The packet is one bounded assignment within a larger PR. Review every owned section.
-Source excerpts carry absolute line starts; patch fragments carry old/new cursors.
-For integration assignments assess compatibility using actual supplied source, not summaries alone.
+        framing = {
+            "whole": "The packet contains the complete captured PR. Review every changed file.",
+            "local": "The packet is one bounded local assignment within a larger PR. "
+            "Review every owned section. "
+            "Source excerpts carry absolute line starts; patch fragments carry old/new cursors.",
+            "integration": "Assess PR-wide compatibility using the actual supplied source "
+            "and reports. "
+            "Source excerpts carry absolute line starts; patch fragments carry old/new cursors.",
+        }
+        instructions += (
+            "\n"
+            + framing[kind]
+            + """
 Request missing evidence using requests (path, LEFT/RIGHT, inclusive start/end, reason).
 Requests can only read changed files from the captured snapshot. No tools execute code.
 If context is required, set complete=false and request it. Never infer unseen compatibility.
 At most two follow-up rounds are available. If unresolved, remain incomplete.
 Previous findings are retained automatically; report only newly discovered findings.
 """
+        )
         # Sonnet may group source IDs but cannot author replacement findings.
         if role == "consolidate":
             schema = Consolidation
@@ -134,7 +151,7 @@ Preserve disagreements explicitly in the summary. Do not mention pricing.
         parsed: Contract | None
         # Disable hidden SDK retries: cost and publication failure must remain observable.
         if role == "openai":
-            client = openai.OpenAI(max_retries=0, timeout=300)
+            client = openai.OpenAI(max_retries=0, timeout=PROVIDER_TIMEOUT_SECONDS)
             # Count with the provider tokenizer; never infer token fit from byte size.
             count = client.responses.input_tokens.count(
                 model=MODELS[role],
@@ -184,7 +201,7 @@ Preserve disagreements explicitly in the summary. Do not mention pricing.
                 raise ValueError("OpenAI review incomplete")
         else:
             # Both Claude roles use adaptive thinking and the role-specific schema.
-            claude = anthropic.Anthropic(max_retries=0, timeout=300)
+            claude = anthropic.Anthropic(max_retries=0, timeout=PROVIDER_TIMEOUT_SECONDS)
             count = claude.messages.count_tokens(
                 model=MODELS[role],
                 system=instructions,
@@ -223,7 +240,7 @@ Preserve disagreements explicitly in the summary. Do not mention pricing.
                 raise ValueError("Claude response incomplete")
         # Publish the validated report only after the provider completion checks pass.
         serialized = parsed.model_dump_json()
-        if len(serialized.encode()) > 60_000:
+        if len(serialized.encode()) > MODEL_REPORT_BYTES:
             raise ValueError("Model report exceeds bounded output budget")
         (directory / f"{role}.json").write_text(serialized)
     except Exception as error:
@@ -281,5 +298,5 @@ def check_capacity(payload: str, input_tokens: int) -> None:
     and Sol's 272k long-context pricing threshold. Output/reasoning is capped at
     16k separately. This is a conservative work policy, not a byte/token formula.
     """
-    if len(payload.encode()) > PACKET_BYTES or not 0 <= input_tokens <= 250_000:
+    if len(payload.encode()) > PACKET_BYTES or not 0 <= input_tokens <= MAX_INPUT_TOKENS:
         raise CapacityError("Provider input capacity budget exceeded")

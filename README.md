@@ -161,10 +161,11 @@ replace the old 80-file and 150 KB per-version rejection.
    lines. Other languages use diff boundaries. Retain original patch records,
    old/new cursors, source offsets, modes, renames and final-newline state.
 3. Compile the inventory and discussion index once per plan. Scan each captured
-   version with a shared literal-reference index, and join normalized source/test
-   names. Reuse this relationship evidence during packing and integration.
+   version with a shared reference index using complete path/module tokens. Join
+   normalized names only between test and non-test files. Reuse this relationship evidence during packing and integration.
    Pack direct references, source/test pairs and directory peers together using
-   stable ordering. A unit is capped at 160,000 bytes so two actual source units
+   stable ordering. Fit checks count precomputed item bytes incrementally; full
+   packets are serialized only after their scopes are chosen. A unit is capped at 160,000 bytes so two actual source units
    can accompany reports during integration. Local packets target 420,000 bytes,
    leaving 180,000 bytes for required follow-ups under the 600,000-byte ceiling.
    Indivisible oversized lines or required metadata fail explicitly; nothing is
@@ -185,7 +186,9 @@ replace the old 80-file and 150 KB per-version rejection.
 6. Recompute the plan and validate the coverage manifest once before consolidation
    and once before publication. The manifest stores assignment and plan hashes;
    full payloads stay in attempt artifacts. Reports are keyed by assignment and
-   provider. Require both providers for all assignments and all follow-ups.
+   provider. Compile immutable diff anchors once per stage and reuse them across
+   workers and replay. Whole, local and integration assignments receive explicit
+   scope instructions with the same source-request contract. Require both providers for all assignments and all follow-ups.
    Coverage proves assignment/completion; it does not prove model understanding.
 7. Sonnet groups up to 40 original findings per batch with global source IDs.
    All findings, locations and severity survive exactly once. Cross-batch duplicate
@@ -221,7 +224,8 @@ Operational defaults are deliberate finite safeguards, not performance optima:
 | Job | 2 workers; 180 minutes; no automatic API retries | Bound concurrency and execution time |
 
 Limits live in `chunking.py`, `work.py`, `models.py` and the workflow. Increasing
-one requires reviewing downstream bounds. The work limits are **not a dollar
+one requires reviewing downstream bounds. Numeric policies live in
+`src/ai_reviewer/limits.py`; equal values with different purposes remain separate. The work limits are **not a dollar
 budget**. Large PRs can cost substantially more through repeated overview/source,
 follow-ups and integration. There is no promise that an accepted snapshot will
 finish: required evidence, output or total work may exceed a later bound, which

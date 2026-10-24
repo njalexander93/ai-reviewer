@@ -43,7 +43,7 @@ def large_context() -> ReviewContext:
 
 
 def fake_model(
-    role: str, payload: str, directory: Path, *, chunked: bool = False, preflight: bool = False
+    role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
 ) -> None:
     """Return complete source-preserving responses without paid calls or GitHub writes."""
     if preflight:
@@ -167,10 +167,17 @@ def test_cross_chunk_source_requests_are_resolved_or_fail_closed(
     monkeypatch.setattr(work, "call_model", model)
     if unresolved:
         with pytest.raises(ValueError, match="exhausted"):
-            work.run_assignment(context, assignment, "claude", tmp_path)
+            work.run_assignment(
+                context, assignment, "claude", tmp_path, work.compile_anchors(context)
+            )
         assert len(seen) == 3
     else:
-        assert work.run_assignment(context, assignment, "claude", tmp_path) == 2
+        assert (
+            work.run_assignment(
+                context, assignment, "claude", tmp_path, work.compile_anchors(context)
+            )
+            == 2
+        )
         assert seen[1]["prior_attempts"][0]["requests"]
 
 
@@ -183,7 +190,7 @@ def test_failed_provider_leaves_manifest_incomplete(
         """Fail OpenAI while allowing all scheduled Claude evidence to finish."""
         if role == "openai":
             raise TimeoutError()
-        fake_model(role, payload, directory, chunked=True)
+        fake_model(role, payload, directory, kind="local")
 
     monkeypatch.setattr(work, "call_model", model)
     with pytest.raises(ValueError, match="failed"):
@@ -411,7 +418,7 @@ def test_token_overflow_replans_before_generation(
     generated = []
 
     def model(
-        role: str, payload: str, directory: Path, *, chunked: bool = False, preflight: bool = False
+        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
     ) -> None:
         """Model the capacity response independently of byte size; record generated inputs."""
         if preflight:
@@ -419,7 +426,7 @@ def test_token_overflow_replans_before_generation(
                 raise work.CapacityError("Provider input capacity budget exceeded")
             return
         generated.append(payload)
-        fake_model(role, payload, directory, chunked=chunked)
+        fake_model(role, payload, directory, kind=kind)
 
     monkeypatch.setattr(work, "call_model", model)
     work.review_chunks(context, tmp_path)
@@ -434,3 +441,69 @@ def test_token_overflow_replans_before_generation(
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="Coverage plan"):
         work.load_reviews(context, tmp_path)
+
+
+def test_stage_compiles_anchors_once_for_all_workers_and_replay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review and loader each compile one index, independent of assignment count."""
+    context = large_context()
+    compile_original = work.compile_anchors
+    compiled = []
+
+    def compile_once(context: ReviewContext) -> work.AnchorIndex:
+        """Count the expensive snapshot boundary, without bypassing its implementation."""
+        anchors = compile_original(context)
+        compiled.append(anchors)
+        return anchors
+
+    monkeypatch.setattr(work, "compile_anchors", compile_once)
+    monkeypatch.setattr(work, "call_model", fake_model)
+    work.review_chunks(context, tmp_path)
+    assert len(compiled) == 1
+    work.load_reviews(context, tmp_path)
+    assert len(compiled) == 2
+    with pytest.raises(TypeError):
+        compiled[0]["invented.py"] = frozenset()
+
+
+def test_integration_budget_matches_finished_packets_without_trial_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fit accounting agrees with actual source/report bytes and serializes only final scopes."""
+    from ai_reviewer.chunking import Chunk, PacketSizer
+    from ai_reviewer.contracts import Review
+
+    context = large_context()
+    context.files[0].after = "tests/test_app.py\n" + context.files[0].after
+    planned = plan(context)
+    reports = {
+        (c.id, role): Review(complete=True, summary='é"\n' + c.id, findings=[])
+        for c in planned.chunks
+        for role in ("claude", "openai")
+    }
+    original_budget, original_payload = PacketSizer.budget, Chunk.payload
+    budgets = {}
+    serialized = []
+
+    def budget(self: PacketSizer, id: str, extra: dict | None = None) -> object:
+        """Retain the counters used for each final packet, without replacing their logic."""
+        result = original_budget(self, id, extra)
+        budgets[id] = result
+        return result
+
+    def payload(self: Chunk, metadata: object) -> str:
+        """Observe full source serialization at the public packet boundary."""
+        serialized.append(self.id)
+        return original_payload(self, metadata)
+
+    monkeypatch.setattr(PacketSizer, "budget", budget)
+    monkeypatch.setattr(Chunk, "payload", payload)
+    assignments = work.integration_assignments(context, planned, reports)
+    edges = [a for a in assignments if a.id.startswith("edge-")]
+    assert edges
+    assert any(json.loads(a.payload)["reference_source"] for a in edges)
+    for assignment in edges:
+        assert budgets[assignment.id].size == len(assignment.payload.encode())
+        assert len(assignment.payload.encode()) <= 600_000
+    assert len(serialized) == len(planned.chunks) + len(edges)

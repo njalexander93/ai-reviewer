@@ -38,7 +38,7 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     payloads: dict[str, dict] = {}
 
     def model(
-        role: str, payload: str, directory: Path, *, chunked: bool = False, preflight: bool = False
+        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
     ) -> None:
         """Write deterministic reports at the paid-provider boundary.
 
@@ -46,7 +46,7 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
             role: Reviewer or consolidator selected by the CLI stage.
             payload: JSON context or review pair, retained for assertions.
             directory: Isolated stage directory receiving the synthetic report.
-            chunked: Source-request schema flag.
+            kind: Assignment scope framing.
             preflight: Count-only phase; no report is generated.
         """
         if preflight:
@@ -123,7 +123,7 @@ def test_parallel_review_waits_for_both_calls(
     (tmp_path / "context.json").write_text(context.model_dump_json())
 
     def model(
-        role: str, payload: str, directory: Path, *, chunked: bool = False, preflight: bool = False
+        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
     ) -> None:
         """Synchronize provider calls and record completion before a selected failure.
 
@@ -131,7 +131,7 @@ def test_parallel_review_waits_for_both_calls(
             role: Provider under test; selects its independent usage artifact.
             payload: Context text shared by both concurrent calls.
             directory: Isolated artifact directory.
-            chunked: Source-request schema flag.
+            kind: Assignment scope framing.
             preflight: Count-only phase; no report is generated.
 
         Raises:

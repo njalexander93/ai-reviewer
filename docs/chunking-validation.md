@@ -3,6 +3,44 @@
 These measurements cover preparation and deterministic planning, not paid model
 judgment. No benchmark review was posted. No repository code was executed.
 
+## Follow-up review: packing and validation cost
+
+Local fit checks now add precomputed unit/comment byte lengths. Cross-chunk fit
+checks add only new units, indexed reference ranges and owner report pairs.
+Actual packets are serialized once their scopes are fixed. Source ranges are
+resolved once per integration stage; anchors are compiled once per review/replay
+stage. One LF patch walker supplies fragment cursors, completeness checks and
+inline locations. All work limits remain explicit failures, not evidence drops.
+
+The reference heuristic now joins actual test/non-test stems and requires complete
+path/module tokens. It no longer joins unrelated same-name source files or matches
+`a` inside `data`. Consequently relationship counts intentionally differ from the
+older measurements below.
+
+Validation: 162 tests pass with 93.68% branch-aware coverage. Ruff lint/format,
+Mypy, lockfile and whitespace checks pass. The static audit read 41 test functions
+across four changed test files with no cannot-fail findings or parser gaps.
+Fresh-context expectation review covered 11 changed functions in three files:
+3 PASS, 8 UNKNOWN, no FLAG. The unknown cases use synthetic provider responses;
+model-family independence is unverified. CLI signature-only edits were not judged.
+These checks do not establish live-provider behavior or model judgment quality.
+
+Single-run offline smoke checks on the development Mac, Python 3.14.8:
+
+| Input | Plan + integration | Local / integration assignments | Result |
+| --- | ---: | ---: | --- |
+| Captured PR #9 | 0.556 s | 11 / 22 | Largest packet 596,001 bytes |
+| Captured PR #18 | 0.357 s | 8 / 15 | Largest packet 574,823 bytes |
+| 3,000 files; 1.2 MB captured source | 0.481 s | 49 / 50 | Largest packet 448,606 bytes |
+| 3,000 files; 24 MB captured source | 1.361 s | — | Explicit 64-chunk limit rejection |
+
+The synthetic files contain identical before/after text, empty patches and no
+references. Reports are synthetic and empty. Checks verify unique unit ownership
+and every completed integration packet's byte ceiling. These timings cover full
+planning and integration construction, excluding collection, providers and replay.
+They are smoke observations, not before/after speedup or worst-case claims. The
+24 MB input demonstrates bounded rejection, not successful review coverage.
+
 ## PR #3 feedback repair
 
 The repair removes the obsolete branch-test workflow and uses one manifest-backed

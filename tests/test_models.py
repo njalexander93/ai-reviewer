@@ -184,7 +184,7 @@ def test_provider_count_blocks_generation_before_capacity_overflow(
     monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
     monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
     with pytest.raises(ValueError, match="capacity"):
-        call_model(role, "tiny", tmp_path, chunked=True)
+        call_model(role, "tiny", tmp_path, kind="local")
     assert generated == []
     assert not (tmp_path / f"{role}.json").exists()
     assert not (tmp_path / f"{role}.usage.json").exists()
@@ -229,7 +229,7 @@ def test_preflight_never_generates_or_records_usage(
     )
     monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
     monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
-    call_model(role, "context", tmp_path, chunked=True, preflight=True)
+    call_model(role, "context", tmp_path, kind="local", preflight=True)
     assert generated == []
     assert list(tmp_path.iterdir()) == []
 
@@ -264,3 +264,46 @@ def test_provider_validation_failure_saves_redacted_diagnostics(
     assert (tmp_path / "claude.usage.json").read_text() == "null"
     assert not (tmp_path / "claude.json").exists()
     assert "secret" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("role", ["claude", "openai"])
+@pytest.mark.parametrize(
+    "kind,framing",
+    [
+        ("whole", "complete captured PR"),
+        ("local", "bounded local assignment"),
+        ("integration", "Assess PR-wide compatibility"),
+    ],
+)
+def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str, kind: str, framing: str
+) -> None:
+    """Both providers receive accurate scope framing and the same request-capable contract."""
+    from ai_reviewer.contracts import ChunkReview
+
+    calls = []
+
+    def count(**kwargs: object) -> SimpleNamespace:
+        """Capture the actual preflight provider request without making a paid call."""
+        calls.append(kwargs)
+        return SimpleNamespace(input_tokens=100)
+
+    client = SimpleNamespace(
+        responses=SimpleNamespace(input_tokens=SimpleNamespace(count=count)),
+        messages=SimpleNamespace(count_tokens=count),
+    )
+    monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
+    monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
+    call_model(role, "unchanged payload", tmp_path, kind=kind, preflight=True)
+    call = calls[0]
+    instructions = call["instructions"] if role == "openai" else call["system"]
+    assert framing in instructions
+    assert "Request missing evidence" in instructions
+    if kind == "whole":
+        assert "within a larger PR" not in instructions
+    schema = (
+        call["text"]["format"]["schema"]
+        if role == "openai"
+        else call["output_format"].model_json_schema()
+    )
+    assert schema == ChunkReview.model_json_schema()

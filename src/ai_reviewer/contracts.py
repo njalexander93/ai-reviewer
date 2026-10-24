@@ -5,11 +5,15 @@ reports and source-ID partition without performing I/O or changing findings.
 Class docstrings also become descriptions in provider-facing JSON schemas.
 """
 
-import re
 from collections import Counter
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from ai_reviewer.limits import MAX_FILES
+from ai_reviewer.patch import diff_lines
 
 
 class Contract(BaseModel):
@@ -189,7 +193,7 @@ class ReviewContext(Contract):
     reviewer: str = Field(min_length=1)
     title: str
     description: str | None
-    files: list[ChangedFile] = Field(max_length=3000)
+    files: list[ChangedFile] = Field(max_length=MAX_FILES)
     previous_comments: list[PriorComment]
     issues: list[IssueContext] = Field(default_factory=list, max_length=40)
 
@@ -261,58 +265,28 @@ class CoveredReviews(Contract):
     summary: str
 
 
-def diff_lines(patch: str) -> set[tuple[str, int]]:
-    """Extract inline coordinates from GitHub unified-diff hunks.
-
-    Args:
-        patch: Unified patch text; content outside recognized hunks is ignored.
-
-    Returns:
-        Pairs of side and one-based line number. Context lines occur on both
-        sides, deletions on LEFT and additions on RIGHT. No hunks means no anchors.
-        This parser extracts coordinates; it does not validate patch completeness.
-    """
-    # Track old and new line counters independently across each hunk.
-    anchors: set[tuple[str, int]] = set()
-    left = right = 0
-    in_hunk = False
-    # Reset counters at hunk headers and advance the side consumed by each line.
-    for line in patch.split("\n"):
-        match = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-        # Headers establish coordinates; file headers and metadata add no anchors.
-        if match:
-            left, right = map(int, match.groups())
-            in_hunk = True
-        # Added lines exist only in the new file.
-        elif in_hunk and line.startswith("+"):
-            anchors.add(("RIGHT", right))
-            right += 1
-        # Deleted lines exist only in the old file.
-        elif in_hunk and line.startswith("-"):
-            anchors.add(("LEFT", left))
-            left += 1
-        # Unchanged context advances both files at once.
-        elif in_hunk and line.startswith(" "):
-            anchors.update({("LEFT", left), ("RIGHT", right)})
-            left += 1
-            right += 1
-    # Collapse repeated coordinates across overlapping hunks.
-    return anchors
+AnchorIndex = Mapping[str, frozenset[tuple[str, int]]]
 
 
-def validate_anchors(context: ReviewContext, reviews: list[Review]) -> None:
+def compile_anchors(context: ReviewContext) -> AnchorIndex:
+    """Build a read-only index once for a snapshot's review or replay stage."""
+    return MappingProxyType(
+        {file.filename: frozenset(diff_lines(file.patch)) for file in context.files}
+    )
+
+
+def validate_anchors(anchors: AnchorIndex, reviews: list[Review]) -> None:
     """Reject invalid model locations before purchasing consolidation.
 
     Args:
-        context: Immutable changed-file packet supplied to both reviewers.
+        anchors: Precompiled immutable snapshot coordinates.
         reviews: Independent reports with locations to validate.
 
     Raises:
         ValueError: A finding is outside the captured diff. Reports remain on disk
             for diagnosis; this fails the run rather than silently dropping findings.
     """
-    anchors = {file.filename: diff_lines(file.patch) for file in context.files}
     for review in reviews:
         for finding in review.findings:
-            if (finding.side, finding.line) not in anchors.get(finding.path, set()):
+            if (finding.side, finding.line) not in anchors.get(finding.path, frozenset()):
                 raise ValueError("Finding is outside the captured diff")

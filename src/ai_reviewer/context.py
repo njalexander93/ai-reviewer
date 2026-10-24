@@ -10,6 +10,7 @@ from ai_reviewer.chunking import MAX_SNAPSHOT_BYTES, plan, validate_patch
 from ai_reviewer.contracts import ChangedFile, PriorComment, ReviewContext
 from ai_reviewer.github import GitHub, pr_path, read_version, rebuild_patch
 from ai_reviewer.issues import github_issues, linear_issues
+from ai_reviewer.limits import MAX_FILES
 
 
 def prepare(
@@ -45,7 +46,7 @@ def prepare(
         raise ValueError("PR is closed, draft, or authored by the reviewer account")
     # Require a complete, bounded file list and resolve the diff's merge base.
     files = gh.pages(f"{path}/files")
-    if len(files) != pr["changed_files"] or len(files) > 3000:
+    if len(files) != pr["changed_files"] or len(files) > MAX_FILES:
         raise ValueError("PR exceeds complete-context file limit")
     comparison = gh.request(
         "GET", f"/repos/{repo}/compare/{pr['base']['sha']}...{pr['head']['sha']}"

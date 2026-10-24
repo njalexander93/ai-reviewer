@@ -8,24 +8,30 @@ No reviewed code is imported or executed. Coverage establishes work, not judgmen
 import ast
 import hashlib
 import json
-import re
 from bisect import bisect_right
 from collections import defaultdict, deque
-from itertools import combinations
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
 from pydantic import Field
 
 from ai_reviewer.contracts import ChangedFile, Contract, ReviewContext, SourceRequest
-
-PACKET_BYTES = 600_000
-UNIT_BYTES = 160_000
-CHUNK_BYTES = 420_000
-MAX_CHUNKS = 64
-MAX_SNAPSHOT_BYTES = 32_000_000
-MAX_BLOB_BYTES = 8_000_000
-MAX_WORK = 128
+from ai_reviewer.limits import (
+    CAPACITY_CHUNK_BYTES,
+    CHUNK_BYTES,
+    MAX_CHUNKS,
+    MAX_RELATIONS,
+    MAX_SNAPSHOT_BYTES,
+    PACKET_BYTES,
+    UNIT_BYTES,
+)
+from ai_reviewer.limits import (
+    MAX_BLOB_BYTES as MAX_BLOB_BYTES,
+)
+from ai_reviewer.limits import (
+    MAX_WORK as MAX_WORK,
+)
+from ai_reviewer.patch import lines, walk_patch
 
 
 def encode(value: Any) -> str:
@@ -36,14 +42,6 @@ def encode(value: Any) -> str:
 def digest(text: str) -> str:
     """Bind persisted work to the exact UTF-8 payload."""
     return hashlib.sha256(text.encode()).hexdigest()
-
-
-def lines(text: str) -> list[str]:
-    """Split only at Git's LF boundaries, retaining termination and Unicode."""
-    # Python splitlines recognizes Unicode separators too; Git does not.
-    return [part + "\n" for part in text.split("\n")[:-1]] + (
-        [text.rsplit("\n", 1)[-1]] if text and not text.endswith("\n") else []
-    )
 
 
 class Unit(Contract):
@@ -96,6 +94,73 @@ class PacketMetadata(Contract):
     comments: list[dict[str, Any]]
     comments_by_path: dict[str | None, list[int]]
     global_comments: list[int]
+
+
+class ArrayBudget:
+    """Count exact JSON array growth without serializing previously accepted evidence."""
+
+    def __init__(self, size: int, sizes: dict[str, dict[str, int]]) -> None:
+        """Start with fixed overhead and shared precomputed item lengths."""
+        self.size = size
+        self.sizes = sizes
+        self.selected: dict[str, set[str]] = {name: set() for name in sizes}
+
+    def growth(self, additions: dict[str, set[str]]) -> int:
+        """Include each item once and account for commas in each nonempty array."""
+        total = 0
+        for name, keys in additions.items():
+            fresh = keys - self.selected[name]
+            total += sum(self.sizes[name][key] for key in fresh)
+            total += len(fresh) if self.selected[name] else max(0, len(fresh) - 1)
+        return total
+
+    def include(self, additions: dict[str, set[str]]) -> None:
+        """Commit an accepted candidate after its byte-budget check."""
+        self.size += self.growth(additions)
+        for name, keys in additions.items():
+            self.selected[name].update(keys)
+
+
+class PacketSizer:
+    """Precompute serialized unit/comment sizes and shared packet overhead once."""
+
+    def __init__(self, metadata: PacketMetadata, units: list[Unit]) -> None:
+        """Compile byte lengths without retaining another copy of source payloads."""
+        self.metadata = metadata
+        self.sizes = {
+            "units": {u.id: len(encode(u.model_dump()).encode()) for u in units},
+            "previous_comments": {
+                str(i): len(encode(comment).encode()) for i, comment in enumerate(metadata.comments)
+            },
+        }
+        self.base = len(
+            encode(
+                {
+                    "overview": metadata.overview,
+                    "scope": {"id": "", "units": []},
+                    "previous_comments": [],
+                }
+            ).encode()
+        )
+
+    def budget(self, id: str, extra: dict[str, Any] | None = None) -> ArrayBudget:
+        """Start an empty packet, including optional integration fields."""
+        size = self.base + len(encode(id).encode()) - 2
+        if extra:
+            size += len(encode(extra).encode()) - 1
+        budget = ArrayBudget(size, self.sizes)
+        budget.include({"previous_comments": {str(i) for i in self.metadata.global_comments}})
+        return budget
+
+    def additions(self, scope: list[Unit]) -> dict[str, set[str]]:
+        """Return only candidate units and their indexed discussion memberships."""
+        paths = {u.filename for u in scope} | {u.previous_filename for u in scope}
+        return {
+            "units": {u.id for u in scope},
+            "previous_comments": {
+                str(i) for path in paths for i in self.metadata.comments_by_path.get(path, [])
+            },
+        }
 
 
 class Relation(Contract):
@@ -182,26 +247,15 @@ def units(file: ChangedFile) -> list[Unit]:
         declarations(file.filename, file.after),
     )
     cursors: list[tuple[int, int]] = []
-    left = right = 1
     boundaries = []
     ends: list[tuple[int, int]] = []
     definition_starts = {start for start, _ in new_defs}
-    in_hunk = False
-    # Capture cursor coordinates before every record, including split hunks.
-    for index, record in enumerate(records):
-        match = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", record)
-        if match:
-            left, right = map(int, match.groups())
+    for index, record in enumerate(walk_patch(file.patch)):
+        if record.counts is not None or record.right in definition_starts:
             boundaries.append(index)
-            in_hunk = True
-        if right in definition_starts:
-            boundaries.append(index)
-        cursors.append((left, right))
-        if in_hunk and not match:
-            left += int(record.startswith((" ", "-")))
-            right += int(record.startswith((" ", "+")))
-        ends.append((left, right))
-    cursors.append((left, right))
+        cursors.append((record.left, record.right))
+        ends.append(record.end)
+    cursors.append(ends[-1] if ends else (1, 1))
 
     def excerpt(
         source: list[str], start: int, end: int, definitions: list[tuple[int, int]], expand: bool
@@ -294,17 +348,17 @@ def relation_key(left: str, right: str) -> tuple[str, str]:
 def direct_relations(context: ReviewContext) -> dict[tuple[str, str], list[SourceRequest]]:
     """Index all known literal references with one multi-pattern scan per version.
 
-    A failure-linked trie preserves substring matches (including overlapping paths).
+    A failure-linked trie finds complete path/module tokens in a single pass.
     Only the first occurrence per target/version contributes source evidence.
     Normalized source/test names are joined separately, without source scans.
     """
     files = sorted(context.files, key=lambda f: f.filename)
     targets: dict[str, set[str]] = defaultdict(set)
-    names: dict[str, list[str]] = defaultdict(list)
+    names: dict[str, dict[bool, list[str]]] = defaultdict(lambda: {False: [], True: []})
     for file in files:
-        names[PurePosixPath(file.filename).stem.removeprefix("test_").removesuffix("_test")].append(
-            file.filename
-        )
+        stem = PurePosixPath(file.filename).stem
+        normalized = stem.removeprefix("test_").removesuffix("_test")
+        names[normalized][normalized != stem].append(file.filename)
         for ref in (
             file.filename,
             str(PurePosixPath(file.filename).with_suffix("")).replace("/", "."),
@@ -344,12 +398,13 @@ def direct_relations(context: ReviewContext) -> dict[tuple[str, str], list[Sourc
         result.setdefault(key, [])
         if evidence is not None:
             result[key].append(evidence)
-        if len(result) > 20_000:
+        if len(result) > MAX_RELATIONS:
             raise ValueError("Captured relationship budget exceeded")
 
     for group in names.values():
-        for left, right in combinations(group, 2):
-            add(left, right)
+        for left in group[False]:
+            for right in group[True]:
+                add(left, right)
     for file in files:
         versions: list[tuple[Literal["LEFT", "RIGHT"], str]] = [
             ("LEFT", file.before),
@@ -366,9 +421,15 @@ def direct_relations(context: ReviewContext) -> dict[tuple[str, str], list[Sourc
                     state = failures[state]
                 state = transitions[state].get(char, 0)
                 for ref in outputs[state]:
+                    start = position - len(ref) + 1
+                    # Match complete path/module tokens, never a word inside another name.
+                    if (start and (text[start - 1].isalnum() or text[start - 1] in "_./")) or (
+                        position + 1 < len(text)
+                        and (text[position + 1].isalnum() or text[position + 1] in "_./")
+                    ):
+                        continue
                     for target in targets[ref]:
                         if target != file.filename:
-                            start = position - len(ref) + 1
                             first[target] = min(first.get(target, start), start)
             total = len(newlines) + int(bool(text) and not text.endswith("\n"))
             for target, position in sorted(first.items()):
@@ -418,12 +479,14 @@ def plan(context: ReviewContext, *, force_chunks: bool = False) -> Plan:
     pending = [u for f in sorted(context.files, key=lambda f: f.filename) for u in units(f)]
     links = direct_relations(context)
     chunks: list[Chunk] = []
+    sizer = PacketSizer(metadata, pending)
+    target_bytes = min(CHUNK_BYTES, CAPACITY_CHUNK_BYTES) if force_chunks else CHUNK_BYTES
     # Start with the stable first unit, then prefer visible related evidence.
     while pending:
         chunk = Chunk(id=f"chunk-{len(chunks):04d}", units=[pending.pop(0)])
-        if len(chunk.payload(metadata).encode()) > (
-            min(CHUNK_BYTES, 200_000) if force_chunks else CHUNK_BYTES
-        ):
+        budget = sizer.budget(chunk.id)
+        budget.include(sizer.additions(chunk.units))
+        if budget.size > target_bytes:
             raise ValueError("Shared metadata, replies or unit exceeds chunk budget")
         candidates = sorted(
             pending,
@@ -434,13 +497,17 @@ def plan(context: ReviewContext, *, force_chunks: bool = False) -> Plan:
                 u.before_start,
             ),
         )
+        smallest = min((sizer.sizes["units"][u.id] for u in candidates), default=0)
+        accepted = set()
         for unit in candidates:
-            trial = Chunk(id=chunk.id, units=[*chunk.units, unit])
-            if len(trial.payload(metadata).encode()) <= (
-                min(CHUNK_BYTES, 200_000) if force_chunks else CHUNK_BYTES
-            ):
-                chunk = trial
-                pending.remove(unit)
+            if budget.size + smallest + 1 > target_bytes:
+                break
+            additions = sizer.additions([unit])
+            if budget.size + budget.growth(additions) <= target_bytes:
+                budget.include(additions)
+                chunk.units.append(unit)
+                accepted.add(unit.id)
+        pending = [u for u in pending if u.id not in accepted]
         chunks.append(chunk)
         if len(chunks) > MAX_CHUNKS:
             raise ValueError("Chunk work budget exceeded")
@@ -463,19 +530,16 @@ def validate_patch(file: ChangedFile) -> None:
     File headers are ignored; only LF separates Git lines.
     """
     old, new = lines(file.before), lines(file.after)
-    records = lines(file.patch)
     left = right = 0
     expected_left = expected_right = 0
     in_hunk = False
-    for record in records:
-        header = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", record)
-        if header:
+    for record in walk_patch(file.patch):
+        if record.counts is not None:
             if in_hunk and (left != expected_left or right != expected_right):
                 raise ValueError("Incomplete captured patch hunk")
-            a, ac, b, bc = header.groups()
-            old_count, new_count = int(ac or 1), int(bc or 1)
-            old_start = int(a) - int(old_count > 0)
-            new_start = int(b) - int(new_count > 0)
+            old_count, new_count = record.counts
+            old_start = record.left - int(old_count > 0)
+            new_start = record.right - int(new_count > 0)
             if (
                 old_start < left
                 or new_start < right
@@ -488,17 +552,18 @@ def validate_patch(file: ChangedFile) -> None:
             expected_left, expected_right = left + old_count, right + new_count
             in_hunk = True
             continue
-        if not in_hunk or record.startswith("\\"):
+        if not in_hunk or record.text.startswith("\\"):
             continue
-        sign = record[:1]
+        sign = record.text[:1]
         if sign not in (" ", "+", "-"):
             raise ValueError("Unreadable captured patch record")
-        text = record[1:].removesuffix("\n")
-        if sign in (" ", "-"):
+        text = record.text[1:].removesuffix("\n")
+        consumes_old, consumes_new = record.consumes
+        if consumes_old:
             if left >= len(old) or old[left].removesuffix("\n") != text:
                 raise ValueError("Captured patch differs from old source")
             left += 1
-        if sign in (" ", "+"):
+        if consumes_new:
             if right >= len(new) or new[right].removesuffix("\n") != text:
                 raise ValueError("Captured patch differs from new source")
             right += 1

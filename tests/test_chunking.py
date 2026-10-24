@@ -294,8 +294,8 @@ def test_direct_reference_outside_changed_hunk_remains_in_integration() -> None:
     assert any("from helpers.target import call\n" in text for text in actual)
 
 
-def test_reference_index_retains_overlaps_renames_and_first_line_evidence() -> None:
-    """Literal path/module matches retain the first reference, even with shared suffixes."""
+def test_reference_index_matches_complete_tokens_renames_and_first_line_evidence() -> None:
+    """Complete path/module matches retain the first reference without suffix collisions."""
     from ai_reviewer.chunking import direct_relations
 
     context, _, _ = bundle(Server())
@@ -327,8 +327,6 @@ def test_reference_index_retains_overlaps_renames_and_first_line_evidence() -> N
     links = direct_relations(context)
     assert set(links) == {
         ("lib/target.py", "src/caller.py"),
-        ("src/caller.py", "target.py"),
-        ("lib/target.py", "target.py"),
         ("lib/target.py", "tests/test_target.py"),
         ("target.py", "tests/test_target.py"),
     }
@@ -341,3 +339,69 @@ def test_reference_index_retains_overlaps_renames_and_first_line_evidence() -> N
     assert evidence[1].start <= 1 <= evidence[1].end < 42
     context.files.reverse()
     assert direct_relations(context) == links
+
+
+def test_common_filenames_and_short_substrings_do_not_create_relations() -> None:
+    """201 identical stems must not exhaust the 20,000 relationship allowance."""
+    from ai_reviewer.chunking import direct_relations
+
+    context, _, _ = bundle(Server())
+    template = ChangedFile(
+        filename="unused",
+        previous_filename=None,
+        status="modified",
+        patch="",
+        before="",
+        after="",
+        before_mode="100644",
+        after_mode="100644",
+    )
+    context.files = [
+        template.model_copy(update={"filename": f"pkg{i}/__init__.py", "before": "", "after": ""})
+        for i in range(201)
+    ] + [
+        template.model_copy(update={"filename": name, "before": "", "after": text})
+        for name, text in (("go.mod", ""), ("a.py", ""), ("caller.py", "cargo data setup"))
+    ]
+    assert direct_relations(context) == {}
+    context.files[-1].after = "import a\n"
+    assert set(direct_relations(context)) == {("a.py", "caller.py")}
+
+
+def test_incremental_packet_sizes_match_serialized_unicode_and_shared_comments() -> None:
+    """Actual UTF-8 serialization is the oracle for fit checks, including deduplication."""
+    from ai_reviewer.chunking import Chunk, PacketSizer, packet_metadata, units
+    from ai_reviewer.contracts import PriorComment
+
+    context, _, _ = bundle(Server())
+    context.files = [
+        ChangedFile(
+            filename=name,
+            previous_filename=None,
+            status="added",
+            patch='@@ -0,0 +1 @@\n+🚀"\t\n',
+            before="",
+            after='🚀"\t\n',
+            before_mode=None,
+            after_mode="100644",
+        )
+        for name in ("a.py", "b.py")
+    ]
+    context.previous_comments = [
+        PriorComment.model_validate(
+            {"author": "reviewer", "body": 'é"\n', "path": path, "line": None, "side": None}
+        )
+        for path in ("unchanged.py", "a.py", "b.py")
+    ]
+    metadata = packet_metadata(context)
+    evidence = [u for f in context.files for u in units(f)]
+    sizer = PacketSizer(metadata, evidence)
+    budget = sizer.budget("chunk-0000")
+    chunk = Chunk(id="chunk-0000", units=[])
+    assert budget.size == len(chunk.payload(metadata).encode())
+    for unit in evidence:
+        budget.include(sizer.additions([unit]))
+        chunk.units.append(unit)
+        assert budget.size == len(chunk.payload(metadata).encode())
+        budget.include(sizer.additions([unit]))
+        assert budget.size == len(chunk.payload(metadata).encode())

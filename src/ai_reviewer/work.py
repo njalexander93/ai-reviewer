@@ -17,6 +17,7 @@ from ai_reviewer.chunking import (
     MAX_WORK,
     PACKET_BYTES,
     Chunk,
+    PacketSizer,
     Plan,
     Unit,
     digest,
@@ -25,6 +26,7 @@ from ai_reviewer.chunking import (
     plan,
 )
 from ai_reviewer.contracts import (
+    AnchorIndex,
     ChunkReview,
     CompletedReview,
     Consolidation,
@@ -35,18 +37,21 @@ from ai_reviewer.contracts import (
     Review,
     ReviewContext,
     SourceRequest,
+    compile_anchors,
     reconcile,
     source_findings,
     validate_anchors,
 )
 from ai_reviewer.diagnostics import report_failure
-from ai_reviewer.models import CapacityError, Role, call_model
+from ai_reviewer.limits import CONSOLIDATION_BYTES, MAX_RELATIONS
+from ai_reviewer.models import AssignmentKind, CapacityError, Role, call_model
 
 
 class Assignment(Contract):
     """Bind one local/integration scope to both required provider reviews."""
 
     id: str
+    kind: AssignmentKind
     payload: str
     sections: list[str]
 
@@ -55,6 +60,7 @@ class AssignmentRecord(Contract):
     """Persist assignment identity and evidence digest without duplicating its payload."""
 
     id: str
+    kind: AssignmentKind
     payload_digest: str
     sections: list[str]
 
@@ -62,7 +68,10 @@ class AssignmentRecord(Contract):
 def assignment_record(assignment: Assignment) -> AssignmentRecord:
     """Bind manifest ownership to the payload retained in each attempt directory."""
     return AssignmentRecord(
-        id=assignment.id, payload_digest=digest(assignment.payload), sections=assignment.sections
+        id=assignment.id,
+        kind=assignment.kind,
+        payload_digest=digest(assignment.payload),
+        sections=assignment.sections,
     )
 
 
@@ -89,11 +98,19 @@ def local_assignments(context: ReviewContext, planned: Plan) -> list[Assignment]
     if planned.whole is not None:
         return [
             Assignment(
-                id="whole", payload=planned.whole, sections=[f.filename for f in context.files]
+                id="whole",
+                kind="whole",
+                payload=planned.whole,
+                sections=[f.filename for f in context.files],
             )
         ]
     return [
-        Assignment(id=c.id, payload=c.payload(planned.metadata), sections=[u.id for u in c.units])
+        Assignment(
+            id=c.id,
+            kind="local",
+            payload=c.payload(planned.metadata),
+            sections=[u.id for u in c.units],
+        )
         for c in planned.chunks
     ]
 
@@ -112,17 +129,30 @@ def integration_assignments(
     assignments = []
     links = {(r.left, r.right): r.evidence for r in planned.relations}
 
+    requests = {q.model_dump_json(): q for evidence in links.values() for q in evidence}
+    reference_data = dict(
+        zip(requests, source_sections(context, list(requests.values())), strict=True)
+    )
+    adjacency: dict[str, dict[str, set[str]]] = defaultdict(dict)
+    for (left, right), evidence in links.items():
+        keys = {q.model_dump_json() for q in evidence}
+        adjacency[left][right] = keys
+        adjacency[right][left] = keys
+
+    def reference_keys(paths: set[str], added: set[str]) -> set[str]:
+        """Look up only relationships incident to newly included paths."""
+        return {
+            key
+            for path in added
+            for neighbor, keys in adjacency[path].items()
+            if neighbor in paths
+            for key in keys
+        }
+
     def reference_source(scope: list[Unit]) -> list[dict[str, Any]]:
-        """Retain actual imports for same-chunk and cross-chunk relationships alike."""
+        """Reuse resolved immutable evidence, ordered by its canonical request key."""
         paths = {u.filename for u in scope}
-        requests = [
-            request
-            for (a, b), evidence in links.items()
-            if a in paths and b in paths
-            for request in evidence
-        ]
-        unique = {request.model_dump_json(): request for request in requests}
-        return source_sections(context, list(unique.values()))
+        return [reference_data[key] for key in sorted(reference_keys(paths, paths))]
 
     # Each chunk rechecks integration using actual local source and both reports.
     for i, chunk in enumerate(planned.chunks):
@@ -133,6 +163,7 @@ def integration_assignments(
         assignments.append(
             Assignment(
                 id=f"integration-{i:04d}",
+                kind="integration",
                 payload=encode(payload),
                 sections=[u.id for u in chunk.units],
             )
@@ -152,7 +183,7 @@ def integration_assignments(
         """Keep distinct cross-owner pairs bounded before packet construction."""
         if ownership[a.id] != ownership[b.id]:
             edges[(a.id, b.id)] = (a, b)
-            if len(edges) > 20_000:
+            if len(edges) > MAX_RELATIONS:
                 raise ValueError("Integration relationship budget exceeded")
 
     for a, b in zip(all_units, all_units[1:]):
@@ -164,12 +195,39 @@ def integration_assignments(
                 add_edge(a, b)
     # Pack relationship pairs together, preserving both actual source endpoints.
     pending: list[Unit] = []
+    paths: set[str] = set()
+    phase = "integration: check cross-chunk relationships using actual source"
+    sizer = PacketSizer(planned.metadata, all_units)
+    sizer.sizes["reference_source"] = {
+        key: len(encode(value).encode()) for key, value in reference_data.items()
+    }
+    sizer.sizes["reports"] = {
+        str(i): sum(
+            len(encode(local[(chunk.id, role)].model_dump()).encode())
+            for role in ("claude", "openai")
+        )
+        + 1
+        for i, chunk in enumerate(planned.chunks)
+    }
+    # Each owner contributes a contiguous pair of reports, including their internal comma.
+    budget = sizer.budget(
+        f"edge-{len(assignments):04d}", {"phase": phase, "reference_source": [], "reports": []}
+    )
+
+    def additions(scope: list[Unit]) -> dict[str, set[str]]:
+        """Count newly introduced source, comments, references and owner report pairs."""
+        added_paths = {u.filename for u in scope}
+        return {
+            **sizer.additions(scope),
+            "reference_source": reference_keys(paths | added_paths, added_paths - paths),
+            "reports": {str(ownership[u.id]) for u in scope},
+        }
 
     def packet(scope: list[Unit]) -> Assignment:
         """Attach reports only from owners of the actual source under integration."""
         pair = Chunk(id=f"edge-{len(assignments):04d}", units=scope)
         payload = json.loads(pair.payload(planned.metadata))
-        payload["phase"] = "integration: check cross-chunk relationships using actual source"
+        payload["phase"] = phase
         payload["reference_source"] = reference_source(scope)
         owners = sorted({ownership[u.id] for u in scope})
         payload["reports"] = [
@@ -177,16 +235,27 @@ def integration_assignments(
             for k in owners
             for role in ("claude", "openai")
         ]
-        return Assignment(id=pair.id, payload=encode(payload), sections=[u.id for u in scope])
+        return Assignment(
+            id=pair.id, kind="integration", payload=encode(payload), sections=[u.id for u in scope]
+        )
 
     order = {unit.id: i for i, unit in enumerate(all_units)}
     for a, b in sorted(edges.values(), key=lambda edge: (order[edge[0].id], order[edge[1].id])):
-        trial = pending + [u for u in (a, b) if u not in pending]
-        if pending and len(packet(trial).payload.encode()) > PACKET_BYTES:
+        extra = [u for u in (a, b) if u.id not in budget.selected["units"]]
+        delta = additions(extra)
+        if pending and budget.size + budget.growth(delta) > PACKET_BYTES:
             assignments.append(packet(pending))
             pending = []
-            trial = [a, b]
-        pending = trial
+            paths = set()
+            budget = sizer.budget(
+                f"edge-{len(assignments):04d}",
+                {"phase": phase, "reference_source": [], "reports": []},
+            )
+            extra = [a, b]
+            delta = additions(extra)
+        budget.include(delta)
+        pending.extend(extra)
+        paths.update(u.filename for u in extra)
         if len(assignments) + len(planned.chunks) >= MAX_WORK:
             raise ValueError("Integration work budget exceeded; review incomplete")
     if pending:
@@ -228,7 +297,10 @@ def integration_pages(assignment: Assignment) -> list[Assignment]:
         pages.append(encode({**base, "reports": pending}))
     return [
         Assignment(
-            id=f"{assignment.id}-page-{index:04d}", payload=payload, sections=assignment.sections
+            id=f"{assignment.id}-page-{index:04d}",
+            kind=assignment.kind,
+            payload=payload,
+            sections=assignment.sections,
         )
         for index, payload in enumerate(pages)
     ]
@@ -238,11 +310,15 @@ def source_sections(context: ReviewContext, requests: list[SourceRequest]) -> li
     """Resolve validated line ranges from captured blobs, with no live repository access."""
     files = {f.filename: f for f in context.files}
     sections = []
+    sources: dict[tuple[str, str], list[str]] = {}
     for request in requests:
         if request.path not in files:
             raise ValueError("Required source is outside the captured snapshot")
         file = files[request.path]
-        source = lines(file.before if request.side == "LEFT" else file.after)
+        key = (request.path, request.side)
+        if key not in sources:
+            sources[key] = lines(file.before if request.side == "LEFT" else file.after)
+        source = sources[key]
         if request.end < request.start or request.end > len(source):
             raise ValueError("Required source range is unavailable")
         sections.append(
@@ -270,7 +346,11 @@ def attempt_directory(directory: Path, assignment: str, role: str, round_: int) 
 
 
 def run_assignment(
-    context: ReviewContext, assignment: Assignment, role: Role, directory: Path
+    context: ReviewContext,
+    assignment: Assignment,
+    role: Role,
+    directory: Path,
+    anchors: AnchorIndex,
 ) -> int:
     """Run at most three calls; unresolved or unrequested missing context fails closed."""
     history: list[ChunkReview] = []
@@ -282,9 +362,9 @@ def run_assignment(
         print(
             f"Review attempt: assignment={assignment.id} role={role} attempt={round_}", flush=True
         )
-        call_model(role, payload, target, chunked=True)
+        call_model(role, payload, target, kind=assignment.kind)
         report = ChunkReview.model_validate_json((target / f"{role}.json").read_text())
-        validate_anchors(context, [report])
+        validate_anchors(anchors, [report])
         history.append(report)
         if not report.requests:
             if not report.complete:
@@ -304,7 +384,11 @@ def save_manifest(directory: Path, manifest: Manifest) -> None:
 
 
 def run_batch(
-    context: ReviewContext, manifest: Manifest, assignments: list[Assignment], directory: Path
+    context: ReviewContext,
+    manifest: Manifest,
+    assignments: list[Assignment],
+    directory: Path,
+    anchors: AnchorIndex,
 ) -> None:
     """Schedule two workers, recording all terminal results even if one fails."""
     if len(manifest.assignments) + len(assignments) > MAX_WORK:
@@ -318,7 +402,9 @@ def run_batch(
     failed = False
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {
-            pool.submit(run_assignment, context, assignment, completion.role, directory): completion
+            pool.submit(
+                run_assignment, context, assignment, completion.role, directory, anchors
+            ): completion
             for assignment in assignments
             for completion in completions
             if completion.assignment == assignment.id
@@ -340,7 +426,11 @@ def run_batch(
 
 
 def read_batch(
-    context: ReviewContext, assignments: list[Assignment], manifest: Manifest, directory: Path
+    context: ReviewContext,
+    assignments: list[Assignment],
+    manifest: Manifest,
+    directory: Path,
+    anchors: AnchorIndex,
 ) -> dict[tuple[str, str], Review]:
     """Replay attempt inputs and require complete results with no unresolved requests."""
     reports: dict[tuple[str, str], Review] = {}
@@ -359,7 +449,7 @@ def read_batch(
                 if (target / "payload.json").read_text() != payload:
                     raise ValueError("Attempt evidence differs from required work")
                 report = ChunkReview.model_validate_json((target / f"{role}.json").read_text())
-                validate_anchors(context, [report])
+                validate_anchors(anchors, [report])
                 history.append(report)
                 terminal = round_ == completion.attempts - 1
                 if terminal:
@@ -389,7 +479,7 @@ def review_chunks(context: ReviewContext, directory: Path) -> None:
             # Count both provider inputs before either provider can generate a report.
             for role in ("claude", "openai"):
                 call_model(
-                    role, planned.whole, directory / "preflight", chunked=True, preflight=True
+                    role, planned.whole, directory / "preflight", kind="whole", preflight=True
                 )
         except CapacityError:
             force_chunks = True
@@ -400,12 +490,13 @@ def review_chunks(context: ReviewContext, directory: Path) -> None:
         assignments=[],
         results=[],
     )
+    anchors = compile_anchors(context)
     local = local_assignments(context, planned)
-    run_batch(context, manifest, local, directory)
-    reports = read_batch(context, local, manifest, directory)
+    run_batch(context, manifest, local, directory, anchors)
+    reports = read_batch(context, local, manifest, directory, anchors)
     integration = integration_assignments(context, planned, reports)
-    run_batch(context, manifest, integration, directory)
-    read_batch(context, integration, manifest, directory)
+    run_batch(context, manifest, integration, directory, anchors)
+    read_batch(context, integration, manifest, directory, anchors)
 
 
 def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
@@ -414,8 +505,9 @@ def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
     planned = plan(context, force_chunks=manifest.force_chunks)
     if manifest.plan_digest != digest(planned.model_dump_json()):
         raise ValueError("Coverage plan does not match the captured snapshot")
+    anchors = compile_anchors(context)
     local = local_assignments(context, planned)
-    reports = read_batch(context, local, manifest, directory)
+    reports = read_batch(context, local, manifest, directory, anchors)
     integration = integration_assignments(context, planned, reports)
     expected = local + integration
     keys = [(a.id, role) for a in expected for role in ("claude", "openai")]
@@ -424,7 +516,7 @@ def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
         actual
     ):
         raise ValueError("Coverage assignments are missing, duplicated or unexpected")
-    reports.update(read_batch(context, integration, manifest, directory))
+    reports.update(read_batch(context, integration, manifest, directory, anchors))
     return CoveredReviews(
         reviews=[reports[key] for key in keys],
         snapshot=planned.snapshot,
@@ -454,7 +546,7 @@ def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
     batch: dict[str, Any] = {}
     for key, finding in items:
         trial = {**batch, key: finding.model_dump()}
-        if len(trial) > 40 or len(encode({"sources": trial}).encode()) > 200_000:
+        if len(trial) > 40 or len(encode({"sources": trial}).encode()) > CONSOLIDATION_BYTES:
             batches.append(batch)
             batch = {}
         batch[key] = finding.model_dump()

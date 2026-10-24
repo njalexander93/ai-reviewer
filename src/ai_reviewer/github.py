@@ -19,9 +19,10 @@ from ai_reviewer.contracts import (
     Consolidation,
     CoveredReviews,
     ReviewContext,
-    diff_lines,
     reconcile,
 )
+from ai_reviewer.limits import GITHUB_BODY_BYTES
+from ai_reviewer.patch import diff_lines
 
 
 class GitHub:
@@ -306,7 +307,7 @@ def publish(
             body = ""
             for fragment in fragments:
                 combined = body + "\n\n---\n\n" + fragment if body else fragment
-                if len(combined.encode()) > 60_000:
+                if len(combined.encode()) > GITHUB_BODY_BYTES:
                     comments.append({"path": filename, "side": side, "line": line, "body": body})
                     body = fragment
                 else:
@@ -317,7 +318,7 @@ def publish(
     body += covered.summary
     # Reject oversized publication atomically; never publish a partial approval.
     if (
-        len(body.encode()) > 60_000
+        len(body.encode()) > GITHUB_BODY_BYTES
         or len(comments) > 1000
         or len(json.dumps(comments, ensure_ascii=False).encode()) > 8_000_000
     ):
