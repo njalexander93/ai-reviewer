@@ -569,3 +569,62 @@ def test_navigation_projection_does_not_mutate_captured_metadata() -> None:
     assert captured == original
     assert omitted == {"inventory": [{"filename": "app.py"}], "declaration_navigation": "truncated"}
     assert full == {**original, "declaration_navigation": "complete"}
+
+
+def test_markdown_navigation_reaches_contract_beyond_previous_excerpt() -> None:
+    """The reported 500/549 gap is discoverable on each captured side after a rename."""
+    from ai_reviewer.chunking import overview
+
+    context, _, _ = bundle(Server())
+    source = "\n" * 535 + "### Task-free parent operations\n" + "\n" * 12
+    source += "External file edits contract\n\n### Next section\n"
+    context.files = [
+        ChangedFile(
+            filename="docs/host-hooks.md",
+            previous_filename="docs/old.markdown",
+            status="renamed",
+            patch="",
+            before=source,
+            after="\n" + source,
+            before_mode="100644",
+            after_mode="100644",
+        )
+    ]
+    item = overview(context)["inventory"][0]
+    assert item["sections"]["LEFT"]["entries"][0] == {
+        "name": "Task-free parent operations",
+        "level": 3,
+        "start": 536,
+        "end": 550,
+    }
+    assert item["sections"]["RIGHT"]["entries"][0] == {
+        "name": "Task-free parent operations",
+        "level": 3,
+        "start": 537,
+        "end": 551,
+    }
+    assert source.splitlines()[548] == "External file edits contract"
+
+
+def test_markdown_navigation_shares_byte_budget_without_mutating_source() -> None:
+    """Section omissions are explicit and indexed ranges survive metadata projection."""
+    from copy import deepcopy
+
+    from ai_reviewer.chunking import bound_navigation, omit_navigation
+    from ai_reviewer.markdown_navigation import section_index
+    from ai_reviewer.serialization import encode
+
+    index = section_index("guide.md", "# Root\n" + "## Child\n" * 100)
+    data = {"inventory": [{"filename": "guide.md", "sections": {"RIGHT": index}}]}
+    original = deepcopy(data)
+    bounded = bound_navigation(data, 400)
+    assert bounded["declaration_navigation"] == "truncated"
+    entries = bounded["inventory"][0]["sections"]["RIGHT"]["entries"]
+    assert 0 < len(entries) < 101
+    assert entries[0] == {"name": "Root", "level": 1, "start": 1, "end": 101}
+    assert len(encode(bounded).encode()) - len(encode(omit_navigation(data)).encode()) <= 400
+    assert bound_navigation(data, 0) == {
+        "inventory": [{"filename": "guide.md"}],
+        "declaration_navigation": "truncated",
+    }
+    assert data == original
