@@ -758,8 +758,12 @@ def test_integration_discovers_handler_before_generation() -> None:
     )
 
 
+@pytest.mark.parametrize("empty_final", [False, True])
 def test_exhaustion_records_attempts_and_safe_outstanding_requests(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    empty_final: bool,
 ) -> None:
     """Three incomplete reports remain failed with actionable, source-free diagnostics."""
     context, _, _ = bundle(Server())
@@ -801,6 +805,8 @@ def test_exhaustion_records_attempts_and_safe_outstanding_requests(
                 }
             ],
         )
+        if empty_final and directory.name == "2":
+            report.requests = []
         (directory / f"{role}.json").write_text(report.model_dump_json())
 
     monkeypatch.setattr(work, "call_model", incomplete)
@@ -823,10 +829,12 @@ def test_exhaustion_records_attempts_and_safe_outstanding_requests(
         "error": "FollowupExhausted",
         "attempts": 3,
         "completed_followups": 2,
-        "outstanding_request_count": 1,
-        "outstanding_requests": [
-            {"path": context.files[0].filename, "side": "RIGHT", "start": 1, "end": 1}
-        ],
+        "category": "unresolved_evidence",
+        "reason": "followup_budget_exhausted",
+        "outstanding_request_count": 0 if empty_final else 1,
+        "outstanding_requests": []
+        if empty_final
+        else [{"path": context.files[0].filename, "side": "RIGHT", "start": 1, "end": 1}],
     }
     assert "secret" not in json.dumps(details) + capsys.readouterr().out
     with pytest.raises(ValueError, match="failed worker result"):
@@ -906,3 +914,123 @@ def test_navigation_cannot_displace_required_packet_evidence(phase: str) -> None
             work.integration_pages(assignment, 100)
         else:
             work.followup_payload(context, assignment, [report], 100)
+
+
+@pytest.mark.parametrize("prior_attempts", [0, 1])
+def test_early_incomplete_without_requests_is_protocol_failure(prior_attempts: int) -> None:
+    """An early missing request is malformed, not evidence that the budget was spent."""
+    from ai_reviewer.diagnostics import IncompleteWithoutRequests, failure_details
+
+    context, _, _ = bundle(Server())
+    assignment = work.local_assignments(context, plan(context))[0]
+    report = ChunkReview(complete=False, summary="private text", findings=[], requests=[])
+    with pytest.raises(IncompleteWithoutRequests) as caught:
+        work.advance(
+            context,
+            assignment,
+            [report] * prior_attempts,
+            report.model_dump_json(),
+            work.compile_anchors(context),
+            100_000,
+        )
+    assert failure_details(caught.value) == {
+        "error": "IncompleteWithoutRequests",
+        "category": "unresolved_evidence",
+        "reason": "missing_source_requests",
+        "attempts": prior_attempts + 1,
+    }
+
+
+def test_markdown_section_request_delivers_contract_and_replays(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An offline reviewer can locate line 549 and replay its bounded source request."""
+    context = large_context()
+    source = "\n" * 535 + "### Task-free parent operations\n" + "\n" * 12
+    source += "External file edits contract\n\n### Next section\n"
+    context.files.append(
+        ChangedFile(
+            filename="docs/host-hooks.md",
+            previous_filename=None,
+            status="added",
+            patch="@@ -0,0 +1,551 @@\n" + "".join("+" + line for line in source.splitlines(True)),
+            before="",
+            after=source,
+            before_mode=None,
+            after_mode="100644",
+        )
+    )
+    planned = plan(context)
+    assignment = work.local_assignments(context, planned)[0]
+    manifest = work.Manifest(
+        providers=("claude", "openai"),
+        plan_digest="test",
+        packet_bytes=planned.packet_bytes,
+        assignments=[],
+        results=[],
+    )
+
+    def request_section(role: str, payload: str, directory: Path, **kwargs: object) -> None:
+        """Use real packet navigation with schema-valid synthetic provider responses."""
+        packet = json.loads(payload)
+        if directory.name == "0":
+            item = next(
+                item
+                for item in packet["overview"]["inventory"]
+                if item["filename"] == "docs/host-hooks.md"
+            )
+            section = next(
+                entry
+                for entry in item["sections"]["RIGHT"]["entries"]
+                if entry["name"] == "Task-free parent operations"
+            )
+            report = ChunkReview(
+                complete=False,
+                summary="Need contract",
+                findings=[],
+                requests=[
+                    {
+                        "path": item["filename"],
+                        "side": "RIGHT",
+                        "start": section["start"],
+                        "end": section["end"],
+                        "reason": "Read the external edit contract",
+                    }
+                ],
+            )
+        else:
+            assert packet["requested_source"] == [
+                {
+                    "path": "docs/host-hooks.md",
+                    "side": "RIGHT",
+                    "start": 536,
+                    "end": 550,
+                    "reason": "Read the external edit contract",
+                    "text": "### Task-free parent operations\n"
+                    + "\n" * 12
+                    + "External file edits contract\n\n",
+                }
+            ]
+            report = ChunkReview(complete=True, summary="Contract read", findings=[], requests=[])
+        (directory / f"{role}.json").write_text(report.model_dump_json())
+
+    monkeypatch.setattr(work, "call_model", request_section)
+    work.run_batch(
+        context,
+        manifest,
+        [assignment],
+        tmp_path,
+        work.compile_anchors(context),
+        planned.packet_bytes,
+    )
+    assert [(r.status, r.attempts) for r in manifest.results] == [("complete", 2)] * 2
+    replayed = work.read_batch(
+        context,
+        [assignment],
+        manifest,
+        tmp_path,
+        work.compile_anchors(context),
+        planned.packet_bytes,
+    )
+    assert len(replayed) == 2

@@ -39,7 +39,7 @@ from ai_reviewer.contracts import (
     compile_anchors,
     validate_anchors,
 )
-from ai_reviewer.diagnostics import FollowupExhausted, report_failure
+from ai_reviewer.diagnostics import FollowupExhausted, IncompleteWithoutRequests, report_failure
 from ai_reviewer.limits import (
     CAPACITY_PACKET_BYTES,
     MAX_ATTEMPTS,
@@ -110,7 +110,7 @@ class Completion(Contract):
         assignment: Planned assignment ID.
         role: Independent provider required to complete that assignment.
         status: Pending before execution; complete or failed after its future settles.
-        attempts: Validated report count for success or follow-up exhaustion, at most
+        attempts: Validated report count for success or incomplete responses, at most
             MAX_ATTEMPTS. Zero on other failures means unknown, not no provider calls.
     """
 
@@ -583,10 +583,10 @@ def advance(
         Parsed report and next JSON payload, or None for the payload when complete.
 
     Raises:
-        FollowupExhausted: The final allowed report still requests required evidence.
+        FollowupExhausted: The final allowed report remains incomplete, with or without requests.
+        IncompleteWithoutRequests: An earlier incomplete report omits source requests.
         ValueError: Schema or anchors are invalid, completion conflicts with requests,
-            incomplete work has no request, requested source
-            is unavailable, or the continuation exceeds the packet ceiling.
+            requested source is unavailable, or the continuation exceeds the packet ceiling.
     """
     # Parse and anchor-check before interpreting a provider completion claim.
     report = ChunkReview.model_validate_json(report_json)
@@ -597,12 +597,12 @@ def advance(
             raise ValueError("Complete report cannot have required source requests")
         return report, None
     # Incomplete work must request available evidence within the remaining attempt bound.
-    if not report.requests:
-        raise ValueError("Required context unresolved")
     if len(history) + 1 >= MAX_ATTEMPTS:
         raise FollowupExhausted(
             len(history) + 1, report.requests, {file.filename for file in context.files}
         )
+    if not report.requests:
+        raise IncompleteWithoutRequests(len(history) + 1)
     return report, followup_payload(context, assignment, [*history, report], packet_bytes)
 
 
@@ -735,7 +735,7 @@ def run_batch(
                 completion.attempts = future.result()
                 completion.status = "complete"
             except Exception as error:
-                if isinstance(error, FollowupExhausted):
+                if isinstance(error, (FollowupExhausted, IncompleteWithoutRequests)):
                     completion.attempts = error.attempts
                 report_failure(
                     error,

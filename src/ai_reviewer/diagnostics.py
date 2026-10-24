@@ -14,6 +14,19 @@ from pydantic_core import ErrorType
 from ai_reviewer.contracts import ChunkReview, Consolidation, ReviewContext, SourceRequest
 
 
+class IncompleteWithoutRequests(ValueError):
+    """Identify an incomplete response missing requests before budget exhaustion.
+
+    Attributes:
+        attempts: Parsed and anchor-validated report count, including this response.
+    """
+
+    def __init__(self, attempts: int) -> None:
+        """Retain the attempt count without copying untrusted provider prose."""
+        super().__init__("Required evidence unresolved: incomplete response has no source requests")
+        self.attempts = attempts
+
+
 class FollowupExhausted(ValueError):
     """Identify incomplete work after the last allowed report.
 
@@ -54,9 +67,13 @@ def failure_details(error: Exception) -> dict[str, Any]:
     """
     # Admit only a class name and numeric HTTP status from generic exceptions.
     details: dict[str, Any] = {"error": type(error).__name__}
+    if isinstance(error, (FollowupExhausted, IncompleteWithoutRequests)):
+        details.update(category="unresolved_evidence", attempts=error.attempts)
+    if isinstance(error, IncompleteWithoutRequests):
+        details["reason"] = "missing_source_requests"
     if isinstance(error, FollowupExhausted):
         details.update(
-            attempts=error.attempts,
+            reason="followup_budget_exhausted",
             completed_followups=max(0, error.attempts - 1),
             outstanding_request_count=error.request_count,
             outstanding_requests=error.requests,

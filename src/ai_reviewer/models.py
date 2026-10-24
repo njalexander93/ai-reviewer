@@ -194,10 +194,18 @@ Request missing evidence using requests (path, LEFT/RIGHT, inclusive start/end, 
 For chunked packets, overview.inventory lists declarations by LEFT/RIGHT with qualified
 names and inclusive start/end lines. Use these locations instead of guessing ranges.
 Use the inventory filename as request.path on either side, including renamed files.
-Index statuses other than indexed mean navigation is unavailable; inspect supplied source.
+Markdown files also have sections by LEFT/RIGHT: raw heading name, level, and inclusive
+start/end of the section (through descendants, before the next equal/shallower heading).
+Use section names to locate the relevant contract and request its source, rather than
+paging guessed line ranges. Large sections can be requested in targeted smaller ranges.
+Markdown status=partial is usable but intentionally incomplete: only ATX (#) and
+single-line setext (underlined) headings outside fenced code are supported. Containers,
+HTML blocks and multiline setext headings are not parsed; names retain inline markup.
+Other statuses except indexed mean navigation is unavailable; inspect supplied source.
 overview.declaration_navigation=truncated means some files or entries were omitted to
-preserve the source budget. Missing entries never prove a declaration is absent.
-The index locates declarations only; it does not replace reading their source.
+preserve the source budget. This bound includes Markdown sections.
+Missing entries never prove evidence is absent.
+The index locates evidence only; it does not replace reading their source.
 Requests can only read changed files from the captured snapshot. No tools execute code.
 If context is required, set complete=false and request it. Never infer unseen compatibility.
 At most two follow-up rounds are available. If unresolved, remain incomplete.

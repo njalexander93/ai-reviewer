@@ -239,18 +239,35 @@ Navigation fields are capped at 16,000 UTF-8 bytes across the inventory and trim
 further when needed to fit a required source unit. Oversized integration and follow-up
 packets omit navigation before paging reports or rejecting required evidence.
 `declaration_navigation: truncated` means entries or entire file indexes were omitted; absence is not evidence that a
-function does not exist. Unit splitting consumes complete discovery before navigation
+function or section does not exist. Unit splitting consumes complete discovery before navigation
 is projected. Projections return new metadata; packet sizers retain unchanged inputs.
 Discovery never executes source and does not replace reading it. Unsupported languages, malformed Python and
 bare-CR line endings have explicit unavailable statuses; ordinary source requests
 still work. Whole-context payload bytes remain unchanged. Index bytes count toward
 existing packet limits; required source and review metadata still fail closed if oversized.
 
-Follow-up exhaustion records `FollowupExhausted` in worker logs and
+Markdown `.md`/`.markdown` files additionally expose LEFT/RIGHT `sections`, using
+raw heading names, levels and inclusive section ranges. Each range includes nested
+sections until the next equal/shallower indexed heading or EOF. Both reviewers are
+taught to request the relevant source using those locations. These sections share
+the existing navigation byte limit and omission marker; they do not alter chunk
+splitting. Status `partial` explicitly identifies a conservative syntax subset:
+ATX (`#`) and single-line setext (underlined) headings, with up to three leading
+spaces, excluding fenced code. Backtick/tilde fences require matching character and
+sufficient closing length. Containers and HTML blocks are skipped conservatively
+until a blank line (comments through their terminator); they are not parsed.
+Multiline setext titles are omitted and inline markup is retained. This is not a
+full CommonMark index: absence never establishes that a section does not exist.
+
+Final incomplete responses, including `complete=false` with no requests, record
+`FollowupExhausted` and reason `followup_budget_exhausted` in worker logs and
 `work/<assignment>/<provider>/failure.json`, with validated attempt count, completed
 follow-up rounds and bounded outstanding coordinates. Reasons, summaries, source and
 provider error bodies are excluded. Unknown paths are redacted. The manifest retains
-the exhausted attempt count and failed status. For other failures, zero attempts
+the exhausted attempt count and failed status. An earlier incomplete response without
+requests records `IncompleteWithoutRequests`, reason `missing_source_requests`, and
+the observed attempt count. Both are classified as `unresolved_evidence`, not API
+transport failures. Neither triggers an extra call. For other failures, zero attempts
 still means unknown; per-attempt artifacts remain the evidence of provider activity.
 Incomplete work cannot proceed to approval. Offline navigation tests do not guarantee
 that a model will finish within the three-attempt budget.

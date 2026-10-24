@@ -332,6 +332,9 @@ def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
     instructions = call["instructions"] if role in ("openai", "luna") else call["system"]
     assert framing in instructions
     assert "Request missing evidence" in instructions
+    assert "Markdown files also have sections by LEFT/RIGHT" in instructions
+    assert "request its source" in instructions
+    assert "Missing entries never prove evidence is absent" in instructions
     if kind == "whole":
         assert "within a larger PR" not in instructions
     schema = (
