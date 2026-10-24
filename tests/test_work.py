@@ -822,3 +822,71 @@ def test_exhaustion_records_attempts_and_safe_outstanding_requests(
             work.compile_anchors(context),
             planned.packet_bytes,
         )
+
+
+@pytest.mark.parametrize("phase", ["integration", "followup"])
+def test_navigation_cannot_displace_required_packet_evidence(phase: str) -> None:
+    """An advisory index must yield when otherwise fitting evidence needs the space."""
+    from ai_reviewer.serialization import encode
+
+    context, _, _ = bundle(Server())
+    context.files = [
+        ChangedFile(
+            filename="app.py",
+            previous_filename=None,
+            status="added",
+            patch="@@ -0,0 +1 @@\n+pass\n",
+            before="",
+            after="pass\n",
+            before_mode=None,
+            after_mode="100644",
+        )
+    ]
+    required = {
+        "scope": {"units": [{"after": "source" * 1000}]},
+        "reports": [{"summary": "report" * 100}],
+        "overview": {
+            "inventory": [{"filename": "app.py", "after_lines": 1}],
+            "declaration_navigation": "complete",
+        },
+    }
+    packet = json.loads(encode(required))
+    packet["overview"]["inventory"][0]["declarations"] = {
+        "RIGHT": {"status": "indexed", "entries": [{"name": "x" * 12000, "start": 1, "end": 1}]}
+    }
+    assignment = work.Assignment(
+        id="integration-0000", kind="integration", payload=encode(packet), sections=["app.py"]
+    )
+    original = assignment.payload
+    if phase == "integration":
+        pages = work.integration_pages(assignment, 10000)
+        assert len(pages) == 1
+        output = pages[0].payload
+    else:
+        report = ChunkReview(
+            complete=False,
+            summary="Need source",
+            findings=[],
+            requests=[
+                {"path": "app.py", "side": "RIGHT", "start": 1, "end": 1, "reason": "Inspect"}
+            ],
+        )
+        output = work.followup_payload(context, assignment, [report], 10000)
+    result = json.loads(output)
+    assert len(output.encode()) <= 10000
+    assert result["scope"] == required["scope"]
+    assert result["reports"] == required["reports"]
+    assert result["overview"] == {
+        "inventory": [{"filename": "app.py", "after_lines": 1}],
+        "declaration_navigation": "truncated",
+    }
+    assert assignment.payload == original
+    if phase == "followup":
+        assert result["requested_source"][0]["text"] == "pass\n"
+        assert result["prior_attempts"][0]["summary"] == "Need source"
+    # Required source alone remains a hard failure, even after navigation is dropped.
+    with pytest.raises(ValueError, match="exceeds packet budget"):
+        if phase == "integration":
+            work.integration_pages(assignment, 100)
+        else:
+            work.followup_payload(context, assignment, [report], 100)

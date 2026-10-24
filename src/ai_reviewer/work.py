@@ -20,6 +20,7 @@ from ai_reviewer.chunking import (
     PacketSizer,
     Plan,
     Unit,
+    bound_navigation,
     plan,
 )
 from ai_reviewer.contracts import (
@@ -425,8 +426,9 @@ def integration_pages(assignment: Assignment, packet_bytes: int) -> list[Assignm
         packet_bytes: Maximum serialized UTF-8 bytes per returned payload.
 
     Returns:
-        The original assignment if it fits, otherwise ordered page-suffixed assignments
-        with identical owned sections. Every page requires both providers.
+        The original assignment if it fits. Otherwise advisory navigation is omitted
+        before report paging; every page retains identical required source and owned
+        sections and requires both providers. The input assignment remains unchanged.
 
     Raises:
         ValueError: Invalid JSON or source plus one indivisible atom exceeds the ceiling.
@@ -437,6 +439,12 @@ def integration_pages(assignment: Assignment, packet_bytes: int) -> list[Assignm
     if len(assignment.payload.encode()) <= packet_bytes:
         return [assignment]
     base = json.loads(assignment.payload)
+    # Navigation must yield to source and reports before creating more required work.
+    if "overview" in base:
+        bound_navigation(base["overview"], 0)
+    serialized = encode(base)
+    if len(serialized.encode()) <= packet_bytes:
+        return [assignment.model_copy(update={"payload": serialized})]
     atoms = base.pop("reports")
     pages = []
     pending: list[dict[str, Any]] = []
@@ -511,6 +519,7 @@ def followup_payload(
 
     Returns:
         JSON for the next provider call without mutating history or assignment.
+        Advisory navigation is omitted if needed; required evidence is never removed.
 
     Raises:
         ValueError: Original JSON is invalid, a requested range is unavailable, or
@@ -520,8 +529,12 @@ def followup_payload(
     payload = json.loads(assignment.payload)
     payload["prior_attempts"] = [r.model_dump() for r in history]
     payload["requested_source"] = source_sections(context, [q for r in history for q in r.requests])
-    # Reject the entire continuation if required evidence cannot fit.
+    # Prefer all requested evidence over advisory navigation on a full continuation.
     serialized = encode(payload)
+    if len(serialized.encode()) > packet_bytes and "overview" in payload:
+        bound_navigation(payload["overview"], 0)
+        serialized = encode(payload)
+    # Reject the entire continuation if required evidence still cannot fit.
     if len(serialized.encode()) > packet_bytes:
         raise ValueError("Required follow-up context exceeds packet budget")
     return serialized

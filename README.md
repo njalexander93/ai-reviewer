@@ -216,8 +216,9 @@ have qualified names and one-based inclusive LEFT/RIGHT ranges, including decora
 Use the inventory's current filename for either side of a renamed file. The index
 is compiled once per plan; unit splitting and packet navigation share that discovery.
 Navigation fields are capped at 16,000 UTF-8 bytes across the inventory and trimmed
-further when needed to fit a required source unit. `declaration_navigation: truncated`
-means entries or entire file indexes were omitted; absence is not evidence that a
+further when needed to fit a required source unit. Oversized integration and follow-up
+packets omit navigation before paging reports or rejecting required evidence.
+`declaration_navigation: truncated` means entries or entire file indexes were omitted; absence is not evidence that a
 function does not exist. Complete splitting ranges remain cached separately.
 Discovery never executes source and does not replace reading it. Unsupported languages, malformed Python and
 bare-CR line endings have explicit unavailable statuses; ordinary source requests
