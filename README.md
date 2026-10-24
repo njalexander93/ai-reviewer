@@ -26,6 +26,10 @@ Model IDs and settings verified on **2026-10-24**:
 [`claude-opus-5-5`](https://platform.claude.com/docs/en/models/overview) and
 [`claude-haiku-5-5`](https://platform.claude.com/docs/en/models/haiku-5-5/overview)
 use `thinking={"type": "adaptive"}` and `output_config={"effort": "medium"}`.
+`models.py` owns the role-to-provider/model/pricing table. The canonical coverage
+loader carries the validated provider set into `consolidation.py`; consolidation
+does not reread the manifest.
+
 Both consolidation stages use the selected cheaper model and the same validated
 finding-partition contract. Lower prices do not establish equivalent summary quality.
 

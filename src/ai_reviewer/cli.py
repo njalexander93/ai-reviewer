@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
+from ai_reviewer.consolidation import consolidate_chunks
 from ai_reviewer.context import prepare
 from ai_reviewer.contracts import (
     FinalConsolidation,
@@ -12,7 +13,7 @@ from ai_reviewer.contracts import (
 from ai_reviewer.diagnostics import report_failure
 from ai_reviewer.github import GitHub, publish
 from ai_reviewer.models import ConfigurationError, print_costs
-from ai_reviewer.work import consolidate_chunks, load_reviews, review_chunks
+from ai_reviewer.work import load_reviews, review_chunks
 
 
 def main() -> None:
@@ -76,7 +77,7 @@ def main() -> None:
     except Exception as error:
         # Keep stage failures diagnosable without printing arbitrary exception text.
         if isinstance(error, ConfigurationError):
-            print("Configure at least one nonempty ANTHROPIC_API_KEY or OPENAI_API_KEY.")
+            print(str(error))
         report_failure(error, directory / f"{args.stage}.error.json", stage=args.stage)
         raise SystemExit(1) from None
 

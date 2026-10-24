@@ -7,7 +7,7 @@ from threading import Barrier
 
 import pytest
 
-from ai_reviewer import cli, work
+from ai_reviewer import cli, consolidation, work
 from ai_reviewer.contracts import ChunkReview, Consolidation
 from tests.test_github import Server, bundle
 
@@ -71,6 +71,7 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
 
     # Run the real stage dispatcher with only external boundaries replaced.
     monkeypatch.setattr(work, "call_model", model)
+    monkeypatch.setattr(consolidation, "call_model", model)
     for stage in ["prepare", "review", "consolidate", "publish", "costs"]:
         monkeypatch.setattr(sys, "argv", ["review", stage, "--directory", str(tmp_path)])
         cli.main()
@@ -103,6 +104,7 @@ def test_incomplete_report_blocks_later_stages(
     context, _, _ = bundle(Server())
     (tmp_path / "context.json").write_text(context.model_dump_json())
     monkeypatch.setattr(work, "call_model", fake_model)
+    monkeypatch.setattr(consolidation, "call_model", fake_model)
     work.review_chunks(context, tmp_path)
     target = work.attempt_directory(tmp_path, "whole", "openai", 0) / "openai.json"
     target.write_text(
@@ -159,6 +161,7 @@ def test_parallel_review_waits_for_both_calls(
 
     # Exercise the real CLI dispatcher with the paid boundary replaced.
     monkeypatch.setattr(work, "call_model", model)
+    monkeypatch.setattr(consolidation, "call_model", model)
     monkeypatch.setattr(sys, "argv", ["reviewer", "review", "--directory", str(tmp_path)])
     if failed_role:
         with pytest.raises(SystemExit) as error:
@@ -186,11 +189,13 @@ def test_invalid_anchor_stops_before_consolidator_purchase(
     from tests.test_work import fake_model
 
     monkeypatch.setattr(work, "call_model", fake_model)
+    monkeypatch.setattr(consolidation, "call_model", fake_model)
     work.review_chunks(context, tmp_path)
     target = work.attempt_directory(tmp_path, "whole", "claude", 0) / "claude.json"
     target.write_text(ChunkReview(**reviews[0].model_dump(), requests=[]).model_dump_json())
     calls = []
     monkeypatch.setattr(work, "call_model", lambda *args: calls.append(args))
+    monkeypatch.setattr(consolidation, "call_model", lambda *args: calls.append(args))
     monkeypatch.setattr(sys, "argv", ["review", "consolidate", "--directory", str(tmp_path)])
     # Reject rather than discard the finding or pay for a useless consolidation.
     with pytest.raises(SystemExit) as error:
@@ -213,6 +218,7 @@ def test_chunked_cli_handoff_uses_manifest_and_large_consolidation_contract(
     server = Server()
     server.files = [{"filename": f.filename, "patch": f.patch} for f in context.files]
     monkeypatch.setattr(work, "call_model", fake_model)
+    monkeypatch.setattr(consolidation, "call_model", fake_model)
     monkeypatch.setattr(cli, "GitHub", lambda token: server.gh)
     monkeypatch.setenv("AI_REVIEWER_TOKEN", "fixture-token")
     # Run all downstream commands, then require exactly one completed publication.

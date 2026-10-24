@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_reviewer import cli, work
+from ai_reviewer import cli, consolidation, work
 from ai_reviewer.contracts import FinalConsolidation
 from ai_reviewer.github import publish
 from tests.test_github import Server, bundle
@@ -48,6 +48,7 @@ def test_selected_providers_complete_pipeline(
         fake_model(role, payload, directory, **kwargs)
 
     monkeypatch.setattr(work, "call_model", model)
+    monkeypatch.setattr(consolidation, "call_model", model)
     work.review_chunks(context, tmp_path)
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest["providers"] == expected
@@ -59,8 +60,8 @@ def test_selected_providers_complete_pipeline(
     covered = work.load_reviews(context, tmp_path)
     assert len(covered.reviews) == len(calls)
     # Force summary reduction too, exercising the second consolidation stage.
-    monkeypatch.setattr(work, "CONSOLIDATION_BYTES", 1)
-    work.consolidate_chunks(context, tmp_path)
+    monkeypatch.setattr(consolidation, "CONSOLIDATION_BYTES", 1)
+    consolidation.consolidate_chunks(context, tmp_path)
     assert set(calls) == {*expected, compiler}
     assert (tmp_path / "consolidation-summaries" / "0" / f"{compiler}.json").exists()
     server = Server()
@@ -122,12 +123,13 @@ def test_configured_failure_never_reduces_required_coverage(
         fake_model(selected, payload, directory, **kwargs)
 
     monkeypatch.setattr(work, "call_model", model)
+    monkeypatch.setattr(consolidation, "call_model", model)
     with pytest.raises((ValueError, RuntimeError)):
         work.review_chunks(context, tmp_path)
     monkeypatch.delenv("ANTHROPIC_API_KEY")
     monkeypatch.delenv("OPENAI_API_KEY")
     with pytest.raises((ValueError, OSError)):
-        work.consolidate_chunks(context, tmp_path)
+        consolidation.consolidate_chunks(context, tmp_path)
     assert not (tmp_path / "consolidate.json").exists()
     if during_preflight:
         assert generated == []
@@ -166,3 +168,37 @@ def test_missing_dual_provider_evidence_cannot_be_reinterpreted(
     monkeypatch.delenv("OPENAI_API_KEY")
     with pytest.raises((ValueError, OSError)):
         work.load_reviews(context, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "key,compiler", [("OPENAI_API_KEY", "luna"), ("ANTHROPIC_API_KEY", "haiku")]
+)
+def test_consolidation_uses_only_the_validated_provider_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    key: str,
+    compiler: str,
+) -> None:
+    """Removing the manifest after canonical validation cannot change consolidation routing."""
+    from ai_reviewer.contracts import CoveredReviews, ReviewContext
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv(key, "synthetic-key")
+    monkeypatch.setattr(work, "call_model", fake_model)
+    monkeypatch.setattr(consolidation, "call_model", fake_model)
+    context = bundle(Server())[0]
+    work.review_chunks(context, tmp_path)
+
+    def load_once(snapshot: ReviewContext, directory: Path) -> CoveredReviews:
+        """Return real validated coverage, then remove its no-longer-needed manifest."""
+        covered = work.load_reviews(snapshot, directory)
+        (directory / "manifest.json").unlink()
+        return covered
+
+    monkeypatch.setattr(consolidation, "load_reviews", load_once)
+    consolidation.consolidate_chunks(context, tmp_path)
+    assert (tmp_path / "consolidation" / "0" / f"{compiler}.json").is_file()
+    result = FinalConsolidation.model_validate_json((tmp_path / "consolidate.json").read_text())
+    assert result.groups == []
+    assert result.summary == "Assessments agree."

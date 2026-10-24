@@ -23,6 +23,14 @@ from ai_reviewer.limits import (
 )
 from ai_reviewer.patch import diff_lines
 
+Provider = Literal["claude", "openai"]
+# Only canonical nonempty selections are accepted in persisted run manifests.
+Providers = (
+    tuple[Literal["claude"]]
+    | tuple[Literal["openai"]]
+    | tuple[Literal["claude"], Literal["openai"]]
+)
+
 
 class Contract(BaseModel):
     """Reject unexpected fields at artifact and model boundaries."""
@@ -281,12 +289,14 @@ class CoveredReviews(Contract):
     application data, not an unforgeable capability or accepted wire format.
 
     Attributes:
+        providers: Validated canonical reviewer set from the run manifest.
         reviews: Complete reports in stable assignment/provider order for source IDs.
         independent_summaries: Explicit whole-review identity and original assessments.
         snapshot: Hash binding these reports to the captured context's exact JSON.
         summary: Human-readable coverage statement; not evidence of model understanding.
     """
 
+    providers: Providers
     reviews: list[Review]
     independent_summaries: list[IndependentSummary]
     snapshot: str

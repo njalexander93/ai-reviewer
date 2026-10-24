@@ -4,7 +4,7 @@ Every provider attempt has an isolated artifact directory. The manifest records
 the enabled providers and planned work before generation starts. Downstream stages
 replay the plan and source requests against the captured snapshot before accepting
 any completed report.
-Pure integration planning also lives here; only execution/consolidation call models.
+Pure integration planning also lives here; only review execution calls models.
 No repository code runs. Failures preserve evidence but prevent partial approval.
 """
 
@@ -27,37 +27,27 @@ from ai_reviewer.contracts import (
     AnchorIndex,
     ChunkReview,
     CompletedReview,
-    Consolidation,
     Contract,
     CoveredReviews,
-    FinalConsolidation,
-    Group,
     IndependentSummary,
+    Provider,
+    Providers,
     Review,
     ReviewContext,
     SourceRequest,
     compile_anchors,
-    reconcile,
-    source_findings,
     validate_anchors,
 )
 from ai_reviewer.diagnostics import report_failure
 from ai_reviewer.limits import (
     CAPACITY_PACKET_BYTES,
-    CONSOLIDATION_BYTES,
     MAX_ATTEMPTS,
-    MAX_CONSOLIDATION_CALLS,
-    MAX_FINDINGS,
     MAX_RELATIONS,
-    MAX_SUMMARY_CALLS,
     MAX_WORK,
-    SUMMARY_PAGE_SIZE,
 )
 from ai_reviewer.models import (
     AssignmentKind,
     CapacityError,
-    Provider,
-    Providers,
     Role,
     call_model,
     configured_providers,
@@ -147,6 +137,15 @@ class Manifest(Contract):
     results: list[Completion]
 
 
+def plan_digest(planned: Plan, providers: Providers) -> str:
+    """Hash the exact plan and canonical required reviewers using the replay wire format.
+
+    Both inputs remain unchanged. The digest binds snapshot, packet policy and provider
+    selection; execution and replay must use this same serialization.
+    """
+    return digest(encode({"plan": planned.model_dump(), "providers": providers}))
+
+
 def local_assignments(context: ReviewContext, planned: Plan) -> list[Assignment]:
     """Create initial work from a plan for the same immutable context.
 
@@ -201,7 +200,7 @@ def integration_assignments(
     context: ReviewContext,
     planned: Plan,
     local: dict[tuple[str, str], Review],
-    providers: Providers = ("claude", "openai"),
+    providers: Providers,
 ) -> list[Assignment]:
     """Plan actual-source checks across visible relationships and every local scope.
 
@@ -211,8 +210,8 @@ def integration_assignments(
     Args:
         context: Immutable snapshot supplying captured reference source.
         planned: Matching local plan, metadata, relationships and packet ceiling.
-        providers: Canonical required reviewer set, matching the run manifest.
         local: Completed reports keyed by every (chunk ID, provider) pair.
+        providers: Canonical required reviewer set, matching the run manifest.
 
     Returns:
         Deterministically ordered per-chunk, cross-chunk and required page assignments.
@@ -853,7 +852,7 @@ def review_chunks(context: ReviewContext, directory: Path) -> None:
     # Bind required work to the chosen plan and compile shared coordinates once.
     manifest = Manifest(
         providers=providers,
-        plan_digest=digest(encode({"plan": planned.model_dump(), "providers": providers})),
+        plan_digest=plan_digest(planned, providers),
         packet_bytes=planned.packet_bytes,
         assignments=[],
         results=[],
@@ -889,9 +888,7 @@ def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
     # Rebuild the plan from persisted policy and require its exact snapshot binding.
     manifest = Manifest.model_validate_json((directory / "manifest.json").read_text())
     planned = plan(context, packet_bytes=manifest.packet_bytes)
-    if manifest.plan_digest != digest(
-        encode({"plan": planned.model_dump(), "providers": manifest.providers})
-    ):
+    if manifest.plan_digest != plan_digest(planned, manifest.providers):
         raise ValueError("Coverage plan does not match the captured snapshot")
     anchors = compile_anchors(context)
     local = local_assignments(context, planned)
@@ -910,6 +907,7 @@ def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
     )
     # Flatten only after replay succeeds; carry explicit identity for presentation.
     return CoveredReviews(
+        providers=manifest.providers,
         reviews=[reports[key] for key in keys],
         snapshot=planned.snapshot,
         independent_summaries=[
@@ -927,91 +925,3 @@ def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
         "Exact section ownership and follow-up evidence are in the workflow coverage manifest. "
         "Completion does not establish model understanding.",
     )
-
-
-def consolidate_chunks(context: ReviewContext, directory: Path) -> None:
-    """Group original findings and reduce assessments through bounded consolidator calls.
-
-    Args:
-        context: Snapshot used to validate coverage before any consolidation call.
-        directory: Run root with complete review artifacts and no consolidation directories.
-
-    Raises:
-        ValueError: Coverage fails, prior consolidation artifacts exist, call budgets
-            are exhausted, or consolidator drops, duplicates or invents source IDs.
-        Exception: Provider and filesystem failures propagate with available usage retained.
-
-    Writes per-call artifacts, consolidate.json and coverage.txt. Cross-batch duplicate
-    findings remain separate. Original finding text and severity are never replaced;
-    summary semantic fidelity depends on the model, not the partition checks.
-    """
-    # Reject retries that would overwrite earlier cost evidence; replay coverage first.
-    if any((directory / name).exists() for name in ("consolidation", "consolidation-summaries")):
-        raise ValueError("Consolidation requires fresh artifacts; earlier usage must be retained")
-    covered = load_reviews(context, directory)
-    manifest = Manifest.model_validate_json((directory / "manifest.json").read_text())
-    consolidator: Role = "haiku" if "claude" in manifest.providers else "luna"
-    reports = covered.reviews
-    sources = source_findings(reports)
-    items = list(sources.items())
-    groups: list[Group] = []
-    summaries = [r.summary for r in reports]
-    # Bound each consolidation call by bytes and source count, retaining global IDs.
-    batches: list[dict[str, Any]] = []
-    batch: dict[str, Any] = {}
-    for key, finding in items:
-        trial = {**batch, key: finding.model_dump()}
-        if (
-            len(trial) > MAX_FINDINGS
-            or len(encode({"sources": trial}).encode()) > CONSOLIDATION_BYTES
-        ):
-            batches.append(batch)
-            batch = {}
-        batch[key] = finding.model_dump()
-    if batch or not batches:
-        batches.append(batch)
-    if len(batches) > MAX_CONSOLIDATION_CALLS:
-        raise ValueError("Consolidation work budget exceeded")
-    # Small reviews carry original assessments in their single grouping call.
-    combined = encode({"sources": batches[0], "reviews": summaries})
-    include_summaries = len(batches) == 1 and len(combined.encode()) <= CONSOLIDATION_BYTES
-    if include_summaries:
-        summaries = []
-    # Validate an exact source partition after each paid grouping call.
-    for index, sources_batch in enumerate(batches):
-        target = directory / "consolidation" / str(index)
-        payload = combined if include_summaries else encode({"sources": sources_batch})
-        call_model(consolidator, payload, target)
-        result = Consolidation.model_validate_json((target / f"{consolidator}.json").read_text())
-        flattened = [key for group in result.groups for key in group.source_ids]
-        if sorted(flattened) != sorted(sources_batch):
-            raise ValueError("Consolidation lost or duplicated original findings")
-        groups.extend(result.groups)
-        summaries.append(result.summary)
-    # Summarize bounded pages of original assessments and grouping results. No finding
-    # text is rewritten; explicit disagreements must survive every summary round.
-    summary_calls = 0
-    while len(summaries) > 1:
-        reduced = []
-        for start in range(0, len(summaries), SUMMARY_PAGE_SIZE):
-            target = directory / "consolidation-summaries" / str(summary_calls)
-            summary_calls += 1
-            if summary_calls > MAX_SUMMARY_CALLS:
-                raise ValueError("Summary work budget exceeded")
-            call_model(
-                consolidator,
-                encode({"sources": {}, "reviews": summaries[start : start + SUMMARY_PAGE_SIZE]}),
-                target,
-            )
-            result = Consolidation.model_validate_json(
-                (target / f"{consolidator}.json").read_text()
-            )
-            if result.groups:
-                raise ValueError("Summary pass invented findings")
-            reduced.append(result.summary)
-        summaries = reduced
-    # Reconcile globally before writing the one publishable consolidation result.
-    result = FinalConsolidation(summary=summaries[0], groups=groups)
-    reconcile(reports, result)
-    (directory / "consolidate.json").write_text(result.model_dump_json())
-    (directory / "coverage.txt").write_text(covered.summary)

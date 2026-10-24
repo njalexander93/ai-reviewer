@@ -34,6 +34,7 @@ def publish(
 
     # Construct internal loader-shaped data to isolate adapter behavior.
     covered = CoveredReviews(
+        providers=("claude", "openai"),
         reviews=reports,
         independent_summaries=[
             IndependentSummary(assignment="whole", provider=role, summary=report.summary)
@@ -673,6 +674,7 @@ def test_summary_provider_labels_follow_explicit_identity() -> None:
     server = Server()
     context, reports, result = bundle(server)
     covered = CoveredReviews(
+        providers=("claude", "openai"),
         reviews=reports,
         snapshot=digest(context.model_dump_json()),
         summary="Fixture coverage",
