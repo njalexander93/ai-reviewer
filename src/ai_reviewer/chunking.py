@@ -2,7 +2,7 @@
 
 Units own contiguous original patch records exactly once. Source excerpts retain
 Git line coordinates; additional source can only come from the same snapshot.
-Shared metadata locates Python declarations for source requests across all packets.
+Shared metadata locates Python declarations and Markdown sections for source requests.
 No reviewed code is imported or executed. Coverage establishes work, not judgment.
 """
 
@@ -27,6 +27,7 @@ from ai_reviewer.limits import (
     PACKET_BYTES,
     UNIT_BYTES,
 )
+from ai_reviewer.markdown_navigation import section_index
 from ai_reviewer.patch import lines, walk_patch
 from ai_reviewer.serialization import digest, encode
 
@@ -323,6 +324,7 @@ def overview(context: ReviewContext) -> dict[str, Any]:
             "previous_filename": f.previous_filename,
             "status": f.status,
             "declarations": file_declarations(f),
+            **file_sections(f),
             "before_lines": f.before.count("\n")
             + int(bool(f.before) and not f.before.endswith("\n")),
             "after_lines": f.after.count("\n") + int(bool(f.after) and not f.after.endswith("\n")),
@@ -332,8 +334,25 @@ def overview(context: ReviewContext) -> dict[str, Any]:
     return data
 
 
+def file_sections(file: ChangedFile) -> dict[str, Any]:
+    """Return optional Markdown inventory fields using each captured version's path.
+
+    The indexer's status owns language selection, including renames between languages.
+    Unsupported files add no section field. This advisory index never feeds splitting.
+    """
+    indexes = {
+        "LEFT": section_index(file.previous_filename or file.filename, file.before),
+        "RIGHT": section_index(file.filename, file.after),
+    }
+    return (
+        {"sections": indexes}
+        if any(index["status"] != "unsupported_language" for index in indexes.values())
+        else {}
+    )
+
+
 def omit_navigation(data: dict[str, Any]) -> dict[str, Any]:
-    """Return an overview without advisory declaration fields, leaving data unchanged.
+    """Return an overview without advisory declaration/section fields, leaving data unchanged.
 
     Required inventory fields and all other overview metadata survive. The explicit
     truncated status reserves its full byte cost even before navigation is selected.
@@ -341,7 +360,7 @@ def omit_navigation(data: dict[str, Any]) -> dict[str, Any]:
     return {
         **data,
         "inventory": [
-            {key: value for key, value in item.items() if key != "declarations"}
+            {key: value for key, value in item.items() if key not in ("declarations", "sections")}
             for item in data["inventory"]
         ],
         "declaration_navigation": "truncated",
@@ -349,10 +368,10 @@ def omit_navigation(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def bound_navigation(data: dict[str, Any], byte_limit: int) -> dict[str, Any]:
-    """Project complete captured declarations into a bounded overview without mutation.
+    """Project captured declaration/section indexes into a bounded overview without mutation.
 
     data must contain the complete discovery result, never a previously truncated
-    projection. byte_limit caps added UTF-8 bytes across all declaration fields,
+    projection. byte_limit caps added UTF-8 bytes across all navigation fields,
     including field overhead. Required metadata survives unchanged. A truncated
     status means missing entries are unavailable, not proof of no declarations.
     """
@@ -360,25 +379,29 @@ def bound_navigation(data: dict[str, Any], byte_limit: int) -> dict[str, Any]:
     remaining = max(0, byte_limit)
     truncated = False
     for source, item in zip(data["inventory"], result["inventory"], strict=True):
-        navigation = source["declarations"]
-        # Admit side statuses first, then as many source-ordered entries as fit.
-        selected = {
-            side: {"status": index["status"], "entries": []} for side, index in navigation.items()
-        }
-        cost = len(encode({"declarations": selected}).encode()) - 1
-        if cost > remaining:
-            truncated = True
-            continue
-        remaining -= cost
-        item["declarations"] = selected
-        for side, index in navigation.items():
-            for entry in index["entries"]:
-                cost = len(encode(entry).encode()) + bool(selected[side]["entries"])
-                if cost > remaining:
-                    truncated = True
-                    break
-                selected[side]["entries"].append(entry)
-                remaining -= cost
+        for field in ("declarations", "sections"):
+            if field not in source:
+                continue
+            navigation = source[field]
+            # Admit side statuses first, then as many source-ordered entries as fit.
+            selected = {
+                side: {"status": index["status"], "entries": []}
+                for side, index in navigation.items()
+            }
+            cost = len(encode({field: selected}).encode()) - 1
+            if cost > remaining:
+                truncated = True
+                continue
+            remaining -= cost
+            item[field] = selected
+            for side, index in navigation.items():
+                for entry in index["entries"]:
+                    cost = len(encode(entry).encode()) + bool(selected[side]["entries"])
+                    if cost > remaining:
+                        truncated = True
+                        break
+                    selected[side]["entries"].append(entry)
+                    remaining -= cost
     result["declaration_navigation"] = "truncated" if truncated else "complete"
     return result
 
