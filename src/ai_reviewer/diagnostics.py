@@ -14,20 +14,43 @@ from pydantic_core import ErrorType
 from ai_reviewer.contracts import ChunkReview, Consolidation, ReviewContext, SourceRequest
 
 
-class IncompleteWithoutRequests(ValueError):
+class UnresolvedEvidence(ValueError):
+    """Carry safe diagnostic identity for reviews that cannot establish completion.
+
+    Attributes:
+        attempts: Parsed and anchor-validated report count, including this response.
+        reason: Fixed subclass-owned reason code, never provider text.
+    """
+
+    reason: str
+
+    def __init__(self, attempts: int, message: str) -> None:
+        """Retain the attempt count and an internal exception message."""
+        super().__init__(message)
+        self.attempts = attempts
+
+    def details(self) -> dict[str, Any]:
+        """Return source-free failure metadata for logs and artifacts."""
+        return {"category": "unresolved_evidence", "reason": self.reason, "attempts": self.attempts}
+
+
+class IncompleteWithoutRequests(UnresolvedEvidence):
     """Identify an incomplete response missing requests before budget exhaustion.
 
     Attributes:
         attempts: Parsed and anchor-validated report count, including this response.
     """
 
+    reason = "missing_source_requests"
+
     def __init__(self, attempts: int) -> None:
         """Retain the attempt count without copying untrusted provider prose."""
-        super().__init__("Required evidence unresolved: incomplete response has no source requests")
-        self.attempts = attempts
+        super().__init__(
+            attempts, "Required evidence unresolved: incomplete response has no source requests"
+        )
 
 
-class FollowupExhausted(ValueError):
+class FollowupExhausted(UnresolvedEvidence):
     """Identify incomplete work after the last allowed report.
 
     Attributes:
@@ -36,14 +59,15 @@ class FollowupExhausted(ValueError):
         request_count: Full outstanding count, before diagnostic truncation.
     """
 
+    reason = "followup_budget_exhausted"
+
     def __init__(self, attempts: int, requests: list[SourceRequest], paths: set[str]) -> None:
         """Retain at most 20 requests, accepting paths only from the captured snapshot.
 
         Long paths are truncated to 240 characters. Unknown paths are redacted.
         Requests and paths are read without mutation; no source is fetched.
         """
-        super().__init__("Required follow-up work exhausted")
-        self.attempts = attempts
+        super().__init__(attempts, "Required follow-up work exhausted")
         self.request_count = len(requests)
         self.requests = [
             {
@@ -54,6 +78,15 @@ class FollowupExhausted(ValueError):
             }
             for request in requests[:20]
         ]
+
+    def details(self) -> dict[str, Any]:
+        """Add bounded outstanding coordinates and completed rounds to safe metadata."""
+        return {
+            **super().details(),
+            "completed_followups": max(0, self.attempts - 1),
+            "outstanding_request_count": self.request_count,
+            "outstanding_requests": self.requests,
+        }
 
 
 def failure_details(error: Exception) -> dict[str, Any]:
@@ -67,17 +100,8 @@ def failure_details(error: Exception) -> dict[str, Any]:
     """
     # Admit only a class name and numeric HTTP status from generic exceptions.
     details: dict[str, Any] = {"error": type(error).__name__}
-    if isinstance(error, (FollowupExhausted, IncompleteWithoutRequests)):
-        details.update(category="unresolved_evidence", attempts=error.attempts)
-    if isinstance(error, IncompleteWithoutRequests):
-        details["reason"] = "missing_source_requests"
-    if isinstance(error, FollowupExhausted):
-        details.update(
-            reason="followup_budget_exhausted",
-            completed_followups=max(0, error.attempts - 1),
-            outstanding_request_count=error.request_count,
-            outstanding_requests=error.requests,
-        )
+    if isinstance(error, UnresolvedEvidence):
+        details.update(error.details())
     status = getattr(error, "status_code", None)
     if type(status) is int and 100 <= status <= 599:
         details["http_status"] = status

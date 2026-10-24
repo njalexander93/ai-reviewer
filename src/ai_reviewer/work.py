@@ -39,7 +39,12 @@ from ai_reviewer.contracts import (
     compile_anchors,
     validate_anchors,
 )
-from ai_reviewer.diagnostics import FollowupExhausted, IncompleteWithoutRequests, report_failure
+from ai_reviewer.diagnostics import (
+    FollowupExhausted,
+    IncompleteWithoutRequests,
+    UnresolvedEvidence,
+    report_failure,
+)
 from ai_reviewer.limits import (
     CAPACITY_PACKET_BYTES,
     MAX_ATTEMPTS,
@@ -735,7 +740,7 @@ def run_batch(
                 completion.attempts = future.result()
                 completion.status = "complete"
             except Exception as error:
-                if isinstance(error, (FollowupExhausted, IncompleteWithoutRequests)):
+                if isinstance(error, UnresolvedEvidence):
                     completion.attempts = error.attempts
                 report_failure(
                     error,

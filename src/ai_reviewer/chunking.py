@@ -324,19 +324,7 @@ def overview(context: ReviewContext) -> dict[str, Any]:
             "previous_filename": f.previous_filename,
             "status": f.status,
             "declarations": file_declarations(f),
-            **(
-                {
-                    "sections": {
-                        "LEFT": section_index(f.previous_filename or f.filename, f.before),
-                        "RIGHT": section_index(f.filename, f.after),
-                    }
-                }
-                if any(
-                    path.lower().endswith((".md", ".markdown"))
-                    for path in (f.filename, f.previous_filename or "")
-                )
-                else {}
-            ),
+            **file_sections(f),
             "before_lines": f.before.count("\n")
             + int(bool(f.before) and not f.before.endswith("\n")),
             "after_lines": f.after.count("\n") + int(bool(f.after) and not f.after.endswith("\n")),
@@ -344,6 +332,23 @@ def overview(context: ReviewContext) -> dict[str, Any]:
         for f in sorted(context.files, key=lambda f: f.filename)
     ]
     return data
+
+
+def file_sections(file: ChangedFile) -> dict[str, Any]:
+    """Return optional Markdown inventory fields using each captured version's path.
+
+    The indexer's status owns language selection, including renames between languages.
+    Unsupported files add no section field. This advisory index never feeds splitting.
+    """
+    indexes = {
+        "LEFT": section_index(file.previous_filename or file.filename, file.before),
+        "RIGHT": section_index(file.filename, file.after),
+    }
+    return (
+        {"sections": indexes}
+        if any(index["status"] != "unsupported_language" for index in indexes.values())
+        else {}
+    )
 
 
 def omit_navigation(data: dict[str, Any]) -> dict[str, Any]:
