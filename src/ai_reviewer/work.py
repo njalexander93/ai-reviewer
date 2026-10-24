@@ -21,6 +21,7 @@ from ai_reviewer.chunking import (
     PacketSizer,
     Plan,
     Unit,
+    omit_navigation,
     plan,
 )
 from ai_reviewer.contracts import (
@@ -38,7 +39,7 @@ from ai_reviewer.contracts import (
     compile_anchors,
     validate_anchors,
 )
-from ai_reviewer.diagnostics import report_failure
+from ai_reviewer.diagnostics import FollowupExhausted, report_failure
 from ai_reviewer.limits import (
     CAPACITY_PACKET_BYTES,
     MAX_ATTEMPTS,
@@ -109,8 +110,8 @@ class Completion(Contract):
         assignment: Planned assignment ID.
         role: Independent provider required to complete that assignment.
         status: Pending before execution; complete or failed after its future settles.
-        attempts: Successful run's persisted attempt count, at most MAX_ATTEMPTS.
-            Remains zero on failure even if partial attempt artifacts exist.
+        attempts: Validated report count for success or follow-up exhaustion, at most
+            MAX_ATTEMPTS. Zero on other failures means unknown, not no provider calls.
     """
 
     assignment: str
@@ -437,8 +438,9 @@ def integration_pages(assignment: Assignment, packet_bytes: int) -> list[Assignm
         packet_bytes: Maximum serialized UTF-8 bytes per returned payload.
 
     Returns:
-        The original assignment if it fits, otherwise ordered page-suffixed assignments
-        with identical owned sections. Every page requires every enabled provider.
+        The original assignment if it fits. Otherwise advisory navigation is omitted
+        before report paging; every page retains identical required source and owned
+        sections and requires every enabled provider. The input assignment remains unchanged.
 
     Raises:
         ValueError: Invalid JSON or source plus one indivisible atom exceeds the ceiling.
@@ -449,6 +451,12 @@ def integration_pages(assignment: Assignment, packet_bytes: int) -> list[Assignm
     if len(assignment.payload.encode()) <= packet_bytes:
         return [assignment]
     base = json.loads(assignment.payload)
+    # Navigation must yield to source and reports before creating more required work.
+    if "overview" in base:
+        base["overview"] = omit_navigation(base["overview"])
+    serialized = encode(base)
+    if len(serialized.encode()) <= packet_bytes:
+        return [assignment.model_copy(update={"payload": serialized})]
     atoms = base.pop("reports")
     pages = []
     pending: list[dict[str, Any]] = []
@@ -523,6 +531,7 @@ def followup_payload(
 
     Returns:
         JSON for the next provider call without mutating history or assignment.
+        Advisory navigation is omitted if needed; required evidence is never removed.
 
     Raises:
         ValueError: Original JSON is invalid, a requested range is unavailable, or
@@ -532,8 +541,12 @@ def followup_payload(
     payload = json.loads(assignment.payload)
     payload["prior_attempts"] = [r.model_dump() for r in history]
     payload["requested_source"] = source_sections(context, [q for r in history for q in r.requests])
-    # Reject the entire continuation if required evidence cannot fit.
+    # Prefer all requested evidence over advisory navigation on a full continuation.
     serialized = encode(payload)
+    if len(serialized.encode()) > packet_bytes and "overview" in payload:
+        payload["overview"] = omit_navigation(payload["overview"])
+        serialized = encode(payload)
+    # Reject the entire continuation if required evidence still cannot fit.
     if len(serialized.encode()) > packet_bytes:
         raise ValueError("Required follow-up context exceeds packet budget")
     return serialized
@@ -570,8 +583,9 @@ def advance(
         Parsed report and next JSON payload, or None for the payload when complete.
 
     Raises:
+        FollowupExhausted: The final allowed report still requests required evidence.
         ValueError: Schema or anchors are invalid, completion conflicts with requests,
-            incomplete work has no request, attempts are exhausted, requested source
+            incomplete work has no request, requested source
             is unavailable, or the continuation exceeds the packet ceiling.
     """
     # Parse and anchor-check before interpreting a provider completion claim.
@@ -586,7 +600,9 @@ def advance(
     if not report.requests:
         raise ValueError("Required context unresolved")
     if len(history) + 1 >= MAX_ATTEMPTS:
-        raise ValueError("Required follow-up work exhausted")
+        raise FollowupExhausted(
+            len(history) + 1, report.requests, {file.filename for file in context.files}
+        )
     return report, followup_payload(context, assignment, [*history, report], packet_bytes)
 
 
@@ -620,8 +636,10 @@ def run_assignment(
     """
     history: list[ChunkReview] = []
     payload = assignment.payload
-    # Persist exact input before each paid call, then use the shared replay transition.
-    for round_ in range(MAX_ATTEMPTS):
+    # The shared transition enforces the attempt bound for execution and replay.
+    # Persist exact input before each paid call.
+    while True:
+        round_ = len(history)
         target = attempt_directory(directory, assignment.id, role, round_)
         target.mkdir(parents=True, exist_ok=True)
         (target / "payload.json").write_text(payload)
@@ -642,7 +660,6 @@ def run_assignment(
         if next_payload is None:
             return len(history)
         payload = next_payload
-    raise ValueError("Required follow-up work exhausted")
 
 
 def save_manifest(directory: Path, manifest: Manifest) -> None:
@@ -681,7 +698,8 @@ def run_batch(
         OSError: Manifest persistence fails; already-started workers still finish.
 
     Work is recorded before submission. Worker errors are logged and converted to
-    failed completions; queued work is not cancelled after a failure. All in-flight
+    failed completions with best-effort failure.json diagnostics. Exhaustion preserves
+    its validated report count; queued work is not cancelled after a failure. All in-flight
     calls finish so available usage is retained before the batch can fail.
     """
     # Record the full required batch before any provider can start spending.
@@ -717,8 +735,15 @@ def run_batch(
                 completion.attempts = future.result()
                 completion.status = "complete"
             except Exception as error:
+                if isinstance(error, FollowupExhausted):
+                    completion.attempts = error.attempts
                 report_failure(
-                    error, assignment=completion.assignment, role=completion.role, phase="worker"
+                    error,
+                    attempt_directory(directory, completion.assignment, completion.role, 0).parent
+                    / "failure.json",
+                    assignment=completion.assignment,
+                    role=completion.role,
+                    phase="worker",
                 )
                 completion.status = "failed"
                 failed = True

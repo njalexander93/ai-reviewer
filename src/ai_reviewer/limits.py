@@ -10,6 +10,8 @@ These are rejection thresholds, not promises that every maximum-sized run fits.
 PACKET_BYTES = 600_000
 UNIT_BYTES = 160_000
 CHUNK_BYTES = 420_000
+# Advisory declaration fields across a packet; source evidence keeps priority.
+NAVIGATION_BYTES = 16_000
 CAPACITY_PACKET_BYTES = 200_000
 CONSOLIDATION_BYTES = 200_000
 MAX_CHUNKS = 64
