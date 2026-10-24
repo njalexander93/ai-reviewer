@@ -157,7 +157,8 @@ the run, as do schema, completeness and coverage errors. No correction call is m
 
 The exact response remains in `work/<assignment>/<provider>/<attempt>/<provider>.json`.
 `rejected-findings.json` beside it records each rejected finding, its zero-based
-index in that response and the validation reason. Accepted findings retain their
+index in that response and the validation reason. These diagnostics are saved before
+completion and continuation checks, including attempts that later fail. Accepted findings retain their
 original order, wording and severity. Replay derives the same selection from the
 raw response; the diagnostic sidecar is not trusted as review input. An affected
 report's summary is replaced with a neutral completion/context statement so its
