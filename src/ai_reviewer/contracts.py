@@ -23,6 +23,14 @@ from ai_reviewer.limits import (
 )
 from ai_reviewer.patch import diff_lines
 
+Provider = Literal["claude", "openai"]
+# Only canonical nonempty selections are accepted in persisted run manifests.
+Providers = (
+    tuple[Literal["claude"]]
+    | tuple[Literal["openai"]]
+    | tuple[Literal["claude"], Literal["openai"]]
+)
+
 
 class Contract(BaseModel):
     """Reject unexpected fields at artifact and model boundaries."""
@@ -103,7 +111,7 @@ class Group(Contract):
 
 
 class Consolidation(Contract):
-    """Hold Sonnet's summary and proposed partition of original findings.
+    """Hold the consolidator's summary and proposed partition of original findings.
 
     Attributes:
         summary: Combined assessment; it does not control the approval verdict.
@@ -116,7 +124,7 @@ class Consolidation(Contract):
 
 
 class FinalConsolidation(Consolidation):
-    """Hold bounded batches after each Sonnet response preserves its source partition."""
+    """Hold bounded batches after each consolidator response preserves its source partition."""
 
     # Aggregate partition across bounded batches; summary retains Consolidation semantics.
     groups: list[Group] = Field(max_length=MAX_FINAL_GROUPS)
@@ -222,11 +230,11 @@ def source_findings(reviews: list[Review]) -> dict[str, Finding]:
         Original findings keyed by zero-based review:finding IDs.
 
     Raises:
-        ValueError: Fewer than two reports are supplied or a report is incomplete.
+        ValueError: No reports are supplied or a report is incomplete.
             Exact assignment/provider coverage is enforced by load_reviews, not here.
     """
     # Enforce the same completeness boundary before consolidation and publication.
-    if len(reviews) < 2 or not all(review.complete for review in reviews):
+    if not reviews or not all(review.complete for review in reviews):
         raise ValueError("Incomplete review; approval prohibited")
     # Index original objects once for both the payload and reconciliation contract.
     return {
@@ -241,7 +249,7 @@ def reconcile(reviews: list[Review], result: Consolidation) -> list[list[Finding
 
     Args:
         reviews: Complete reports in deterministic assignment/provider order.
-        result: Proposed duplicate groups from Sonnet.
+        result: Proposed duplicate groups from the consolidator.
 
     Returns:
         Original findings grouped for publication, with their severity unchanged.
@@ -281,12 +289,14 @@ class CoveredReviews(Contract):
     application data, not an unforgeable capability or accepted wire format.
 
     Attributes:
+        providers: Validated canonical reviewer set from the run manifest.
         reviews: Complete reports in stable assignment/provider order for source IDs.
         independent_summaries: Explicit whole-review identity and original assessments.
         snapshot: Hash binding these reports to the captured context's exact JSON.
         summary: Human-readable coverage statement; not evidence of model understanding.
     """
 
+    providers: Providers
     reviews: list[Review]
     independent_summaries: list[IndependentSummary]
     snapshot: str

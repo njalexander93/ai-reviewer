@@ -1,20 +1,37 @@
 # AI Reviewer
 
-Two independent PR reviews: **Claude Opus 5.5** and **GPT-6.1 Sol**, both at medium
-reasoning effort. **Claude Sonnet 5.5** groups duplicate findings and writes the
-summary. One configurable GitHub account submits the review and inline threads.
+Review with the providers whose API keys are configured. All models use **medium**
+reasoning effort. One GitHub account publishes the validated result.
 
-```mermaid
-flowchart LR
-    PR[Published or updated PR] --> Context[Capture diff and request reviewer]
-    Context --> Claude[Opus 5.5 · medium]
-    Context --> OpenAI[GPT-6.1 Sol · medium]
-    Claude --> Sonnet[Sonnet 5.5 · consolidate]
-    OpenAI --> Sonnet
-    Sonnet --> Validate[Validate findings and current revision]
-    Validate --> Publish[Request changes or approve]
-    Publish --> Costs[Print cost breakdown in Actions logs]
-```
+| Configured keys | Independent reviewers | Consolidation |
+| --- | --- | --- |
+| OpenAI only | GPT-6.1 Sol | GPT-6 Luna |
+| Anthropic only | Claude Opus 5.5 | Claude Haiku 5.5 |
+| Both | Opus 5.5 and GPT-6.1 Sol | Haiku 5.5 |
+| Neither | Configuration error before provider calls | None |
+
+Missing, empty and whitespace-only keys are unconfigured. A nonblank invalid key
+remains configured: authentication, credit and other provider failures fail the run.
+They never downgrade required coverage. There is no provider-mode setting.
+
+The manifest records the enabled set and binds it into the plan digest. Replay and
+publication use that set, never current credentials or the artifacts that happen to
+exist. Every enabled reviewer must finish every required assignment and follow-up.
+Older manifests without this selection are rejected; run artifacts are not migrated.
+
+Model IDs and settings verified on **2026-10-24**:
+[`gpt-6.1-sol`](https://developers.openai.com/api/docs/models/gpt-6.1-sol) and
+[`gpt-6-luna`](https://developers.openai.com/api/docs/models/gpt-6-luna) use
+`reasoning={"effort": "medium"}` through Responses.
+[`claude-opus-5-5`](https://platform.claude.com/docs/en/models/overview) and
+[`claude-haiku-5-5`](https://platform.claude.com/docs/en/models/haiku-5-5/overview)
+use `thinking={"type": "adaptive"}` and `output_config={"effort": "medium"}`.
+`models.py` owns the role-to-provider/model/pricing table. The canonical coverage
+loader carries the validated provider set into `consolidation.py`; consolidation
+does not reread the manifest.
+
+Both consolidation stages use the selected cheaper model and the same validated
+finding-partition contract. Lower prices do not establish equivalent summary quality.
 
 ## Install in a repository
 
@@ -26,10 +43,13 @@ flowchart LR
 
    | Secret | Value |
    | --- | --- |
-   | `ANTHROPIC_API_KEY` | Anthropic API key with access to both Claude models |
-   | `OPENAI_API_KEY` | OpenAI API key with access to GPT-6.1 Sol |
+   | `ANTHROPIC_API_KEY` | Optional; access to Opus 5.5 and Haiku 5.5 |
+   | `OPENAI_API_KEY` | Optional; access to GPT-6.1 Sol and GPT-6 Luna |
    | `AI_REVIEWER_TOKEN` | Reviewer's GitHub personal access token |
    | `LINEAR_API_KEY` (optional) | Linear personal API key with read access to relevant issues |
+
+   Configure at least one model-provider key. Keep the forwarding entries for both;
+   an unset optional secret passes an empty value.
 
 3. Copy [the caller workflow](examples/ai-review.yml) into the target repository
    as `.github/workflows/ai-review.yml`. Replace both `REVIEWER_RELEASE_COMMIT_SHA` placeholders with the same reviewed,
@@ -62,9 +82,9 @@ insufficient.
 - Same-repository PRs run automatically. Fork PRs require a maintainer to select
   **Run workflow** and enter the PR number. Draft, closed and reviewer-authored
   PRs are rejected. Requests serialize per repository and PR.
-- Small packets retain two independent whole-packet reviews with complete before/after
+- Small packets retain one whole-packet review per enabled provider with complete before/after
   text. Both sizes use the same manifest, source validation and consolidation flow.
-  Larger snapshots use deterministic chunks and two reviews of every required
+  Larger snapshots use deterministic chunks and one review per enabled provider of every required
   local/integration assignment. Each packet includes PR metadata, the full issue
   requirements, a changed-file inventory and relevant previous inline discussion.
   Before versions come from the merge base, matching the PR diff.
@@ -73,7 +93,7 @@ insufficient.
 - The imported [thermo-nuclear review skill](src/ai_reviewer/prompts/review.md)
   supplies the structural quality standard. Correctness and security findings
   also count. Models must report insufficient context explicitly.
-- Sonnet sees completed reports and findings in bounded batches. It must preserve every finding exactly
+- The consolidator sees completed reports and findings in bounded batches. It must preserve every finding exactly
   once. Original wording and explicit severity labels remain in feedback. Different
   locations receive separate threads; large groups split between findings at a
   conservative 60,000 UTF-8 byte limit per inline comment.
@@ -87,7 +107,7 @@ insufficient.
 ## Issue context
 
 Each preparation collects issue titles, descriptions, states and source URLs once
-and passes the same snapshot to both reviewers. Neither provider needs an issue:
+and passes the same snapshot to enabled reviewers. Neither provider needs an issue:
 GitHub only, Linear only, both and neither are supported. Duplicate references
 within a provider produce one issue record.
 
@@ -114,7 +134,7 @@ within a provider produce one issue record.
   workflow token may not access issues in another private repository.
 
 Issue contents are untrusted requirements, not reviewer instructions. Linear
-content is sent to both model providers and saved in the calling repository's
+content is sent to configured model providers and saved in the calling repository's
 review artifacts. Use a key scoped to data appropriate for that repository;
 review feedback may quote issue requirements.
 
@@ -147,8 +167,8 @@ does not change the reviewer executing against that PR.
 
 The workflow checks out only its pinned reviewer implementation. It reads PR
 content through GitHub's API and never executes PR code, installs its packages,
-or exposes shell tools to models. One job performs setup once and runs both independent reviews concurrently in a
-single step. Both provider API keys are available to that step; only preparation
+or exposes shell tools to models. One job performs setup once and runs enabled independent reviews concurrently in a
+single step. Configured provider API keys are available to that step; only preparation
 and publication receive the reviewer credential. All stages share the runner and
 workspace, so step-scoped environment variables are not a sandbox boundary.
 
@@ -185,12 +205,12 @@ replace the old 80-file and 150 KB per-version rejection.
    leaving 180,000 bytes for required follow-ups under the 600,000-byte ceiling.
    Indivisible oversized lines or required metadata fail explicitly; nothing is
    silently removed to fit.
-4. Run Opus and Sol, both at medium effort, on every chunk with **two concurrent
+4. Run each enabled reviewer at medium effort on every chunk with **two concurrent
    workers** in the same Actions job. Each provider can request up to eight source
    ranges per response from the captured changed files. Allow two follow-up rounds.
    All earlier findings and requested source remain available. Unresolved context,
    an unavailable range or an oversized follow-up makes the run incomplete.
-5. Both providers perform integration passes with actual source and reports.
+5. Enabled providers perform integration passes with actual source and reports.
    Every chunk gets an integration pass. Additional packets join direct references,
    source/test pairs and neighboring directory/file sections across chunks. Direct
    references come from full captured blobs, with their actual source lines included
@@ -203,9 +223,9 @@ replace the old 80-file and 150 KB per-version rejection.
    full payloads stay in attempt artifacts. Reports are keyed by assignment and
    provider. Compile immutable diff anchors once per stage and reuse them across
    workers and replay. Whole, local and integration assignments receive explicit
-   scope instructions with the same source-request contract. Require both providers for all assignments and all follow-ups.
+   scope instructions with the same source-request contract. Require every enabled provider for all assignments and all follow-ups.
    Coverage proves assignment/completion; it does not prove model understanding.
-7. Sonnet groups up to 40 original findings per batch with global source IDs.
+7. The consolidator groups up to 40 original findings per batch with global source IDs.
    All findings, locations and severity survive exactly once. Cross-batch duplicate
    findings remain separate. Bounded summary passes carry original assessments
    and disagreements into one overview. Publication submits **one GitHub review**.
@@ -218,7 +238,7 @@ and [Sol 1.05M context](https://developers.openai.com/api/docs/models/gpt-6.1-so
 and stays below Sol's 272k long-context price threshold. Bytes are not converted
 into guessed tokens. See [Claude token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting)
 and [OpenAI token counting](https://developers.openai.com/api/docs/guides/token-counting).
-Count both provider inputs for every planned local scope before either generates
+Count every enabled provider input for every planned local scope before any reviewer generates
 a report, including packets already routed to chunks.
 If any exceeds capacity, re-plan with a 200,000-byte ceiling for every review
 packet, including integration pages and follow-ups. Local chunks target half that
@@ -234,10 +254,10 @@ Operational defaults are deliberate finite safeguards, not performance optima:
 | --- | --- | --- |
 | Collection | 3,000 files; 8 MB/blob; 32 MB snapshot; 10,000 API requests/client; 20,000 direct relations | Bound fetching and memory while admitting both historical examples |
 | Local planning | 64 chunks | Bound partition growth |
-| Local + integration work | 128 assignments, each reviewed by both providers | Bound relationship expansion and spending |
+| Local + integration work | 128 assignments, each reviewed by all enabled providers | Bound relationship expansion and spending |
 | Follow-ups | 3 total attempts/provider/assignment | Resolve missing evidence without an open-ended loop |
 | Provider output | 40 findings and 60,000 serialized bytes/attempt | Bound report handling and integration input |
-| Sonnet work | 128 finding batches + 128 summary calls | Bound aggregate consolidation |
+| Consolidation work | 128 finding batches + 128 summary calls | Bound aggregate consolidation |
 | Publication | 1,000 comments; 8 MB comment payload; 60,000-byte body | Fail before any oversized or partial review write |
 | Job | 2 workers; 180 minutes; no automatic API retries | Bound concurrency and execution time |
 
@@ -267,18 +287,21 @@ secrets. The CLI deliberately suppresses provider exception bodies.
 ## Cost reporting
 
 The final **Report API costs** step reads every nested attempt artifact and prints
-Opus, Sol and Sonnet estimates, Claude/OpenAI
+Opus, Sol, Haiku and Luna estimates, Claude/OpenAI
 subtotals and a combined total. It runs after success or failure. An attempted
 call with unavailable usage is **unknown**, never silently counted as free. A
 stage never attempted is reported as **not run ($0)**. Review comments contain
 no cost accounting.
 
 Estimates use provider-reported input, output and cache token counts. Rates are
-recorded in [models.py](src/ai_reviewer/models.py), checked on **2026-10-23** against
+recorded in [models.py](src/ai_reviewer/models.py), checked on **2026-10-24** against
 [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) and
 [OpenAI pricing](https://developers.openai.com/api/docs/pricing). They exclude tax,
 credits and GitHub Actions charges. Update rates when provider pricing changes;
-provider billing remains authoritative. Configure spending limits in each API
+provider billing remains authoritative. Haiku uses its 5x long-prompt rates when
+fresh + cached + cache-write input exceeds 100,000 tokens. The shared 250,000-token
+input ceiling stays below the OpenAI long-prompt threshold. Per-attempt artifacts
+use `haiku` or `luna` names so costs follow the actual provider and model. Configure spending limits in each API
 project independently.
 
 ## Development

@@ -26,6 +26,7 @@ jobs:
       pr-number: ${{ github.event.pull_request.number || inputs.pr-number }}
       implementation-ref: REVIEWER_RELEASE_COMMIT_SHA
     secrets:
+      # Configure at least one provider key; an unset secret is passed as empty.
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       AI_REVIEWER_TOKEN: ${{ secrets.AI_REVIEWER_TOKEN }}
