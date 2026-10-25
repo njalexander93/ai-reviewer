@@ -673,3 +673,73 @@ def test_provider_tool_turn_exhaustion_fails_without_a_report(
         models.call_model("openai", "review", target, repository=repository)
     assert json.loads((target / "exhaustion.json").read_text())["reason"] == "turns"
     assert not (target / "openai.json").exists()
+
+
+@pytest.mark.parametrize(
+    "initial_count,continuation_count,turns", [(150_000, 250_000, 12), (150_001, 150_001, 1)]
+)
+def test_repository_token_headroom_is_reserved_before_generation(
+    tmp_path: Path, initial_count: int, continuation_count: int, turns: int
+) -> None:
+    """Reject oversized initial input unpaid; allow twelve full-sized planned turns."""
+    _, repository = make_repository(tmp_path)
+    generated: list[int] = []
+
+    def generate(current: int) -> int:
+        """Record each paid turn and return its ordinal as a synthetic response."""
+        generated.append(current)
+        return current
+
+    adapter = models.ProviderAdapter(
+        initial=0,
+        count=lambda current: initial_count if current == 0 else continuation_count,
+        generate=generate,
+        usage=lambda response: None,
+        calls=lambda response: (
+            [
+                (
+                    "list_repository_files",
+                    {"revision": "head", "path_prefix": "", "cursor": "0", "limit": 1},
+                    str(response),
+                )
+            ]
+            if response < turns - 1
+            else []
+        ),
+        continue_turn=lambda current, response, results: current + 1,
+        finish=lambda response: (response, True),
+    )
+    if initial_count > 150_000:
+        with pytest.raises(models.CapacityError):
+            models._run_provider_turns(
+                adapter,
+                payload="{}",
+                session=repository,
+                preflight=True,
+                usage_path=tmp_path / "usage.json",
+            )
+        assert generated == []
+    else:
+        result = models._run_provider_turns(
+            adapter,
+            payload="{}",
+            session=repository,
+            preflight=False,
+            usage_path=tmp_path / "usage.json",
+        )
+        assert result == (11, True)
+        assert generated == list(range(12))
+        assert repository.context_tokens == 2_900_000
+
+
+def test_openai_continuation_preserves_its_input_history() -> None:
+    """Appending a provider response returns new state without modifying prior input."""
+    history = [{"role": "user", "content": "source"}]
+    response = SimpleNamespace(output=[SDKItem(type="message", content="analysis")])
+    continued = models._append_openai_turn(history, response, [("call-1", "{}")])
+    assert history == [{"role": "user", "content": "source"}]
+    assert continued == [
+        *history,
+        {"type": "message", "content": "analysis"},
+        {"type": "function_call_output", "call_id": "call-1", "output": "{}"},
+    ]

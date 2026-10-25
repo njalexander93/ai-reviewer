@@ -150,7 +150,7 @@ class Server:
             data = {"tree": {"sha": ref}}
         elif "/git/trees/" in path:
             raw = b"first\nold\n" if path.endswith("c" * 40) else b"first\nnew\n"
-            blob = hashlib.sha1(b"blob 10\0" + raw).hexdigest()
+            blob = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
             data = {
                 "truncated": False,
                 "tree": [
@@ -161,7 +161,7 @@ class Server:
                         "sha": blob
                         if self.valid_repository_tree
                         else ("e" if path.endswith("c" * 40) else "d") * 40,
-                        "size": 10 if self.valid_repository_tree else self.content["size"],
+                        "size": len(raw) if self.valid_repository_tree else self.content["size"],
                     }
                 ],
             }

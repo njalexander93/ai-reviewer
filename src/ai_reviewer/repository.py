@@ -178,7 +178,6 @@ def capture_repository(gh: GitHub, context: ReviewContext, directory: Path) -> S
     }
     trees: dict[Revision, TreeSnapshot] = {}
     trees_by_commit: dict[str, TreeSnapshot] = {}
-    cached_trees: dict[str, tuple[str, list[dict[str, Any]]]] = {}
     cached_status: dict[str, Literal["text", "binary", "unavailable"]] = {}
     total_bytes = 0
     blob_requests = 0
@@ -192,9 +191,7 @@ def capture_repository(gh: GitHub, context: ReviewContext, directory: Path) -> S
         if commit in trees_by_commit:
             trees[side] = trees_by_commit[commit]
             continue
-        if commit not in cached_trees:
-            cached_trees[commit] = _tree_snapshot(gh, context.repo, commit)
-        tree_sha, raw_entries = cached_trees[commit]
+        tree_sha, raw_entries = _tree_snapshot(gh, context.repo, commit)
         entries = []
         for raw_entry in raw_entries:
             mode = raw_entry["mode"]

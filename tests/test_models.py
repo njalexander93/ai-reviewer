@@ -333,7 +333,7 @@ def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
     assert framing in instructions
     assert "Request missing evidence" in instructions
     assert "Markdown files also have sections by LEFT/RIGHT" in instructions
-    assert "Requests can\nread changed files" in instructions
+    assert "Requests can read changed files" in " ".join(instructions.split())
     assert "Missing entries never prove evidence is absent" in instructions
     if kind == "whole":
         assert "within a larger PR" not in instructions

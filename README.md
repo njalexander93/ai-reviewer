@@ -324,7 +324,7 @@ Operational defaults are deliberate finite safeguards, not performance optima:
 | Local planning | 64 chunks | Bound partition growth |
 | Local + integration work | 128 assignments, each reviewed by all enabled providers | Bound relationship expansion and spending |
 | Follow-ups | 3 total attempts/provider/assignment | Resolve missing evidence without an open-ended loop |
-| Repository tools | 12 provider turns; 32 calls; 16,000 bytes/call; 256,000 returned bytes; 500,000 cumulative counted input tokens; 600 seconds per provider assignment | Bound iterative investigation; exhaustion fails review coverage |
+| Repository tools | 12 provider turns; 32 calls; 16,000 bytes/call; 256,000 returned bytes; 3,000,000 cumulative counted input tokens; 600 seconds per provider assignment | Bound iterative investigation; exhaustion fails review coverage |
 | Repository reads | 50 files/list page; 25 search matches and 500 scanned files/call; 200 lines/read | Bound each visible result and filesystem work |
 | Provider output | 40 findings and 60,000 serialized bytes/attempt | Bound report handling and integration input |
 | Consolidation work | 128 finding batches + 128 summary calls | Bound aggregate consolidation |
@@ -338,7 +338,7 @@ Line reads page complete lines by serialized JSON size and return `next_start`.
 A single line exceeding the result budget returns an explicit diagnostic.
 
 The repository-tool deadline is checked before tools/counting and after generation.
-An in-flight provider request can extend one assignment by up to its 120-second
+An in-flight provider request can extend one assignment by up to its 300-second
 timeout; a response arriving after the deadline cannot complete the assignment.
 Missing transcript files fail replay, including when a review used zero tools.
 Repository-mode reports have no excerpt-request field and cannot enter legacy
@@ -368,6 +368,15 @@ They contain changed source, tracked text blobs, tool results, discussion and is
 context. Treat their access as part of the calling repository's trust boundary. Public
 review text and Actions logs must not contain secrets. The CLI deliberately suppresses
 provider exception bodies.
+
+Repository review preflight caps initial input at 150,000 tokens, reserving 100,000
+for tool continuations under the 250,000 per-request limit. The 3,000,000 cumulative
+ceiling counts full repeated inputs across at most 12 turns; it is not a billing
+estimate. Requests retain the 300-second timeout; the 600-second assignment deadline
+is checked before counting and after provider calls. A running call may finish after
+the deadline, but its review is rejected. Time or result limits can bind before all
+12 turns. No maximum is a promise of completion.
+
 
 ## Cost reporting
 
