@@ -4,6 +4,7 @@ Preparation owns eligibility, collection, packet limits and the final revision
 check. It requests a reviewer only after all provider context is validated.
 """
 
+from pathlib import Path
 from typing import Any
 
 from ai_reviewer.chunking import plan, validate_patch
@@ -11,15 +12,21 @@ from ai_reviewer.contracts import ChangedFile, PriorComment, ReviewContext
 from ai_reviewer.github import GitHub, pr_path, read_version, rebuild_patch
 from ai_reviewer.issues import github_issues, linear_issues
 from ai_reviewer.limits import MAX_FILES, MAX_SNAPSHOT_BYTES
+from ai_reviewer.repository import capture_repository
 
 
 def prepare(
-    gh: GitHub, repo: str, number: int, reviewer: str, linear_token: str | None = None
+    gh: GitHub,
+    repo: str,
+    number: int,
+    reviewer: str,
+    linear_token: str | None = None,
+    repository_directory: Path | None = None,
 ) -> ReviewContext:
     """Capture changed files, review discussion and optional issue requirements.
 
     Reads GitHub content and requests the reviewer only after collection succeeds.
-    It never executes repository code or inspects unchanged dependency files.
+    It never executes repository code; optional snapshots include unchanged tracked files.
 
     Args:
         gh: Client authorized to read the repository and request reviewers.
@@ -27,6 +34,8 @@ def prepare(
         number: Positive pull request number.
         reviewer: Login to request; must differ from the PR author.
         linear_token: Optional Linear personal API key for issue requirements.
+        repository_directory: Optional artifact directory for the complete immutable
+            comparison/head/base tracked-source index and content-addressed text blobs.
 
     Returns:
         Validated context containing revisions, PR metadata, discussion, changed
@@ -125,6 +134,9 @@ def prepare(
         previous_comments=comments,
         issues=issues,
     )
+    # Capture complete tracked source separately; prompts receive only its digest.
+    if repository_directory is not None:
+        context.repository_digest = capture_repository(gh, context, repository_directory).digest
     # Budget only the evidence that will actually reach the providers.
     plan(context)
     # Reject a collection that raced a head or base update.

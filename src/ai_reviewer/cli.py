@@ -56,6 +56,7 @@ def main() -> None:
                 int(os.environ["PR_NUMBER"]),
                 identity,
                 linear_token=os.environ.get("LINEAR_API_KEY"),
+                repository_directory=directory / "repository",
             )
             # Persist the collected packet for the enabled independent reviewers.
             context_path.write_text(context.model_dump_json())
