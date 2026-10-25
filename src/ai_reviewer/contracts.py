@@ -199,6 +199,8 @@ class ReviewContext(Contract):
         head: Reviewed head commit SHA.
         base: Base branch tip observed during preparation.
         diff_base: Merge-base commit used to read old file versions.
+        repository_digest: Digest for the separate complete tracked-source snapshot,
+            or None for synthetic contexts that do not enable repository tools.
         reviewer: GitHub login expected to publish the review.
         title: PR title.
         description: PR body, or None when absent.
@@ -212,6 +214,7 @@ class ReviewContext(Contract):
     head: str = Field(pattern=r"^[0-9a-f]{40}$")
     base: str = Field(pattern=r"^[0-9a-f]{40}$")
     diff_base: str = Field(pattern=r"^[0-9a-f]{40}$")
+    repository_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     reviewer: str = Field(min_length=1)
     title: str
     description: str | None

@@ -1,5 +1,6 @@
 """Exercise the stage artifact handoff through the real CLI and REST adapter."""
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -25,6 +26,10 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     """Independent reports reach publication through files, without prices in feedback."""
     # Bind the CLI to a synthetic repository and isolated artifact directory.
     server = Server()
+    server.valid_repository_tree = True
+    for source in (b"first\nold\n", b"first\nnew\n"):
+        sha = hashlib.sha1(b"blob " + str(len(source)).encode() + b"\0" + source).hexdigest()
+        server.repository_blobs[sha] = source
     server.linked_issues = [
         {
             "url": "https://github.com/owner/repo/issues/2",
@@ -45,7 +50,13 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     payloads: dict[str, dict] = {}
 
     def model(
-        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
+        role: str,
+        payload: str,
+        directory: Path,
+        *,
+        kind: str = "whole",
+        preflight: bool = False,
+        repository: object | None = None,
     ) -> None:
         """Write deterministic reports at the paid-provider boundary.
 
@@ -55,10 +66,13 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
             directory: Isolated stage directory receiving the synthetic report.
             kind: Assignment scope framing.
             preflight: Count-only phase; no report is generated.
+            repository: Optional immutable snapshot accepted by the review stage.
         """
         if preflight:
             return
         directory.mkdir(parents=True, exist_ok=True)
+        if repository is not None:
+            (directory / "repository-tools.jsonl").write_text("")
         # Retain the actual stage input before selecting its response contract.
         payloads[role] = json.loads(payload)
         report = (
@@ -78,6 +92,8 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     # Verify identical reviewer input, the published verdict and log-only accounting.
     assert payloads["claude"] == payloads["openai"]
     assert payloads["claude"]["head"] == "a" * 40
+    assert payloads["claude"]["repository_digest"]
+    assert (tmp_path / "repository" / "index.json").exists()
     assert payloads["claude"]["issues"][0]["description"] == "Retain prior edits."
     assert payloads["sonnet"]["reviews"][:2] == [
         "claude completed",
@@ -132,7 +148,13 @@ def test_parallel_review_waits_for_both_calls(
     (tmp_path / "context.json").write_text(context.model_dump_json())
 
     def model(
-        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
+        role: str,
+        payload: str,
+        directory: Path,
+        *,
+        kind: str = "whole",
+        preflight: bool = False,
+        repository: object | None = None,
     ) -> None:
         """Synchronize provider calls and record completion before a selected failure.
 
@@ -142,6 +164,7 @@ def test_parallel_review_waits_for_both_calls(
             directory: Isolated artifact directory.
             kind: Assignment scope framing.
             preflight: Count-only phase; no report is generated.
+            repository: Optional immutable snapshot accepted by the review stage.
 
         Raises:
             RuntimeError: The selected provider fails after recording usage.
@@ -194,8 +217,8 @@ def test_invalid_blocking_anchor_stops_before_consolidator_purchase(
     target = work.attempt_directory(tmp_path, "whole", "claude", 0) / "claude.json"
     target.write_text(ChunkReview(**reviews[0].model_dump(), requests=[]).model_dump_json())
     calls = []
-    monkeypatch.setattr(work, "call_model", lambda *args: calls.append(args))
-    monkeypatch.setattr(consolidation, "call_model", lambda *args: calls.append(args))
+    monkeypatch.setattr(work, "call_model", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(consolidation, "call_model", lambda *args, **kwargs: calls.append(args))
     monkeypatch.setattr(sys, "argv", ["review", "consolidate", "--directory", str(tmp_path)])
     # Reject rather than discard the finding or pay for a useless consolidation.
     with pytest.raises(SystemExit) as error:

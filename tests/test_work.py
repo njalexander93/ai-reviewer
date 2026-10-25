@@ -55,7 +55,13 @@ def large_context() -> ReviewContext:
 
 
 def fake_model(
-    role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
+    role: str,
+    payload: str,
+    directory: Path,
+    *,
+    kind: str = "whole",
+    preflight: bool = False,
+    repository: object | None = None,
 ) -> None:
     """Write synthetic reports at the provider boundary without network calls.
 
@@ -65,6 +71,7 @@ def fake_model(
         directory: Artifact location, created if needed.
         kind: Accepted for call_model compatibility; it does not change the fake's behavior.
         preflight: Return without files or generation when true.
+        repository: Optional read-only snapshot accepted for tool-enabled runs.
 
     Writes role.json and a null usage artifact. Invalid JSON and filesystem errors
     propagate. These application fixtures do not establish real provider behavior.
@@ -474,7 +481,13 @@ def test_token_overflow_replans_before_generation(
     generated = []
 
     def model(
-        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
+        role: str,
+        payload: str,
+        directory: Path,
+        *,
+        kind: str = "whole",
+        preflight: bool = False,
+        repository: object | None = None,
     ) -> None:
         """Reject only the selected role's whole preflight, then delegate to fake_model.
 
@@ -598,7 +611,13 @@ def test_capacity_fallback_bounds_integration_and_followup_payloads(
     requested = set()
 
     def model(
-        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
+        role: str,
+        payload: str,
+        directory: Path,
+        *,
+        kind: str = "whole",
+        preflight: bool = False,
+        repository: object | None = None,
     ) -> None:
         """Reject oversized input, then request source once per local provider assignment.
 

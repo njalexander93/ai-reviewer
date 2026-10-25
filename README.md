@@ -45,7 +45,7 @@ unique findings as singleton groups. Model choice never decides approval.
    | Secret | Value |
    | --- | --- |
    | `ANTHROPIC_API_KEY` | Optional; access to Opus 5.5 and Sonnet 5.5 |
-   | `OPENAI_API_KEY` | Optional; access to GPT-6.1 Sol |
+   | `OPENAI_API_KEY` | Optional; access to GPT-6.1 Sol for review and consolidation |
    | `AI_REVIEWER_TOKEN` | Reviewer's GitHub personal access token |
    | `LINEAR_API_KEY` (optional) | Linear personal API key with read access to relevant issues |
 
@@ -191,11 +191,10 @@ and publication receive the reviewer credential. All stages share the runner and
 workspace, so step-scoped environment variables are not a sandbox boundary.
 
 **This is a bounded static review, not a replacement for the interactive agents.**
-It can retrieve captured changed-file sections, but cannot inspect unchanged dependencies,
-run tests, browse links or verify an
-entire repository architecture. When those are necessary, models should mark the
-review incomplete. Model judgment can still be wrong or affected by malicious
-instructions in source; structured output does not eliminate that risk.
+It can inspect tracked text files from immutable head, comparison and target-base
+snapshots, including unchanged dependencies. It cannot run tests or browse links.
+Model judgment can still be wrong or affected by malicious instructions in source;
+structured output does not eliminate that risk.
 
 ### Large PRs
 
@@ -208,7 +207,10 @@ replace the old 80-file and 150 KB per-version rejection.
 1. Capture immutable head, base and merge-base evidence. Validate that original
    patches account for the complete before/after change. Reconstruct missing
    text patches with Git over inert blobs. Binary, unreadable, truncated or
-   unsupported objects still fail without approval.
+   unsupported changed-file objects still fail without approval. Separately save
+   complete tracked-file indexes and best-effort bounded UTF-8 blobs for all three
+   revisions. Blob and byte limits leave uncaptured files indexed as unavailable.
+   If fewer than eight GitHub requests remain, fail preparation explicitly.
 2. Keep a whole file when it fits the unit budget. For oversized text, prefer
    Python function/class boundaries, then diff sections, then physical patch
    lines. Other languages use diff boundaries. Retain original patch records,
@@ -224,24 +226,26 @@ replace the old 80-file and 150 KB per-version rejection.
    Indivisible oversized lines or required metadata fail explicitly; nothing is
    silently removed to fit.
 4. Run each enabled reviewer at medium effort on every chunk with **two concurrent
-   workers** in the same Actions job. Each provider can request up to eight source
-   ranges per response from the captured changed files. Allow two follow-up rounds.
-   All earlier findings and requested source remain available. Unresolved context,
-   an unavailable range or an oversized follow-up makes the run incomplete.
+   workers** in the same Actions job. Each provider gets the same list, literal-search
+   and inclusive line-range tools over those snapshots. Tool results are bounded and
+   recorded beside each attempt, then replayed against the captured Git blobs before
+   coverage is accepted. If a tool budget is exhausted, the required assignment fails.
 5. Enabled providers perform integration passes with actual source and reports.
    Every chunk gets an integration pass. Additional packets join direct references,
    source/test pairs and neighboring directory/file sections across chunks. Direct
    references come from full captured blobs, with their actual source lines included
    even outside changed hunks. Accumulated reports are paged into additional required
    integration assignments. This
-   is a bounded heuristic, **not a complete dependency graph**. Models must request
-   missing source and remain incomplete if the snapshot cannot answer.
+   is a bounded heuristic, **not a complete dependency graph**. Models can search
+   the complete captured tracked snapshots for dependencies outside these heuristics.
 6. Recompute the plan and validate the coverage manifest once before consolidation
    and once before publication. The manifest stores assignment and plan hashes;
    full payloads stay in attempt artifacts. Reports are keyed by assignment and
    provider. Compile immutable diff anchors once per stage and reuse them across
    workers and replay. Whole, local and integration assignments receive explicit
-   scope instructions with the same source-request contract. Require every enabled provider for all assignments and all follow-ups.
+   scope instructions. Repository-enabled reviews use bounded tools; contexts without
+   a repository snapshot retain the changed-file request protocol. Require every
+   enabled provider for all assignments.
    Coverage proves assignment/completion; it does not prove model understanding.
 7. The consolidator groups up to 40 original findings per batch with global source IDs.
    All accepted findings, locations and severity survive exactly once. Cross-batch duplicate
@@ -260,10 +264,12 @@ packets omit navigation before paging reports or rejecting required evidence.
 `declaration_navigation: truncated` means entries or entire file indexes were omitted; absence is not evidence that a
 function or section does not exist. Unit splitting consumes complete discovery before navigation
 is projected. Projections return new metadata; packet sizers retain unchanged inputs.
-Discovery never executes source and does not replace reading it. Unsupported languages, malformed Python and
-bare-CR line endings have explicit unavailable statuses; ordinary source requests
-still work. Whole-context payload bytes remain unchanged. Index bytes count toward
-existing packet limits; required source and review metadata still fail closed if oversized.
+Discovery never executes source and does not replace reading it. Unsupported languages,
+malformed Python and bare-CR line endings have explicit unavailable statuses; changed-file
+source requests still work when repository tools are unavailable. Whole-source bodies stay
+out of the shared overview, which carries only the repository snapshot digest. Index bytes
+count toward existing packet limits; required source and review metadata still fail closed
+if oversized.
 
 Markdown `.md`/`.markdown` files additionally expose LEFT/RIGHT `sections`, using
 raw heading names, levels and inclusive section ranges. Each range includes nested
@@ -313,14 +319,31 @@ Operational defaults are deliberate finite safeguards, not performance optima:
 
 | Boundary | Default | Reason |
 | --- | --- | --- |
-| Collection | 3,000 files; 8 MB/blob; 32 MB snapshot; 10,000 API requests/client; 20,000 direct relations | Bound fetching and memory while admitting both historical examples |
+| Changed-file collection | 3,000 files; 8 MB/blob; 32 MB snapshot; 10,000 API requests/client; 20,000 direct relations | Bound PR evidence collection |
+| Repository snapshots | 50,000 tracked entries per revision; at most 4,000 unique blob requests, reserving six tree reads and two preparation requests; 2 MB per captured blob; 100 MB total unique captured bytes; recursive Git trees must be complete | Bound immutable head/comparison/base capture; binary, symlink, submodule, oversized and uncaptured blobs stay listed with diagnostics |
 | Local planning | 64 chunks | Bound partition growth |
 | Local + integration work | 128 assignments, each reviewed by all enabled providers | Bound relationship expansion and spending |
 | Follow-ups | 3 total attempts/provider/assignment | Resolve missing evidence without an open-ended loop |
+| Repository tools | 12 provider turns; 32 calls; 16,000 bytes/call; 256,000 returned bytes; 3,000,000 cumulative counted input tokens; 600 seconds per provider assignment | Bound iterative investigation; exhaustion fails review coverage |
+| Repository reads | 50 files/list page; 25 search matches and 500 scanned files/call; 200 lines/read | Bound each visible result and filesystem work |
 | Provider output | 40 findings and 60,000 serialized bytes/attempt | Bound report handling and integration input |
 | Consolidation work | 128 finding batches + 128 summary calls | Bound aggregate consolidation |
 | Publication | 1,000 comments; 8 MB comment payload; 60,000-byte body | Fail before any oversized or partial review write |
 | Job | 2 workers; 180 minutes; no automatic API retries | Bound concurrency and execution time |
+
+The initial packet remains capped at 600,000 bytes. Tool continuations have a
+1,576,000-byte serialized-history ceiling, alongside the per-call and cumulative
+token limits above. These are independent ceilings, not guaranteed usable capacity.
+Line reads page complete lines by serialized JSON size and return `next_start`.
+A single line exceeding the result budget returns an explicit diagnostic.
+
+The repository-tool deadline is checked before tools/counting and after generation.
+An in-flight provider request can extend one assignment by up to its 300-second
+timeout; a response arriving after the deadline cannot complete the assignment.
+Missing transcript files fail replay, including when a review used zero tools.
+Repository-mode reports have no excerpt-request field and cannot enter legacy
+follow-ups. Preparation fails if it cannot reserve requests for repository snapshots;
+it never silently downgrades a requested repository review to excerpt-only access.
 
 Application work limits live in `src/ai_reviewer/limits.py`; the job timeout lives
 in the workflow. Increasing one requires reviewing downstream bounds. Equal values
@@ -341,9 +364,19 @@ approval dismissal as described above. A failed subsequent run does not retract
 older reviews by itself.
 
 Review context and model reports are Actions artifacts retained for one day.
-They contain source, discussion and issue context. Treat their access as part of the calling
-repository's trust boundary. Public review text and Actions logs must not contain
-secrets. The CLI deliberately suppresses provider exception bodies.
+They contain changed source, tracked text blobs, tool results, discussion and issue
+context. Treat their access as part of the calling repository's trust boundary. Public
+review text and Actions logs must not contain secrets. The CLI deliberately suppresses
+provider exception bodies.
+
+Repository review preflight caps initial input at 150,000 tokens, reserving 100,000
+for tool continuations under the 250,000 per-request limit. The 3,000,000 cumulative
+ceiling counts full repeated inputs across at most 12 turns; it is not a billing
+estimate. Requests retain the 300-second timeout; the 600-second assignment deadline
+is checked before counting and after provider calls. A running call may finish after
+the deadline, but its review is rejected. Time or result limits can bind before all
+12 turns. No maximum is a promise of completion.
+
 
 ## Cost reporting
 

@@ -1,6 +1,7 @@
 """Exercise GitHub boundaries using REST-shaped fixtures and real HTTP request construction."""
 
 import base64
+import hashlib
 import json
 
 import httpx
@@ -89,6 +90,8 @@ class Server:
         }
         self.login = "reviewer"
         self.mode = "100644"
+        self.valid_repository_tree = False
+        self.repository_blobs: dict[str, bytes] = {}
         self.comments: list[dict] = []
         self.linked_issues: list[dict] = []
         # Replace the HTTP boundary before any production method can make a request.
@@ -146,6 +149,8 @@ class Server:
             self.content_refs.append(ref)
             data = {"tree": {"sha": ref}}
         elif "/git/trees/" in path:
+            raw = b"first\nold\n" if path.endswith("c" * 40) else b"first\nnew\n"
+            blob = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
             data = {
                 "truncated": False,
                 "tree": [
@@ -153,13 +158,22 @@ class Server:
                         "path": "app.py",
                         "type": "blob",
                         "mode": self.mode,
-                        "sha": ("e" if path.endswith("c" * 40) else "d") * 40,
-                        "size": self.content["size"],
+                        "sha": blob
+                        if self.valid_repository_tree
+                        else ("e" if path.endswith("c" * 40) else "d") * 40,
+                        "size": len(raw) if self.valid_repository_tree else self.content["size"],
                     }
                 ],
             }
         elif "/git/blobs/" in path:
             data = self.content
+            if self.valid_repository_tree:
+                raw = self.repository_blobs[path.rsplit("/", 1)[1]]
+                data = {
+                    "size": len(raw),
+                    "encoding": "base64",
+                    "content": base64.b64encode(raw).decode(),
+                }
             if (
                 path.endswith("e" * 40)
                 and self.content["content"] == base64.b64encode(b"first\nnew\n").decode()

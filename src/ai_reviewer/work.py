@@ -59,6 +59,11 @@ from ai_reviewer.models import (
     configured_providers,
 )
 from ai_reviewer.patch import lines
+from ai_reviewer.repository import RepositoryTools, load_repository
+from ai_reviewer.repository_evidence import (
+    attempt_directory as attempt_directory,
+)
+from ai_reviewer.repository_evidence import replay_tool_events, tool_events_digest
 from ai_reviewer.serialization import digest, encode
 
 
@@ -117,12 +122,15 @@ class Completion(Contract):
         status: Pending before execution; complete or failed after its future settles.
         attempts: Validated report count for success or incomplete responses, at most
             MAX_ATTEMPTS. Zero on other failures means unknown, not no provider calls.
+        tool_events_digest: Digest of this provider's exact repository tool transcripts,
+            or None when the run did not enable repository tools.
     """
 
     assignment: str
     role: Provider
     status: Literal["pending", "complete", "failed"] = "pending"
     attempts: int = Field(default=0, ge=0, le=MAX_ATTEMPTS)
+    tool_events_digest: str | None = None
 
 
 class Manifest(Contract):
@@ -275,7 +283,7 @@ def integration_assignments(
     # Each chunk rechecks integration using actual local source and all enabled reports.
     for i, chunk in enumerate(planned.chunks):
         payload = json.loads(chunk.payload(planned.metadata))
-        payload["phase"] = "integration: assess PR-wide compatibility; request missing source"
+        payload["phase"] = "integration: assess PR-wide compatibility; investigate missing evidence"
         payload["reports"] = [atom for role in providers for atom in report_data[(chunk.id, role)]]
         payload["reference_source"] = reference_source(chunk.units)
         assignments.append(
@@ -557,15 +565,6 @@ def followup_payload(
     return serialized
 
 
-def attempt_directory(directory: Path, assignment: str, role: str, round_: int) -> Path:
-    """Return directory/work/assignment/role/round_ without creating it.
-
-    Directory is the run root; assignment and role must be trusted internal path
-    components. Round_ is a zero-based attempt index. This helper does not sanitize IDs.
-    """
-    return directory / "work" / assignment / role / str(round_)
-
-
 def advance(
     context: ReviewContext,
     assignment: Assignment,
@@ -591,6 +590,14 @@ def advance(
         ValueError: Completion conflicts with requests, requested source is unavailable,
             or the continuation exceeds the packet ceiling.
     """
+    # Execution and replay both prohibit the legacy protocol for repository reviews.
+    if context.repository_digest is not None:
+        if history or report.requests:
+            raise ValueError("Repository review requires one complete report without requests")
+        if not report.complete:
+            raise UnresolvedEvidence(
+                1, "Repository evidence remains incomplete", "repository_evidence_incomplete"
+            )
     # Complete work must have no outstanding required source requests.
     if report.complete:
         if report.requests:
@@ -613,6 +620,7 @@ def run_assignment(
     directory: Path,
     anchors: AnchorIndex,
     packet_bytes: int,
+    repository: RepositoryTools | None = None,
 ) -> int:
     """Run one provider through bounded attempts, preserving input and usage evidence.
 
@@ -623,6 +631,7 @@ def run_assignment(
         directory: Fresh run root; each attempt gets its own subdirectory.
         anchors: Index compiled from context and shared read-only among workers.
         packet_bytes: Plan ceiling for follow-up JSON, in UTF-8 bytes.
+        repository: Optional complete tracked-source snapshot shared read-only by workers.
 
     Returns:
         Number of attempts through the first complete report.
@@ -647,7 +656,7 @@ def run_assignment(
         print(
             f"Review attempt: assignment={assignment.id} role={role} attempt={round_}", flush=True
         )
-        call_model(role, payload, target, kind=assignment.kind)
+        call_model(role, payload, target, kind=assignment.kind, repository=repository)
         report, rejected = filter_report(
             anchors, ChunkReview.model_validate_json((target / f"{role}.json").read_text())
         )
@@ -684,6 +693,7 @@ def run_batch(
     directory: Path,
     anchors: AnchorIndex,
     packet_bytes: int,
+    repository: RepositoryTools | None = None,
 ) -> None:
     """Run enabled providers with two workers and persist every terminal result.
 
@@ -694,6 +704,7 @@ def run_batch(
         directory: Existing run root for manifest and isolated attempt artifacts.
         anchors: Read-only coordinates compiled from context.
         packet_bytes: Selected plan ceiling passed to every attempt.
+        repository: Optional complete tracked-source capability passed to reviewers.
 
     Raises:
         ValueError: Total work exceeds MAX_WORK, or any worker fails after draining.
@@ -725,6 +736,7 @@ def run_batch(
                 directory,
                 anchors,
                 packet_bytes,
+                repository,
             ): completion
             for assignment in assignments
             for completion in completions
@@ -735,6 +747,13 @@ def run_batch(
             completion = futures[future]
             try:
                 completion.attempts = future.result()
+                completion.tool_events_digest = tool_events_digest(
+                    directory,
+                    completion.assignment,
+                    completion.role,
+                    completion.attempts,
+                    repository_enabled=repository is not None,
+                )
                 completion.status = "complete"
             except Exception as error:
                 if isinstance(error, UnresolvedEvidence):
@@ -762,6 +781,7 @@ def read_batch(
     directory: Path,
     anchors: AnchorIndex,
     packet_bytes: int,
+    repository: RepositoryTools | None = None,
 ) -> dict[tuple[str, str], Review]:
     """Replay recorded attempts and return validated reports keyed by work identity.
 
@@ -772,6 +792,7 @@ def read_batch(
         directory: Existing run artifacts, including each payload and provider report.
         anchors: Read-only snapshot coordinates used by execution too.
         packet_bytes: Plan ceiling for reconstructing continuation inputs.
+        repository: Optional verified snapshot shared across tool transcript replay.
 
     Returns:
         Reports keyed by (assignment ID, provider), retaining accepted attempt findings
@@ -792,6 +813,15 @@ def read_batch(
             if len(matches) != 1 or matches[0].status != "complete" or not matches[0].attempts:
                 raise ValueError("Missing, duplicate or failed worker result")
             completion = matches[0]
+            replay_tool_events(
+                context,
+                directory,
+                assignment.id,
+                role,
+                completion.attempts,
+                completion.tool_events_digest,
+                repository,
+            )
             history: list[ChunkReview] = []
             payload = assignment.payload
             # Reconstruct each input through the same transition used during execution.
@@ -818,7 +848,13 @@ def read_batch(
     return reports
 
 
-def preflight(context: ReviewContext, planned: Plan, directory: Path, providers: Providers) -> None:
+def preflight(
+    context: ReviewContext,
+    planned: Plan,
+    directory: Path,
+    providers: Providers,
+    repository: RepositoryTools | None = None,
+) -> None:
     """Count enabled providers on every local scope before purchasing any review.
 
     Args:
@@ -826,6 +862,7 @@ def preflight(context: ReviewContext, planned: Plan, directory: Path, providers:
         context: Snapshot that produced planned.
         planned: Candidate plan whose initial inputs will be counted serially.
         directory: Run root; provider setup uses preflight/assignment-ID directories.
+        repository: Optional immutable repository snapshot used to count its tool schema.
 
     Raises:
         CapacityError: Any input exceeds provider-counted token or byte policy.
@@ -833,7 +870,7 @@ def preflight(context: ReviewContext, planned: Plan, directory: Path, providers:
 
     call_model may write diagnostic artifacts on failure, including capacity rejection.
     """
-    # Count every enabled provider format before any initial review is generated.
+    # Count each review format with the same repository tool schema used during generation.
     for assignment in local_assignments(context, planned):
         for role in providers:
             call_model(
@@ -842,15 +879,19 @@ def preflight(context: ReviewContext, planned: Plan, directory: Path, providers:
                 directory / "preflight" / assignment.id,
                 kind=assignment.kind,
                 preflight=True,
+                repository=repository,
             )
 
 
-def review_chunks(context: ReviewContext, directory: Path) -> None:
+def review_chunks(
+    context: ReviewContext, directory: Path, repository: RepositoryTools | None = None
+) -> None:
     """Execute one fresh manifest-backed review, including required integration work.
 
     Args:
         context: Captured snapshot; source remains immutable throughout the run.
         directory: Run root without a manifest or work directory; preflight may create it.
+        repository: Verified tracked-source snapshots from the same preparation run.
 
     Raises:
         ValueError: Artifacts already exist, planning/capacity fails, or required work
@@ -865,13 +906,15 @@ def review_chunks(context: ReviewContext, directory: Path) -> None:
         raise ValueError("Review run requires a fresh artifact directory")
     # Resolve credentials once; failed configured providers never become disabled.
     providers = configured_providers()
+    if context.repository_digest is not None and repository is None:
+        repository = load_repository(context, directory / "repository")
     # Select a capacity policy before committing work to a manifest.
     planned = plan(context)
     try:
-        preflight(context, planned, directory, providers)
+        preflight(context, planned, directory, providers, repository)
     except CapacityError:
         planned = plan(context, packet_bytes=CAPACITY_PACKET_BYTES)
-        preflight(context, planned, directory, providers)
+        preflight(context, planned, directory, providers, repository)
     # Bind required work to the chosen plan and compile shared coordinates once.
     manifest = Manifest(
         providers=providers,
@@ -883,11 +926,13 @@ def review_chunks(context: ReviewContext, directory: Path) -> None:
     anchors = compile_anchors(context)
     # Validate local evidence before using its reports to plan integration.
     local = local_assignments(context, planned)
-    run_batch(context, manifest, local, directory, anchors, planned.packet_bytes)
-    reports = read_batch(context, local, manifest, directory, anchors, planned.packet_bytes)
+    run_batch(context, manifest, local, directory, anchors, planned.packet_bytes, repository)
+    reports = read_batch(
+        context, local, manifest, directory, anchors, planned.packet_bytes, repository
+    )
     integration = integration_assignments(context, planned, reports, manifest.providers)
-    run_batch(context, manifest, integration, directory, anchors, planned.packet_bytes)
-    read_batch(context, integration, manifest, directory, anchors, planned.packet_bytes)
+    run_batch(context, manifest, integration, directory, anchors, planned.packet_bytes, repository)
+    read_batch(context, integration, manifest, directory, anchors, planned.packet_bytes, repository)
 
 
 def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
@@ -913,9 +958,16 @@ def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
     planned = plan(context, packet_bytes=manifest.packet_bytes)
     if manifest.plan_digest != plan_digest(planned, manifest.providers):
         raise ValueError("Coverage plan does not match the captured snapshot")
+    repository = (
+        load_repository(context, directory / "repository")
+        if context.repository_digest is not None
+        else None
+    )
     anchors = compile_anchors(context)
     local = local_assignments(context, planned)
-    reports = read_batch(context, local, manifest, directory, anchors, planned.packet_bytes)
+    reports = read_batch(
+        context, local, manifest, directory, anchors, planned.packet_bytes, repository
+    )
     integration = integration_assignments(context, planned, reports, manifest.providers)
     # Compare exact ownership and provider keys, not a report-count approximation.
     expected = local + integration
@@ -926,7 +978,9 @@ def load_reviews(context: ReviewContext, directory: Path) -> CoveredReviews:
     ):
         raise ValueError("Coverage assignments are missing, duplicated or unexpected")
     reports.update(
-        read_batch(context, integration, manifest, directory, anchors, planned.packet_bytes)
+        read_batch(
+            context, integration, manifest, directory, anchors, planned.packet_bytes, repository
+        )
     )
     # Flatten only after replay succeeds; carry explicit identity for presentation.
     return CoveredReviews(

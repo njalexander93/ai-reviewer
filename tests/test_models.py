@@ -333,7 +333,7 @@ def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
     assert framing in instructions
     assert "Request missing evidence" in instructions
     assert "Markdown files also have sections by LEFT/RIGHT" in instructions
-    assert "request its source" in instructions
+    assert "Requests can read changed files" in " ".join(instructions.split())
     assert "Missing entries never prove evidence is absent" in instructions
     if kind == "whole":
         assert "within a larger PR" not in instructions
@@ -343,6 +343,15 @@ def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
         else call["output_format"].model_json_schema()
     )
     assert schema == ChunkReview.model_json_schema()
+
+
+@pytest.mark.parametrize("role", ["claude", "openai"])
+def test_repository_contract_excludes_legacy_requests(role: str) -> None:
+    """Repository reviews cannot emit the legacy source-request field in their schema."""
+    schema, instructions = models.request_contract(role, "whole", repository_enabled=True)
+    assert "Read-only repository tools are available" in instructions
+    assert "requests" not in schema.model_json_schema()["properties"]
+    assert "Request missing evidence using requests" not in instructions
 
 
 @pytest.mark.parametrize("role", ["sonnet", "sol"])

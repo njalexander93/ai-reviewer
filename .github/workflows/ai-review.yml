@@ -21,7 +21,7 @@ jobs:
     # Use the same trusted revision for the workflow and its implementation.
     uses: ./.github/workflows/review.yml
     with:
-      pr-number: ${{ github.event.pull_request.number || inputs.pr-number }}
+      pr-number: ${{ github.event.pull_request.number || fromJSON(inputs.pr-number) }}
       implementation-ref: ${{ github.sha }}
       implementation-repository: ${{ github.repository }}
     secrets:
