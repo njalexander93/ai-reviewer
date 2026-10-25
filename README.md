@@ -20,8 +20,8 @@ exist. Every enabled reviewer must finish every required assignment and follow-u
 Older manifests without this selection are rejected; run artifacts are not migrated.
 
 Model IDs and settings verified on **2026-10-25**:
-[`gpt-6.1-sol`](https://developers.openai.com/api/docs/models/gpt-6.1-sol) and
-[`gpt-6.1-sol`](https://developers.openai.com/api/docs/models/gpt-6.1-sol) use
+[`gpt-6.1-sol`](https://developers.openai.com/api/docs/models/gpt-6.1-sol) serves
+both OpenAI review and consolidation. Both roles use
 `reasoning={"effort": "medium"}` through Responses.
 [`claude-opus-5-5`](https://platform.claude.com/docs/en/models/overview) and
 [`claude-sonnet-5-5`](https://platform.claude.com/docs/en/models/sonnet-5-5/overview)
@@ -45,7 +45,7 @@ unique findings as singleton groups. Model choice never decides approval.
    | Secret | Value |
    | --- | --- |
    | `ANTHROPIC_API_KEY` | Optional; access to Opus 5.5 and Sonnet 5.5 |
-   | `OPENAI_API_KEY` | Optional; access to GPT-6.1 Sol and GPT-6.1 Sol |
+   | `OPENAI_API_KEY` | Optional; access to GPT-6.1 Sol for review and consolidation |
    | `AI_REVIEWER_TOKEN` | Reviewer's GitHub personal access token |
    | `LINEAR_API_KEY` (optional) | Linear personal API key with read access to relevant issues |
 
@@ -372,7 +372,7 @@ provider exception bodies.
 ## Cost reporting
 
 The final **Report API costs** step reads every nested attempt artifact and prints
-Opus, Sol, Sonnet and Sol estimates, Claude/OpenAI
+Opus, Sonnet and separate Sol review/consolidation estimates, Claude/OpenAI
 subtotals and a combined total. It runs after success or failure. An attempted
 call with unavailable usage is **unknown**, never silently counted as free. A
 stage never attempted is reported as **not run ($0)**. Review comments contain

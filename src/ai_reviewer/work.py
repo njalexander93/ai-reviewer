@@ -60,6 +60,9 @@ from ai_reviewer.models import (
 )
 from ai_reviewer.patch import lines
 from ai_reviewer.repository import RepositoryTools, load_repository
+from ai_reviewer.repository_evidence import (
+    attempt_directory as attempt_directory,
+)
 from ai_reviewer.repository_evidence import replay_tool_events, tool_events_digest
 from ai_reviewer.serialization import digest, encode
 
@@ -280,7 +283,7 @@ def integration_assignments(
     # Each chunk rechecks integration using actual local source and all enabled reports.
     for i, chunk in enumerate(planned.chunks):
         payload = json.loads(chunk.payload(planned.metadata))
-        payload["phase"] = "integration: assess PR-wide compatibility; request missing source"
+        payload["phase"] = "integration: assess PR-wide compatibility; investigate missing evidence"
         payload["reports"] = [atom for role in providers for atom in report_data[(chunk.id, role)]]
         payload["reference_source"] = reference_source(chunk.units)
         assignments.append(
@@ -562,15 +565,6 @@ def followup_payload(
     return serialized
 
 
-def attempt_directory(directory: Path, assignment: str, role: str, round_: int) -> Path:
-    """Return directory/work/assignment/role/round_ without creating it.
-
-    Directory is the run root; assignment and role must be trusted internal path
-    components. Round_ is a zero-based attempt index. This helper does not sanitize IDs.
-    """
-    return directory / "work" / assignment / role / str(round_)
-
-
 def advance(
     context: ReviewContext,
     assignment: Assignment,
@@ -598,8 +592,12 @@ def advance(
     """
     # Execution and replay both prohibit the legacy protocol for repository reviews.
     if context.repository_digest is not None:
-        if history or report.requests or not report.complete:
+        if history or report.requests:
             raise ValueError("Repository review requires one complete report without requests")
+        if not report.complete:
+            raise UnresolvedEvidence(
+                1, "Repository evidence remains incomplete", "repository_evidence_incomplete"
+            )
     # Complete work must have no outstanding required source requests.
     if report.complete:
         if report.requests:

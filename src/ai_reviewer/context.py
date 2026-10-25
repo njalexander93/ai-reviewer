@@ -11,7 +11,7 @@ from ai_reviewer.chunking import plan, validate_patch
 from ai_reviewer.contracts import ChangedFile, PriorComment, ReviewContext
 from ai_reviewer.github import GitHub, pr_path, read_version, rebuild_patch
 from ai_reviewer.issues import github_issues, linear_issues
-from ai_reviewer.limits import MAX_FILES, MAX_SNAPSHOT_BYTES
+from ai_reviewer.limits import MAX_FILES, MAX_SNAPSHOT_BYTES, REPOSITORY_RESERVED_REQUESTS
 from ai_reviewer.repository import capture_repository
 
 
@@ -136,7 +136,7 @@ def prepare(
     )
     # Capture complete tracked source separately; prompts receive only its digest.
     if repository_directory is not None:
-        if gh.requests_remaining < 8:
+        if gh.requests_remaining < REPOSITORY_RESERVED_REQUESTS:
             raise ValueError("Insufficient GitHub request budget for repository snapshots")
         context.repository_digest = capture_repository(gh, context, repository_directory).digest
     # Budget only the evidence that will actually reach the providers.

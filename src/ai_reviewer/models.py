@@ -404,6 +404,8 @@ def _run_provider_turns(
     current = adapter.initial
     aggregate: Usage | None = Usage(input=0, output=0, cached=0, cache_write=0)
     for turn in range(REPOSITORY_TOOL_TURNS if session else 1):
+        if session:
+            session.check_time()
         count = adapter.count(current)
         check_capacity(
             payload if turn == 0 else encode(current),

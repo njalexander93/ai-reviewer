@@ -13,6 +13,7 @@ from ai_reviewer import models, work
 from ai_reviewer import repository as repository_module
 from ai_reviewer.context import prepare
 from ai_reviewer.contracts import ChunkReview, Review, ReviewContext
+from ai_reviewer.diagnostics import UnresolvedEvidence, failure_details
 from ai_reviewer.repository import (
     RepositorySnapshotError,
     RepositoryTools,
@@ -329,6 +330,42 @@ def test_tool_history_can_grow_beyond_initial_packet_cap(tmp_path: Path) -> None
     ) == ("done", True)
 
 
+def test_expired_assignment_never_starts_a_token_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An expired assignment rejects work before contacting a provider again."""
+    _, repository = make_repository(tmp_path)
+    monkeypatch.setattr(repository_module.time, "monotonic", lambda: repository.started + 601)
+    adapter = SimpleNamespace(
+        initial="payload", count=lambda current: pytest.fail("expired provider count started")
+    )
+    with pytest.raises(RepositorySnapshotError, match="seconds budget"):
+        models._run_provider_turns(
+            adapter,
+            payload="payload",
+            session=repository,
+            preflight=False,
+            usage_path=tmp_path / "usage.json",
+        )
+
+
+def test_incomplete_repository_review_retains_evidence_failure_category(tmp_path: Path) -> None:
+    """An incomplete tool review is evidence failure, not a provider transport error."""
+    context, _ = make_repository(tmp_path)
+    assignment = work.Assignment(id="whole", kind="whole", payload="{}", sections=[])
+    report = ChunkReview(
+        complete=False, summary="Need unreadable dependency", findings=[], requests=[]
+    )
+    with pytest.raises(UnresolvedEvidence) as error:
+        work.advance(context, assignment, [], report, 600_000)
+    assert failure_details(error.value) == {
+        "error": "UnresolvedEvidence",
+        "category": "unresolved_evidence",
+        "reason": "repository_evidence_incomplete",
+        "attempts": 1,
+    }
+
+
 def test_github_wrapped_base64_blob_is_decoded_and_verified() -> None:
     """The blob reader accepts GitHub's line-wrapped base64 while keeping SHA checks."""
     raw = b"print('wrapped')\n"
@@ -357,6 +394,8 @@ def test_blob_request_budget_keeps_complete_inventory_with_unavailable_content(
     blobs = {git_sha(value.decode()): value for value in sources.values()}
 
     class GitHubTrees:
+        requests_remaining = 10_000
+
         def request(self, _method: str, path: str, **_: object) -> dict[str, object]:
             commit = path.rsplit("/", 1)[1]
             if "/git/commits/" in path:

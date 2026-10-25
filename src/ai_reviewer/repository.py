@@ -22,7 +22,7 @@ from ai_reviewer.limits import (
     REPOSITORY_CONTEXT_TOKENS,
     REPOSITORY_PAGE_SIZE,
     REPOSITORY_RANGE_LINES,
-    REPOSITORY_SEARCH_FILE_BYTES,
+    REPOSITORY_RESERVED_REQUESTS,
     REPOSITORY_SEARCH_FILES,
     REPOSITORY_SEARCH_LINE_CHARS,
     REPOSITORY_SEARCH_MATCHES,
@@ -184,7 +184,7 @@ def capture_repository(gh: GitHub, context: ReviewContext, directory: Path) -> S
     blob_requests = 0
     request_budget = min(
         MAX_REPOSITORY_BLOB_REQUESTS,
-        max(0, getattr(gh, "requests_remaining", MAX_REPOSITORY_BLOB_REQUESTS + 8) - 8),
+        max(0, gh.requests_remaining - REPOSITORY_RESERVED_REQUESTS),
     )
 
     # Capture each unique revision once; source bytes are deduplicated by blob SHA.
@@ -508,13 +508,8 @@ class RepositoryTools:
                     continue
                 text = self._read_text(entry)
                 records = lines(text)
-                byte_limit = REPOSITORY_SEARCH_FILE_BYTES
                 for line_index in range(line_offset if file_index == offset else 0, len(records)):
                     line = records[line_index]
-                    byte_limit -= len(line.encode())
-                    if byte_limit < 0:
-                        next_cursor = f"{file_index}:{line_index}"
-                        break
                     if needle in line.casefold():
                         match = {
                             "path": path,

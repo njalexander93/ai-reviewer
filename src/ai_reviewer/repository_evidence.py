@@ -1,4 +1,4 @@
-"""Hash and replay provider repository-tool transcripts against pinned snapshots."""
+"""Own attempt paths and replay repository-tool transcripts against pinned snapshots."""
 
 import json
 from pathlib import Path
@@ -8,8 +8,8 @@ from ai_reviewer.repository import RepositoryTools, load_repository
 from ai_reviewer.serialization import digest, encode
 
 
-def _attempt_directory(directory: Path, assignment: str, role: str, round_: int) -> Path:
-    """Return one internally named provider attempt directory."""
+def attempt_directory(directory: Path, assignment: str, role: str, round_: int) -> Path:
+    """Return one attempt path without I/O; IDs must be trusted internal components."""
     return directory / "work" / assignment / role / str(round_)
 
 
@@ -21,7 +21,7 @@ def tool_events_digest(
         return None
     evidence = []
     for round_ in range(attempts):
-        path = _attempt_directory(directory, assignment, role, round_) / "repository-tools.jsonl"
+        path = attempt_directory(directory, assignment, role, round_) / "repository-tools.jsonl"
         data = path.read_bytes()
         evidence.append({"round": round_, "sha256": digest(data.decode()), "bytes": len(data)})
     return digest(encode(evidence))
@@ -47,7 +47,7 @@ def replay_tool_events(
     if replay.index.digest != context.repository_digest:
         raise ValueError("Repository tool replay uses a different captured snapshot")
     for round_ in range(attempts):
-        path = _attempt_directory(directory, assignment, role, round_) / "repository-tools.jsonl"
+        path = attempt_directory(directory, assignment, role, round_) / "repository-tools.jsonl"
         rows = [json.loads(line) for line in path.read_text().splitlines()]
         session = RepositoryTools(replay.index, replay.blob_dir, entries=replay.entries)
         for sequence, row in enumerate(rows):
