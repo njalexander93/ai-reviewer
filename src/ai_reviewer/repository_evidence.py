@@ -22,7 +22,7 @@ def tool_events_digest(
     evidence = []
     for round_ in range(attempts):
         path = _attempt_directory(directory, assignment, role, round_) / "repository-tools.jsonl"
-        data = path.read_bytes() if path.exists() else b""
+        data = path.read_bytes()
         evidence.append({"round": round_, "sha256": digest(data.decode()), "bytes": len(data)})
     return digest(encode(evidence))
 
@@ -48,7 +48,7 @@ def replay_tool_events(
         raise ValueError("Repository tool replay uses a different captured snapshot")
     for round_ in range(attempts):
         path = _attempt_directory(directory, assignment, role, round_) / "repository-tools.jsonl"
-        rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
         session = RepositoryTools(replay.index, replay.blob_dir, entries=replay.entries)
         for sequence, row in enumerate(rows):
             if row.get("sequence") != sequence or row.get("snapshot_digest") != replay.index.digest:

@@ -135,7 +135,9 @@ def prepare(
         issues=issues,
     )
     # Capture complete tracked source separately; prompts receive only its digest.
-    if repository_directory is not None and gh.requests_remaining >= 8:
+    if repository_directory is not None:
+        if gh.requests_remaining < 8:
+            raise ValueError("Insufficient GitHub request budget for repository snapshots")
         context.repository_digest = capture_repository(gh, context, repository_directory).digest
     # Budget only the evidence that will actually reach the providers.
     plan(context)

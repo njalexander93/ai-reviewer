@@ -9,10 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from ai_reviewer import models
+from ai_reviewer import models, work
 from ai_reviewer import repository as repository_module
 from ai_reviewer.context import prepare
-from ai_reviewer.contracts import ChunkReview, ReviewContext
+from ai_reviewer.contracts import ChunkReview, Review, ReviewContext
 from ai_reviewer.repository import (
     RepositorySnapshotError,
     RepositoryTools,
@@ -236,6 +236,99 @@ def test_snapshot_integrity_error_fails_instead_of_becoming_tool_result(tmp_path
         )
 
 
+def test_missing_empty_transcript_is_not_accepted_as_valid_evidence(tmp_path: Path) -> None:
+    """A zero-tool review still requires its explicit empty transcript artifact."""
+    context, repository = make_repository(tmp_path)
+    path = attempt_directory(tmp_path, "whole", "claude", 0) / "repository-tools.jsonl"
+    repository.for_attempt(path)
+    expected = tool_events_digest(tmp_path, "whole", "claude", 1, repository_enabled=True)
+    assert path.exists()
+    path.unlink()
+    with pytest.raises(FileNotFoundError):
+        replay_tool_events(context, tmp_path, "whole", "claude", 1, expected)
+
+
+@pytest.mark.parametrize(
+    "line", ["\x01" * 1000 + "\n", "x" * 20_000 + "\n"], ids=["escaped", "oversized"]
+)
+def test_line_reads_bound_serialized_bytes_and_report_exact_ranges(
+    tmp_path: Path, line: str
+) -> None:
+    """Escaped source pages retain whole lines; an oversized single line is explicit."""
+    _, repository = make_repository(tmp_path)
+    text = line * 10
+    sha = git_sha(text)
+    (repository.blob_dir / sha).write_text(text)
+    repository.entries["head"]["escaped.txt"] = SnapshotEntry(
+        path="escaped.txt", mode="100644", blob=sha, size=len(text.encode()), status="text"
+    )
+    result_text = repository.invoke(
+        "read_repository_lines",
+        {"revision": "head", "path": "escaped.txt", "start": 1, "end": 10},
+    )
+    assert len(result_text.encode()) <= 16_000
+    result = json.loads(result_text)
+    if len(line) > 16_000:
+        assert result["diagnostic"] == "line exceeds serialized result limit"
+        assert result["line"] == 1
+    else:
+        assert result["text"] == line
+        assert result["end"] == 1
+        assert result["next_start"] == 2
+        assert result["truncated"] is True
+
+
+def test_repository_replay_rejects_legacy_requests(tmp_path: Path) -> None:
+    """The shared execution/replay transition rejects changed-file follow-ups."""
+    context, _ = make_repository(tmp_path)
+    assignment = work.Assignment(id="whole", kind="whole", payload="{}", sections=[])
+    report = ChunkReview(
+        complete=False,
+        summary="Need source",
+        findings=[],
+        requests=[{"path": "a.py", "side": "RIGHT", "start": 1, "end": 1, "reason": "Read"}],
+    )
+    with pytest.raises(ValueError, match="one complete report without requests"):
+        work.advance(context, assignment, [], report, 600_000)
+
+
+def test_tool_history_can_grow_beyond_initial_packet_cap(tmp_path: Path) -> None:
+    """A valid continuation can exceed the initial packet cap within its own budget."""
+    _, repository = make_repository(tmp_path)
+    responses = iter(["tool", "done"])
+    adapter = models.ProviderAdapter(
+        initial="small packet",
+        count=lambda current: 100,
+        generate=lambda current: next(responses),
+        usage=lambda response: None,
+        calls=lambda response: (
+            [
+                (
+                    "list_repository_files",
+                    {
+                        "revision": "head",
+                        "path_prefix": "",
+                        "cursor": "0",
+                        "limit": 1,
+                    },
+                    "call-1",
+                )
+            ]
+            if response == "tool"
+            else []
+        ),
+        continue_turn=lambda current, response, results: "x" * 600_001,
+        finish=lambda response: (response, True),
+    )
+    assert models._run_provider_turns(
+        adapter,
+        payload="small packet",
+        session=repository,
+        preflight=False,
+        usage_path=tmp_path / "usage.json",
+    ) == ("done", True)
+
+
 def test_github_wrapped_base64_blob_is_decoded_and_verified() -> None:
     """The blob reader accepts GitHub's line-wrapped base64 while keeping SHA checks."""
     raw = b"print('wrapped')\n"
@@ -306,8 +399,8 @@ def test_blob_request_budget_keeps_complete_inventory_with_unavailable_content(
     assert all(len(tree.entries) == 1 for tree in index.snapshots.values())
 
 
-def test_insufficient_github_budget_falls_back_to_changed_file_context(tmp_path: Path) -> None:
-    """Keep legacy changed-file review available when tree capture has no safe request room."""
+def test_insufficient_github_budget_fails_repository_capture(tmp_path: Path) -> None:
+    """A requested repository review cannot silently downgrade its source access."""
     server = Server()
 
     class LimitedGitHub:
@@ -319,10 +412,14 @@ def test_insufficient_github_budget_falls_back_to_changed_file_context(tmp_path:
         def pages(self, *args: object, **kwargs: object) -> object:
             return server.gh.pages(*args, **kwargs)
 
-    context = prepare(
-        LimitedGitHub(), "owner/repo", 1, "reviewer", repository_directory=tmp_path / "repository"
-    )
-    assert context.repository_digest is None
+    with pytest.raises(ValueError, match="Insufficient GitHub request budget"):
+        prepare(
+            LimitedGitHub(),
+            "owner/repo",
+            1,
+            "reviewer",
+            repository_directory=tmp_path / "repository",
+        )
     assert not (tmp_path / "repository" / "index.json").exists()
 
 
@@ -388,9 +485,10 @@ class SDKItem:
         return self.__dict__
 
 
+@pytest.mark.parametrize("missing_usage", [None, 0, 1])
 @pytest.mark.parametrize("role", ["openai", "claude"])
 def test_provider_tool_round_trip_is_offline_and_records_cost_and_evidence(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str, missing_usage: int | None
 ) -> None:
     """Both provider adapters send bounded search results back before final JSON."""
     _, repository = make_repository(tmp_path)
@@ -418,9 +516,7 @@ def test_provider_tool_round_trip_is_offline_and_records_cost_and_evidence(
             "query": "edit_roles",
         },
     )
-    report = ChunkReview(
-        complete=True, summary="Inspected the declaration.", findings=[], requests=[]
-    )
+    report = Review(complete=True, summary="Inspected the declaration.", findings=[])
     reasoning = SDKItem(
         type="reasoning",
         id="rs_123",
@@ -463,7 +559,11 @@ def test_provider_tool_round_trip_is_offline_and_records_cost_and_evidence(
 
     def generate(**kwargs: object) -> SimpleNamespace:
         generations.append(kwargs)
-        return [first, final][len(generations) - 1]
+        index = len(generations) - 1
+        response = [first, final][index]
+        if missing_usage == index:
+            response.usage = None
+        return response
 
     client = SimpleNamespace(
         responses=SimpleNamespace(
@@ -479,10 +579,18 @@ def test_provider_tool_round_trip_is_offline_and_records_cost_and_evidence(
     assert len(generations) == 2
     assert all(count["tools"] for count in counts)
     usage_result = json.loads((target / f"{role}.usage.json").read_text())
-    assert usage_result["input"] == 200
+    if missing_usage is None:
+        assert usage_result["input"] == 200
+    else:
+        assert usage_result is None
     rows = (target / "repository-tools.jsonl").read_text().splitlines()
     assert len(rows) == 1 and json.loads(rows[0])["result"]["matches"][0]["line"] == 469
-    assert ChunkReview.model_validate_json((target / f"{role}.json").read_text()) == report
+    assert (
+        ChunkReview.model_validate_json((target / f"{role}.json").read_text()).model_dump(
+            exclude={"requests"}
+        )
+        == report.model_dump()
+    )
     if role == "openai":
         assert "tools" in generations[0]
         assert generations[0]["include"] == ["reasoning.encrypted_content"]

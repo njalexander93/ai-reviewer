@@ -596,6 +596,10 @@ def advance(
         ValueError: Completion conflicts with requests, requested source is unavailable,
             or the continuation exceeds the packet ceiling.
     """
+    # Execution and replay both prohibit the legacy protocol for repository reviews.
+    if context.repository_digest is not None:
+        if history or report.requests or not report.complete:
+            raise ValueError("Repository review requires one complete report without requests")
     # Complete work must have no outstanding required source requests.
     if report.complete:
         if report.requests:
@@ -658,8 +662,6 @@ def run_assignment(
         report, rejected = filter_report(
             anchors, ChunkReview.model_validate_json((target / f"{role}.json").read_text())
         )
-        if repository is not None and report.requests:
-            raise ValueError("Repository tools replace changed-file follow-up requests")
         # Persist diagnostics before completion or continuation checks can fail.
         if rejected:
             (target / "rejected-findings.json").write_text(

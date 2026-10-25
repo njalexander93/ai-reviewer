@@ -21,9 +21,9 @@ from tests.test_work import fake_model, large_context
 @pytest.mark.parametrize(
     "claude,openai,expected,compiler",
     [
-        ("", "key", ["openai"], "luna"),
-        ("key", " ", ["claude"], "haiku"),
-        ("key", "key", ["claude", "openai"], "haiku"),
+        ("", "key", ["openai"], "sol"),
+        ("key", " ", ["claude"], "sonnet"),
+        ("key", "key", ["claude", "openai"], "sonnet"),
     ],
 )
 def test_selected_providers_complete_pipeline(
@@ -171,7 +171,7 @@ def test_missing_dual_provider_evidence_cannot_be_reinterpreted(
 
 
 @pytest.mark.parametrize(
-    "key,compiler", [("OPENAI_API_KEY", "luna"), ("ANTHROPIC_API_KEY", "haiku")]
+    "key,compiler", [("OPENAI_API_KEY", "sol"), ("ANTHROPIC_API_KEY", "sonnet")]
 )
 def test_consolidation_uses_only_the_validated_provider_selection(
     monkeypatch: pytest.MonkeyPatch,

@@ -339,6 +339,7 @@ class RepositoryTools:
     def for_attempt(self, event_path: Path) -> "RepositoryTools":
         """Create fresh accounting and an isolated event log over the same snapshots."""
         event_path.parent.mkdir(parents=True, exist_ok=True)
+        event_path.touch(exist_ok=False)
         return RepositoryTools(self.index, self.blob_dir, event_path, entries=self.entries)
 
     def account_tokens(self, count: int) -> None:
@@ -563,19 +564,33 @@ class RepositoryTools:
             source = lines(self._read_text(found))
             if start > len(source):
                 return {"revision": revision, "path": path, "diagnostic": "line range unavailable"}
-            selected = "".join(source[start - 1 : min(end, len(source))])
-            clipped = len(selected.encode()) > REPOSITORY_TOOL_VISIBLE_RESULT_BYTES
-            while len(selected.encode()) > REPOSITORY_TOOL_VISIBLE_RESULT_BYTES:
-                selected = selected[: len(selected) // 2]
+            # Page whole lines by serialized bytes, including JSON escaping.
+            selected = ""
+            actual_end = start - 1
+            for line_number in range(start, min(end, len(source)) + 1):
+                candidate_text = selected + source[line_number - 1]
+                if len(encode(candidate_text).encode()) > REPOSITORY_TOOL_VISIBLE_RESULT_BYTES:
+                    if not selected:
+                        return {
+                            "revision": revision,
+                            "path": path,
+                            "line": line_number,
+                            "diagnostic": "line exceeds serialized result limit",
+                        }
+                    break
+                selected = candidate_text
+                actual_end = line_number
+            clipped = actual_end < min(end, len(source))
             return {
                 "revision": revision,
                 "commit": self.index.snapshots[revision].commit,
                 "path": path,
                 "blob": found.blob,
                 "start": start,
-                "end": min(end, len(source)),
+                "end": actual_end,
                 "text": selected,
                 "truncated": clipped or end > len(source),
+                "next_start": actual_end + 1 if clipped else None,
             }
         raise ValueError("unknown repository tool")
 

@@ -71,11 +71,13 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
         if preflight:
             return
         directory.mkdir(parents=True, exist_ok=True)
+        if repository is not None:
+            (directory / "repository-tools.jsonl").write_text("")
         # Retain the actual stage input before selecting its response contract.
         payloads[role] = json.loads(payload)
         report = (
             Consolidation(summary="Both reviewers found no blockers.", groups=[])
-            if role in ("haiku", "luna")
+            if role in ("sonnet", "sol")
             else ChunkReview(complete=True, summary=f"{role} completed", findings=[], requests=[])
         )
         # Match the artifact interface consumed by the next real CLI stage.
@@ -93,7 +95,7 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     assert payloads["claude"]["repository_digest"]
     assert (tmp_path / "repository" / "index.json").exists()
     assert payloads["claude"]["issues"][0]["description"] == "Retain prior edits."
-    assert payloads["haiku"]["reviews"][:2] == [
+    assert payloads["sonnet"]["reviews"][:2] == [
         "claude completed",
         "openai completed",
     ]
