@@ -135,7 +135,7 @@ def prepare(
         issues=issues,
     )
     # Capture complete tracked source separately; prompts receive only its digest.
-    if repository_directory is not None:
+    if repository_directory is not None and gh.requests_remaining >= 8:
         context.repository_digest = capture_repository(gh, context, repository_directory).digest
     # Budget only the evidence that will actually reach the providers.
     plan(context)

@@ -481,7 +481,13 @@ def test_token_overflow_replans_before_generation(
     generated = []
 
     def model(
-        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
+        role: str,
+        payload: str,
+        directory: Path,
+        *,
+        kind: str = "whole",
+        preflight: bool = False,
+        repository: object | None = None,
     ) -> None:
         """Reject only the selected role's whole preflight, then delegate to fake_model.
 
@@ -605,7 +611,13 @@ def test_capacity_fallback_bounds_integration_and_followup_payloads(
     requested = set()
 
     def model(
-        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
+        role: str,
+        payload: str,
+        directory: Path,
+        *,
+        kind: str = "whole",
+        preflight: bool = False,
+        repository: object | None = None,
     ) -> None:
         """Reject oversized input, then request source once per local provider assignment.
 

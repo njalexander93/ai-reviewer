@@ -207,7 +207,9 @@ replace the old 80-file and 150 KB per-version rejection.
    patches account for the complete before/after change. Reconstruct missing
    text patches with Git over inert blobs. Binary, unreadable, truncated or
    unsupported changed-file objects still fail without approval. Separately save
-   complete tracked-file indexes and bounded UTF-8 blobs for all three revisions.
+   complete tracked-file indexes and best-effort bounded UTF-8 blobs for all three
+   revisions. Blob and byte limits leave uncaptured files indexed as unavailable.
+   If fewer than eight GitHub requests remain, use the changed-file review protocol.
 2. Keep a whole file when it fits the unit budget. For oversized text, prefer
    Python function/class boundaries, then diff sections, then physical patch
    lines. Other languages use diff boundaries. Retain original patch records,
@@ -317,7 +319,7 @@ Operational defaults are deliberate finite safeguards, not performance optima:
 | Boundary | Default | Reason |
 | --- | --- | --- |
 | Changed-file collection | 3,000 files; 8 MB/blob; 32 MB snapshot; 10,000 API requests/client; 20,000 direct relations | Bound PR evidence collection |
-| Repository snapshots | 50,000 tracked entries per revision; 2 MB per captured blob; 100 MB total unique captured bytes; recursive Git trees must be complete | Bound immutable head/comparison/base capture; binary, symlink, submodule and oversized blobs stay listed with diagnostics |
+| Repository snapshots | 50,000 tracked entries per revision; at most 4,000 unique blob requests, reserving six tree reads and two preparation requests; 2 MB per captured blob; 100 MB total unique captured bytes; recursive Git trees must be complete | Bound immutable head/comparison/base capture; binary, symlink, submodule, oversized and uncaptured blobs stay listed with diagnostics |
 | Local planning | 64 chunks | Bound partition growth |
 | Local + integration work | 128 assignments, each reviewed by all enabled providers | Bound relationship expansion and spending |
 | Follow-ups | 3 total attempts/provider/assignment | Resolve missing evidence without an open-ended loop |

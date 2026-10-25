@@ -16,15 +16,22 @@ from ai_reviewer.contracts import Contract, ReviewContext
 from ai_reviewer.github import GitHub
 from ai_reviewer.limits import (
     MAX_REPOSITORY_BLOB_BYTES,
+    MAX_REPOSITORY_BLOB_REQUESTS,
     MAX_REPOSITORY_BYTES,
     MAX_REPOSITORY_FILES,
     REPOSITORY_CONTEXT_TOKENS,
     REPOSITORY_PAGE_SIZE,
     REPOSITORY_RANGE_LINES,
+    REPOSITORY_SEARCH_FILE_BYTES,
+    REPOSITORY_SEARCH_FILES,
+    REPOSITORY_SEARCH_LINE_CHARS,
+    REPOSITORY_SEARCH_MATCHES,
+    REPOSITORY_SEARCH_QUERY_CHARS,
     REPOSITORY_TOOL_CALLS,
     REPOSITORY_TOOL_RESULT_BYTES,
     REPOSITORY_TOOL_SECONDS,
     REPOSITORY_TOOL_TOTAL_BYTES,
+    REPOSITORY_TOOL_VISIBLE_RESULT_BYTES,
 )
 from ai_reviewer.patch import lines
 from ai_reviewer.serialization import digest, encode
@@ -47,7 +54,7 @@ class SnapshotEntry(Contract):
     mode: str
     blob: str | None
     size: int
-    status: Literal["text", "binary", "oversized", "symlink", "submodule"]
+    status: Literal["text", "binary", "oversized", "unavailable", "symlink", "submodule"]
 
 
 class TreeSnapshot(Contract):
@@ -138,7 +145,8 @@ def _read_repository_blob(gh: GitHub, repo: str, sha: str, size: int) -> bytes:
     blob = gh.request("GET", f"/repos/{repo}/git/blobs/{sha}")
     if blob.get("encoding") != "base64" or blob.get("size") != size:
         raise RepositorySnapshotError("Repository blob metadata does not match its tree")
-    raw = base64.b64decode(blob["content"], validate=True)
+    encoded = re.sub(r"[\t\n\r ]", "", blob["content"])
+    raw = base64.b64decode(encoded, validate=True)
     if len(raw) != size or _git_blob_sha(raw) != sha:
         raise RepositorySnapshotError("Repository blob content does not match its Git SHA")
     return raw
@@ -156,7 +164,7 @@ def capture_repository(gh: GitHub, context: ReviewContext, directory: Path) -> S
         Snapshot index whose digest binds every revision, tree and entry.
 
     Raises:
-        RepositorySnapshotError: Tree completeness or aggregate text-byte limits fail.
+        RepositorySnapshotError: A tracked tree is incomplete or exceeds its file limit.
         OSError: The run artifact cannot be written.
         RuntimeError: GitHub rejects a required immutable tree or blob read.
     """
@@ -171,8 +179,13 @@ def capture_repository(gh: GitHub, context: ReviewContext, directory: Path) -> S
     trees: dict[Revision, TreeSnapshot] = {}
     trees_by_commit: dict[str, TreeSnapshot] = {}
     cached_trees: dict[str, tuple[str, list[dict[str, Any]]]] = {}
-    cached_status: dict[str, Literal["text", "binary"]] = {}
+    cached_status: dict[str, Literal["text", "binary", "unavailable"]] = {}
     total_bytes = 0
+    blob_requests = 0
+    request_budget = min(
+        MAX_REPOSITORY_BLOB_REQUESTS,
+        max(0, getattr(gh, "requests_remaining", MAX_REPOSITORY_BLOB_REQUESTS + 8) - 8),
+    )
 
     # Capture each unique revision once; source bytes are deduplicated by blob SHA.
     for side, commit in revisions.items():
@@ -187,7 +200,7 @@ def capture_repository(gh: GitHub, context: ReviewContext, directory: Path) -> S
             mode = raw_entry["mode"]
             blob = raw_entry["sha"] if raw_entry["type"] == "blob" else None
             size = raw_entry.get("size", 0)
-            status: Literal["text", "binary", "oversized", "symlink", "submodule"]
+            status: Literal["text", "binary", "oversized", "unavailable", "symlink", "submodule"]
             if mode == "120000":
                 status = "symlink"
             elif mode == "160000":
@@ -196,7 +209,11 @@ def capture_repository(gh: GitHub, context: ReviewContext, directory: Path) -> S
                 status = "oversized"
             elif cached_status.get(blob or "") is not None:
                 status = cached_status[blob or ""]
+            elif blob_requests >= request_budget or total_bytes + size > MAX_REPOSITORY_BYTES:
+                status = "unavailable"
+                cached_status[blob or ""] = status
             else:
+                blob_requests += 1
                 raw = _read_repository_blob(gh, context.repo, blob or "", size)
                 try:
                     decoded = raw.decode("utf-8")
@@ -204,8 +221,6 @@ def capture_repository(gh: GitHub, context: ReviewContext, directory: Path) -> S
                 except UnicodeDecodeError:
                     status = "binary"
                 total_bytes += len(raw)
-                if total_bytes > MAX_REPOSITORY_BYTES:
-                    raise RepositorySnapshotError("Repository snapshot byte limit exceeded")
                 if status == "text":
                     blob_path = blob_dir / (blob or "")
                     if not blob_path.exists():
@@ -328,9 +343,15 @@ class RepositoryTools:
 
     def account_tokens(self, count: int) -> None:
         """Charge a counted provider request against the assignment context-token ceiling."""
+        self.check_time()
         self.context_tokens += count
         if self.context_tokens > REPOSITORY_CONTEXT_TOKENS:
             self.exhaust("context_tokens", REPOSITORY_CONTEXT_TOKENS)
+
+    def check_time(self) -> None:
+        """Stop between provider or tool requests when the assignment deadline expires."""
+        if time.monotonic() - self.started >= REPOSITORY_TOOL_SECONDS:
+            self.exhaust("seconds", REPOSITORY_TOOL_SECONDS)
 
     def exhaust(self, reason: str, limit: int) -> None:
         """Persist a source-free budget diagnostic, then fail this required assignment."""
@@ -363,8 +384,7 @@ class RepositoryTools:
             RepositorySnapshotError: Call, result-byte or wall-clock budget is exhausted;
                 artifact content is missing or fails its Git SHA verification.
         """
-        if time.monotonic() - self.started > REPOSITORY_TOOL_SECONDS:
-            self.exhaust("seconds", REPOSITORY_TOOL_SECONDS)
+        self.check_time()
         if self.calls >= REPOSITORY_TOOL_CALLS:
             self.exhaust("calls", REPOSITORY_TOOL_CALLS)
         self.calls += 1
@@ -372,6 +392,8 @@ class RepositoryTools:
             return self._record(name, {}, {"error": "arguments must be an object"}, call_id)
         try:
             result = self._execute(name, arguments)
+        except RepositorySnapshotError:
+            raise
         except (ValueError, KeyError, TypeError) as error:
             result = {"error": str(error)}
         return self._record(name, arguments, result, call_id)
@@ -428,7 +450,7 @@ class RepositoryTools:
             page: list[dict[str, Any]] = []
             for path in paths[offset : offset + limit]:
                 candidate = [*page, entries[path].model_dump()]
-                if len(encode(candidate).encode()) > REPOSITORY_TOOL_RESULT_BYTES // 2:
+                if len(encode(candidate).encode()) > REPOSITORY_TOOL_VISIBLE_RESULT_BYTES:
                     break
                 page.append(entries[path].model_dump())
             if not page and offset < len(paths):
@@ -451,13 +473,19 @@ class RepositoryTools:
                 arguments["limit"],
                 arguments["query"],
             )
-            if not isinstance(query, str) or not query or len(query) > 200:
-                raise ValueError("query must contain 1 to 200 literal characters")
+            if (
+                not isinstance(query, str)
+                or not query
+                or len(query) > REPOSITORY_SEARCH_QUERY_CHARS
+            ):
+                raise ValueError(
+                    f"query must contain 1 to {REPOSITORY_SEARCH_QUERY_CHARS} literal characters"
+                )
             if not isinstance(prefix, str) or not _valid_path(prefix, allow_empty=True):
                 raise ValueError("invalid repository path prefix")
             if not isinstance(cursor, str) or not re.fullmatch(r"[0-9]+:[0-9]+", cursor):
                 raise ValueError("cursor must be a file:line offset")
-            if type(limit) is not int or not 1 <= limit <= 25:
+            if type(limit) is not int or not 1 <= limit <= REPOSITORY_SEARCH_MATCHES:
                 raise ValueError("limit must be within the search page bound")
             paths = [p for p in sorted(entries) if p.startswith(prefix)]
             offset, line_offset = (int(value) for value in cursor.split(":"))
@@ -466,10 +494,10 @@ class RepositoryTools:
             scanned = 0
             needle = query.casefold()
             next_cursor = ""
-            result_bound = REPOSITORY_TOOL_RESULT_BYTES // 2
+            result_bound = REPOSITORY_TOOL_VISIBLE_RESULT_BYTES
             for file_index in range(offset, len(paths)):
                 path = paths[file_index]
-                if len(matches) >= limit or scanned >= 500:
+                if len(matches) >= limit or scanned >= REPOSITORY_SEARCH_FILES:
                     next_cursor = f"{file_index}:0"
                     break
                 scanned += 1
@@ -479,7 +507,7 @@ class RepositoryTools:
                     continue
                 text = self._read_text(entry)
                 records = lines(text)
-                byte_limit = MAX_REPOSITORY_BLOB_BYTES * 2
+                byte_limit = REPOSITORY_SEARCH_FILE_BYTES
                 for line_index in range(line_offset if file_index == offset else 0, len(records)):
                     line = records[line_index]
                     byte_limit -= len(line.encode())
@@ -490,8 +518,8 @@ class RepositoryTools:
                         match = {
                             "path": path,
                             "line": line_index + 1,
-                            "text": line.rstrip("\n")[:80],
-                            "line_truncated": len(line.rstrip("\n")) > 80,
+                            "text": line.rstrip("\n")[:REPOSITORY_SEARCH_LINE_CHARS],
+                            "line_truncated": len(line.rstrip("\n")) > REPOSITORY_SEARCH_LINE_CHARS,
                         }
                         if len(encode([*matches, match]).encode()) > result_bound:
                             next_cursor = f"{file_index}:{line_index}"
@@ -536,8 +564,8 @@ class RepositoryTools:
             if start > len(source):
                 return {"revision": revision, "path": path, "diagnostic": "line range unavailable"}
             selected = "".join(source[start - 1 : min(end, len(source))])
-            clipped = len(selected.encode()) > REPOSITORY_TOOL_RESULT_BYTES // 2
-            while len(selected.encode()) > REPOSITORY_TOOL_RESULT_BYTES // 2:
+            clipped = len(selected.encode()) > REPOSITORY_TOOL_VISIBLE_RESULT_BYTES
+            while len(selected.encode()) > REPOSITORY_TOOL_VISIBLE_RESULT_BYTES:
                 selected = selected[: len(selected) // 2]
             return {
                 "revision": revision,

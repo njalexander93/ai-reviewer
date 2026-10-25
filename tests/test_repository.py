@@ -1,5 +1,6 @@
 """Exercise immutable full-source snapshots and their bounded provider tools."""
 
+import base64
 import hashlib
 import json
 from collections.abc import Callable
@@ -10,6 +11,7 @@ import pytest
 
 from ai_reviewer import models
 from ai_reviewer import repository as repository_module
+from ai_reviewer.context import prepare
 from ai_reviewer.contracts import ChunkReview, ReviewContext
 from ai_reviewer.repository import (
     RepositorySnapshotError,
@@ -17,10 +19,13 @@ from ai_reviewer.repository import (
     SnapshotEntry,
     SnapshotIndex,
     TreeSnapshot,
+    _read_repository_blob,
+    capture_repository,
     load_repository,
 )
+from ai_reviewer.repository_evidence import replay_tool_events, tool_events_digest
 from ai_reviewer.serialization import digest, encode
-from ai_reviewer.work import attempt_directory, replay_tool_events, tool_events_digest
+from ai_reviewer.work import attempt_directory
 from tests.test_github import Server, bundle
 
 
@@ -219,6 +224,108 @@ def test_paths_ranges_and_pagination_are_bounded_and_replayable(tmp_path: Path) 
         replay_tool_events(context, tmp_path, "whole", "claude", 1, expected)
 
 
+def test_snapshot_integrity_error_fails_instead_of_becoming_tool_result(tmp_path: Path) -> None:
+    """Missing captured blobs fail the assignment instead of returning a recoverable error."""
+    _, repository = make_repository(tmp_path)
+    entry = repository.entries["head"]["task_boundary.py"]
+    (repository.blob_dir / entry.blob).unlink()
+    with pytest.raises(RepositorySnapshotError, match="missing or unsafe"):
+        repository.invoke(
+            "read_repository_lines",
+            {"revision": "head", "path": "task_boundary.py", "start": 469, "end": 470},
+        )
+
+
+def test_github_wrapped_base64_blob_is_decoded_and_verified() -> None:
+    """The blob reader accepts GitHub's line-wrapped base64 while keeping SHA checks."""
+    raw = b"print('wrapped')\n"
+    sha = git_sha(raw.decode())
+    wrapped = base64.b64encode(raw).decode()
+    wrapped = wrapped[:8] + "\n" + wrapped[8:] + "\n"
+
+    class GitHubBlob:
+        def request(self, *_: object, **__: object) -> dict[str, object]:
+            return {"encoding": "base64", "size": len(raw), "content": wrapped}
+
+    assert _read_repository_blob(GitHubBlob(), "owner/repo", sha, len(raw)) == raw
+
+
+def test_blob_request_budget_keeps_complete_inventory_with_unavailable_content(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Capture stops fetching at its request cap while retaining all tracked paths."""
+    context = bundle(Server())[0]
+    monkeypatch.setattr(repository_module, "MAX_REPOSITORY_BLOB_REQUESTS", 1)
+    sources = {
+        context.head: b"head source\n",
+        context.diff_base: b"comparison source\n",
+        context.base: b"base source\n",
+    }
+    blobs = {git_sha(value.decode()): value for value in sources.values()}
+
+    class GitHubTrees:
+        def request(self, _method: str, path: str, **_: object) -> dict[str, object]:
+            commit = path.rsplit("/", 1)[1]
+            if "/git/commits/" in path:
+                return {"tree": {"sha": commit}}
+            if "/git/trees/" in path:
+                raw = sources[commit]
+                sha = git_sha(raw.decode())
+                return {
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": f"{commit[:4]}.py",
+                            "type": "blob",
+                            "mode": "100644",
+                            "sha": sha,
+                            "size": len(raw),
+                        }
+                    ],
+                }
+            sha = path.rsplit("/", 1)[1]
+            return {
+                "encoding": "base64",
+                "size": len(blobs[sha]),
+                "content": base64.b64encode(blobs[sha]).decode(),
+            }
+
+    index = capture_repository(GitHubTrees(), context, tmp_path / "repository")
+    assert (
+        sum(entry.status == "text" for tree in index.snapshots.values() for entry in tree.entries)
+        == 1
+    )
+    assert (
+        sum(
+            entry.status == "unavailable"
+            for tree in index.snapshots.values()
+            for entry in tree.entries
+        )
+        == 2
+    )
+    assert all(len(tree.entries) == 1 for tree in index.snapshots.values())
+
+
+def test_insufficient_github_budget_falls_back_to_changed_file_context(tmp_path: Path) -> None:
+    """Keep legacy changed-file review available when tree capture has no safe request room."""
+    server = Server()
+
+    class LimitedGitHub:
+        requests_remaining = 7
+
+        def request(self, *args: object, **kwargs: object) -> object:
+            return server.gh.request(*args, **kwargs)
+
+        def pages(self, *args: object, **kwargs: object) -> object:
+            return server.gh.pages(*args, **kwargs)
+
+    context = prepare(
+        LimitedGitHub(), "owner/repo", 1, "reviewer", repository_directory=tmp_path / "repository"
+    )
+    assert context.repository_digest is None
+    assert not (tmp_path / "repository" / "index.json").exists()
+
+
 @pytest.mark.parametrize(
     "budget,limit",
     [
@@ -314,6 +421,13 @@ def test_provider_tool_round_trip_is_offline_and_records_cost_and_evidence(
     report = ChunkReview(
         complete=True, summary="Inspected the declaration.", findings=[], requests=[]
     )
+    reasoning = SDKItem(
+        type="reasoning",
+        id="rs_123",
+        summary=[],
+        encrypted_content="opaque-encrypted-reasoning",
+        status="completed",
+    )
 
     def usage() -> SimpleNamespace:
         return SimpleNamespace(
@@ -325,7 +439,7 @@ def test_provider_tool_round_trip_is_offline_and_records_cost_and_evidence(
         )
 
     first = SimpleNamespace(
-        output=[tool_call],
+        output=[reasoning, tool_call] if role == "openai" else [tool_call],
         usage=usage(),
         status="completed",
         output_parsed=None,
@@ -371,6 +485,12 @@ def test_provider_tool_round_trip_is_offline_and_records_cost_and_evidence(
     assert ChunkReview.model_validate_json((target / f"{role}.json").read_text()) == report
     if role == "openai":
         assert "tools" in generations[0]
+        assert generations[0]["include"] == ["reasoning.encrypted_content"]
+        assert any(
+            item.get("type") == "reasoning"
+            and item.get("encrypted_content") == "opaque-encrypted-reasoning"
+            for item in generations[1]["input"]
+        )
         assert any(item.get("type") == "function_call_output" for item in generations[1]["input"])
     else:
         assert "tools" in generations[0]

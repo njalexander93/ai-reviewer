@@ -7,7 +7,7 @@ Unknown usage stays unknown; API exceptions are not printed because they may ech
 
 import json
 import os
-import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -23,7 +23,10 @@ from ai_reviewer.limits import (
     MODEL_REPORT_BYTES,
     PACKET_BYTES,
     PROVIDER_TIMEOUT_SECONDS,
-    REPOSITORY_TOOL_SECONDS,
+    REPOSITORY_RANGE_LINES,
+    REPOSITORY_REQUEST_TIMEOUT_SECONDS,
+    REPOSITORY_SEARCH_FILES,
+    REPOSITORY_SEARCH_MATCHES,
     REPOSITORY_TOOL_TURNS,
 )
 from ai_reviewer.repository import RepositorySnapshotError, RepositoryTools
@@ -101,8 +104,10 @@ REPOSITORY_TOOL_SCHEMAS: list[dict] = [
             "Search literal case-insensitive text in tracked UTF-8 source from one immutable PR "
             "snapshot. Use a short distinctive name or phrase, then read the relevant bounded "
             'line range. Start with cursor "0:0"; continue with the returned file:line cursor '
-            "while nonempty. Limit must be from 1 to 25. Each call scans at most 500 files, and "
-            "skipped binary, symlink, submodule, and oversized files are counted in the result."
+            f"while nonempty. Limit must be from 1 to {REPOSITORY_SEARCH_MATCHES}. "
+            f"Each call scans at most {REPOSITORY_SEARCH_FILES} files, and "
+            "skipped binary, symlink, submodule, oversized, and uncaptured files "
+            "are counted in the result."
         ),
         "properties": {
             "revision": {"type": "string", "enum": ["head", "comparison", "base"]},
@@ -116,10 +121,12 @@ REPOSITORY_TOOL_SCHEMAS: list[dict] = [
     {
         "name": "read_repository_lines",
         "description": (
-            "Read at most 200 inclusive source lines from a tracked text file at one immutable "
+            f"Read at most {REPOSITORY_RANGE_LINES} inclusive source lines from a tracked "
+            "text file at one immutable "
             "PR snapshot. Select head, comparison (the exact diff-base side), or base (the pull "
             "request target tip). Start and end are one-based and inclusive. A missing, binary, "
-            "symlink, submodule, oversized, or unavailable range returns a diagnostic; very long "
+            "symlink, submodule, oversized, uncaptured, or unavailable range "
+            "returns a diagnostic; very long "
             "selected text is clipped and marked truncated."
         ),
         "properties": {
@@ -342,6 +349,29 @@ def _sdk_dict(item: Any) -> dict[str, Any]:
     return cast(dict[str, Any], item.model_dump(mode="json", exclude_none=True))
 
 
+def _parse_arguments(value: str) -> dict[str, Any]:
+    """Decode provider tool JSON, preserving malformed input as a safe validation error."""
+    try:
+        arguments = json.loads(value)
+    except TypeError, json.JSONDecodeError:
+        return {"_invalid_arguments": True}
+    return arguments if isinstance(arguments, dict) else {"_invalid_arguments": True}
+
+
+def _append_openai_turn(
+    history: list[dict[str, Any]],
+    response: Any,
+    results: list[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    """Retain all output items and append matching function results to Responses input."""
+    history.extend(_sdk_dict(item) for item in response.output)
+    history.extend(
+        {"type": "function_call_output", "call_id": call_id, "output": result}
+        for call_id, result in results
+    )
+    return history
+
+
 def _add_usage(total: Usage | None, current: Usage | None) -> Usage | None:
     """Accumulate provider-reported usage across one bounded tool-assisted review."""
     if current is None:
@@ -354,6 +384,57 @@ def _add_usage(total: Usage | None, current: Usage | None) -> Usage | None:
         cached=total.cached + current.cached,
         cache_write=total.cache_write + current.cache_write,
     )
+
+
+@dataclass(frozen=True)
+class ProviderAdapter:
+    """Translate provider wire shapes for the shared bounded turn loop."""
+
+    initial: Any
+    count: Callable[[Any], int]
+    generate: Callable[[Any], Any]
+    usage: Callable[[Any], Usage | None]
+    calls: Callable[[Any], list[tuple[str, dict[str, Any], str]]]
+    continue_turn: Callable[[Any, Any, list[tuple[str, str]]], Any]
+    finish: Callable[[Any], tuple[Any, bool]]
+
+
+def _run_provider_turns(
+    adapter: ProviderAdapter,
+    *,
+    payload: str,
+    session: RepositoryTools | None,
+    preflight: bool,
+    usage_path: Path,
+) -> tuple[Any, bool] | None:
+    """Count, generate and continue one provider through a shared finite state machine."""
+    current = adapter.initial
+    aggregate: Usage | None = None
+    for turn in range(REPOSITORY_TOOL_TURNS if session else 1):
+        count = adapter.count(current)
+        check_capacity(payload if turn == 0 else encode(current), count)
+        if session:
+            session.account_tokens(count)
+        if preflight:
+            return None
+        usage_path.write_text("null")
+        response = adapter.generate(current)
+        aggregate = _add_usage(aggregate, adapter.usage(response))
+        if aggregate is not None:
+            usage_path.write_text(aggregate.model_dump_json())
+        calls = adapter.calls(response) if session else []
+        if not calls:
+            return adapter.finish(response)
+        if session is None:
+            raise ValueError("Unexpected repository tool call without a snapshot")
+        if turn + 1 >= REPOSITORY_TOOL_TURNS:
+            session.exhaust("turns", REPOSITORY_TOOL_TURNS)
+        results = [
+            (call_id, session.invoke(name, arguments, call_id))
+            for name, arguments, call_id in calls
+        ]
+        current = adapter.continue_turn(current, response, results)
+    raise RepositorySnapshotError("Repository tool turn budget exhausted")
 
 
 def call_model(
@@ -402,187 +483,142 @@ def call_model(
         )
         schema, instructions = request_contract(role, kind, repository_enabled=session is not None)
         tools = repository_tool_definitions(spec.provider) if session else None
-        aggregate: Usage | None = None
         if spec.provider == "openai":
             openai_client: Any = openai.OpenAI(
-                max_retries=0, timeout=120 if session else PROVIDER_TIMEOUT_SECONDS
+                max_retries=0,
+                timeout=REPOSITORY_REQUEST_TIMEOUT_SECONDS if session else PROVIDER_TIMEOUT_SECONDS,
             )
             history: list[dict[str, Any]] = [{"role": "user", "content": payload}]
-            current_input: str | list[dict[str, Any]] = payload
-            final_response = None
-            # Each continuation is counted and timed before another generation is allowed.
-            for turn in range(REPOSITORY_TOOL_TURNS if session else 1):
-                count = openai_client.responses.input_tokens.count(
+            adapter = ProviderAdapter(
+                initial=payload,
+                count=lambda current: (
+                    openai_client.responses.input_tokens.count(
+                        model=spec.model,
+                        instructions=instructions,
+                        input=current,
+                        reasoning={"effort": "medium"},
+                        truncation="disabled",
+                        **({"tools": tools} if session else {}),
+                        text={
+                            "format": {
+                                "type": "json_schema",
+                                "name": schema.__name__,
+                                "schema": schema.model_json_schema(),
+                                "strict": True,
+                            }
+                        },
+                    ).input_tokens
+                ),
+                generate=lambda current: openai_client.responses.parse(
                     model=spec.model,
                     instructions=instructions,
-                    input=current_input,
-                    reasoning={"effort": "medium"},
-                    truncation="disabled",
-                    **({"tools": tools} if session else {}),
-                    text={
-                        "format": {
-                            "type": "json_schema",
-                            "name": schema.__name__,
-                            "schema": schema.model_json_schema(),
-                            "strict": True,
-                        }
-                    },
-                ).input_tokens
-                check_capacity(
-                    payload if isinstance(current_input, str) else encode(current_input), count
-                )
-                if session:
-                    if time.monotonic() - session.started >= REPOSITORY_TOOL_SECONDS:
-                        session.exhaust("seconds", REPOSITORY_TOOL_SECONDS)
-                    session.account_tokens(count)
-                if preflight:
-                    return
-                # A failed later turn makes total paid usage unknown, not a partial total.
-                phase = "generation"
-                usage_path.write_text("null")
-                response = openai_client.responses.parse(
-                    model=spec.model,
-                    instructions=instructions,
-                    input=current_input,
+                    input=current,
                     reasoning={"effort": "medium"},
                     text_format=schema,
                     max_output_tokens=MAX_OUTPUT_TOKENS,
                     store=False,
                     truncation="disabled",
                     service_tier="default",
+                    **({"include": ["reasoning.encrypted_content"]} if session else {}),
                     **({"tools": tools, "parallel_tool_calls": False} if session else {}),
-                )
-                phase = "validate_response"
-                if response.usage:
-                    token_usage = response.usage
-                    cached = token_usage.input_tokens_details.cached_tokens or 0
-                    aggregate = _add_usage(
-                        aggregate,
-                        Usage(
-                            input=token_usage.input_tokens - cached,
-                            output=token_usage.output_tokens,
-                            cached=cached,
-                            cache_write=0,
-                        ),
+                ),
+                usage=lambda response: (
+                    Usage(
+                        input=response.usage.input_tokens
+                        - (response.usage.input_tokens_details.cached_tokens or 0),
+                        output=response.usage.output_tokens,
+                        cached=response.usage.input_tokens_details.cached_tokens or 0,
+                        cache_write=0,
                     )
-                    assert aggregate is not None
-                    usage_path.write_text(aggregate.model_dump_json())
-                calls = (
-                    [
-                        item
-                        for item in response.output
-                        if getattr(item, "type", None) == "function_call"
-                    ]
-                    if session
-                    else []
-                )
-                if not calls:
-                    final_response = response
-                    break
-                if not session:
-                    raise ValueError("Unexpected repository tool call without a snapshot")
-                if turn + 1 >= REPOSITORY_TOOL_TURNS:
-                    session.exhaust("turns", REPOSITORY_TOOL_TURNS)
-                history.extend(_sdk_dict(item) for item in response.output)
-                for call in calls:
-                    try:
-                        arguments = json.loads(call.arguments)
-                    except TypeError, json.JSONDecodeError:
-                        arguments = {"_invalid_arguments": True}
-                    result = session.invoke(call.name, arguments, call.call_id)
-                    history.append(
-                        {"type": "function_call_output", "call_id": call.call_id, "output": result}
-                    )
-                current_input = history
-            if final_response is None:
-                raise RepositorySnapshotError("Repository tool turn budget exhausted")
-            parsed = final_response.output_parsed
-            completed = final_response.status == "completed"
+                    if response.usage
+                    else None
+                ),
+                calls=lambda response: [
+                    (item.name, _parse_arguments(item.arguments), item.call_id)
+                    for item in response.output
+                    if getattr(item, "type", None) == "function_call"
+                ],
+                continue_turn=lambda current, response, results: _append_openai_turn(
+                    history, response, results
+                ),
+                finish=lambda response: (response.output_parsed, response.status == "completed"),
+            )
         else:
             anthropic_client: Any = anthropic.Anthropic(
-                max_retries=0, timeout=120 if session else PROVIDER_TIMEOUT_SECONDS
+                max_retries=0,
+                timeout=REPOSITORY_REQUEST_TIMEOUT_SECONDS if session else PROVIDER_TIMEOUT_SECONDS,
             )
             messages: list[dict[str, Any]] = [{"role": "user", "content": payload}]
-            final_message = None
-            for turn in range(REPOSITORY_TOOL_TURNS if session else 1):
-                count = anthropic_client.messages.count_tokens(
+            adapter = ProviderAdapter(
+                initial=messages,
+                count=lambda current: (
+                    anthropic_client.messages.count_tokens(
+                        model=spec.model,
+                        system=instructions,
+                        messages=current,
+                        thinking={"type": "adaptive"},
+                        output_config={"effort": "medium"},
+                        output_format=schema,
+                        **({"tools": tools} if session else {}),
+                    ).input_tokens
+                ),
+                generate=lambda current: anthropic_client.messages.parse(
                     model=spec.model,
                     system=instructions,
-                    messages=messages,
-                    thinking={"type": "adaptive"},
-                    output_config={"effort": "medium"},
-                    output_format=schema,
-                    **({"tools": tools} if session else {}),
-                ).input_tokens
-                check_capacity(payload if len(messages) == 1 else encode(messages), count)
-                if session:
-                    if time.monotonic() - session.started >= REPOSITORY_TOOL_SECONDS:
-                        session.exhaust("seconds", REPOSITORY_TOOL_SECONDS)
-                    session.account_tokens(count)
-                if preflight:
-                    return
-                phase = "generation"
-                usage_path.write_text("null")
-                message = anthropic_client.messages.parse(
-                    model=spec.model,
-                    system=instructions,
-                    messages=messages,
+                    messages=current,
                     max_tokens=MAX_OUTPUT_TOKENS,
                     thinking={"type": "adaptive"},
                     output_config={"effort": "medium"},
                     output_format=schema,
                     service_tier="standard_only",
                     **({"tools": tools, "tool_choice": {"type": "auto"}} if session else {}),
-                )
-                phase = "validate_response"
-                if message.usage:
-                    current_usage = message.usage
-                    aggregate = _add_usage(
-                        aggregate,
-                        Usage(
-                            input=current_usage.input_tokens,
-                            output=current_usage.output_tokens,
-                            cached=current_usage.cache_read_input_tokens or 0,
-                            cache_write=current_usage.cache_creation_input_tokens or 0,
-                        ),
+                ),
+                usage=lambda response: (
+                    Usage(
+                        input=response.usage.input_tokens,
+                        output=response.usage.output_tokens,
+                        cached=response.usage.cache_read_input_tokens or 0,
+                        cache_write=response.usage.cache_creation_input_tokens or 0,
                     )
-                    assert aggregate is not None
-                    usage_path.write_text(aggregate.model_dump_json())
-                calls = (
-                    [
-                        block
-                        for block in message.content
-                        if getattr(block, "type", None) == "tool_use"
-                    ]
-                    if session
-                    else []
-                )
-                if not calls:
-                    final_message = message
-                    break
-                if not session:
-                    raise ValueError("Unexpected repository tool call without a snapshot")
-                if turn + 1 >= REPOSITORY_TOOL_TURNS:
-                    session.exhaust("turns", REPOSITORY_TOOL_TURNS)
-                messages.append(
+                    if response.usage
+                    else None
+                ),
+                calls=lambda response: [
+                    (block.name, block.input, block.id)
+                    for block in response.content
+                    if getattr(block, "type", None) == "tool_use"
+                ],
+                continue_turn=lambda current, response, results: [
+                    *current,
                     {
                         "role": "assistant",
-                        "content": [_sdk_dict(block) for block in message.content],
-                    }
-                )
-                results = [
+                        "content": [_sdk_dict(block) for block in response.content],
+                    },
                     {
-                        "type": "tool_result",
-                        "tool_use_id": call.id,
-                        "content": session.invoke(call.name, call.input, call.id),
-                    }
-                    for call in calls
-                ]
-                messages.append({"role": "user", "content": results})
-            if final_message is None:
-                raise RepositorySnapshotError("Repository tool turn budget exhausted")
-            parsed = final_message.parsed_output
-            completed = final_message.stop_reason == "end_turn"
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": call_id, "content": result}
+                            for call_id, result in results
+                        ],
+                    },
+                ],
+                finish=lambda response: (
+                    response.parsed_output,
+                    response.stop_reason == "end_turn",
+                ),
+            )
+        phase = "generation"
+        result = _run_provider_turns(
+            adapter,
+            payload=payload,
+            session=session,
+            preflight=preflight,
+            usage_path=usage_path,
+        )
+        if result is None:
+            return
+        phase = "validate_response"
+        parsed, completed = result
         if not completed or parsed is None:
             raise ValueError("Provider review incomplete")
         # Publish only a completed schema-validated report after every tool turn ends.

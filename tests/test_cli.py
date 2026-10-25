@@ -146,7 +146,13 @@ def test_parallel_review_waits_for_both_calls(
     (tmp_path / "context.json").write_text(context.model_dump_json())
 
     def model(
-        role: str, payload: str, directory: Path, *, kind: str = "whole", preflight: bool = False
+        role: str,
+        payload: str,
+        directory: Path,
+        *,
+        kind: str = "whole",
+        preflight: bool = False,
+        repository: object | None = None,
     ) -> None:
         """Synchronize provider calls and record completion before a selected failure.
 
@@ -156,6 +162,7 @@ def test_parallel_review_waits_for_both_calls(
             directory: Isolated artifact directory.
             kind: Assignment scope framing.
             preflight: Count-only phase; no report is generated.
+            repository: Optional immutable snapshot accepted by the review stage.
 
         Raises:
             RuntimeError: The selected provider fails after recording usage.
@@ -208,8 +215,8 @@ def test_invalid_blocking_anchor_stops_before_consolidator_purchase(
     target = work.attempt_directory(tmp_path, "whole", "claude", 0) / "claude.json"
     target.write_text(ChunkReview(**reviews[0].model_dump(), requests=[]).model_dump_json())
     calls = []
-    monkeypatch.setattr(work, "call_model", lambda *args: calls.append(args))
-    monkeypatch.setattr(consolidation, "call_model", lambda *args: calls.append(args))
+    monkeypatch.setattr(work, "call_model", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(consolidation, "call_model", lambda *args, **kwargs: calls.append(args))
     monkeypatch.setattr(sys, "argv", ["review", "consolidate", "--directory", str(tmp_path)])
     # Reject rather than discard the finding or pay for a useless consolidation.
     with pytest.raises(SystemExit) as error:

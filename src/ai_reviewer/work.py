@@ -60,6 +60,7 @@ from ai_reviewer.models import (
 )
 from ai_reviewer.patch import lines
 from ai_reviewer.repository import RepositoryTools, load_repository
+from ai_reviewer.repository_evidence import replay_tool_events, tool_events_digest
 from ai_reviewer.serialization import digest, encode
 
 
@@ -570,88 +571,6 @@ def attempt_directory(directory: Path, assignment: str, role: str, round_: int) 
     return directory / "work" / assignment / role / str(round_)
 
 
-def tool_events_digest(
-    directory: Path, assignment: str, role: str, attempts: int, *, repository_enabled: bool
-) -> str | None:
-    """Hash ordered attempt-local repository transcripts for coordinator-owned replay.
-
-    Args:
-        directory: Run artifact root.
-        assignment: Stable internal work ID.
-        role: Independent provider role.
-        attempts: Number of completed provider attempts.
-        repository_enabled: Whether a complete snapshot was available to the worker.
-
-    Returns:
-        SHA-256 over round identities and exact transcript bytes, or None when disabled.
-    """
-    if not repository_enabled:
-        return None
-    evidence = []
-    for round_ in range(attempts):
-        path = attempt_directory(directory, assignment, role, round_) / "repository-tools.jsonl"
-        data = path.read_bytes() if path.exists() else b""
-        evidence.append({"round": round_, "sha256": digest(data.decode()), "bytes": len(data)})
-    return digest(encode(evidence))
-
-
-def replay_tool_events(
-    context: ReviewContext,
-    directory: Path,
-    assignment: str,
-    role: str,
-    attempts: int,
-    expected_digest: str | None,
-    repository: RepositoryTools | None = None,
-) -> None:
-    """Re-execute logged read-only calls against verified snapshots and compare exact results.
-
-    Args:
-        context: Original revision-pinned review context.
-        directory: Run artifact root containing repository index and attempt logs.
-        assignment: Stable internal work ID.
-        role: Provider transcript owner.
-        attempts: Completed provider attempt count.
-        expected_digest: Coordinator-recorded transcript digest.
-        repository: Already verified index, shared within one batch replay when available.
-
-    Raises:
-        ValueError: Logs, result hashes, sequence, revision identity or replayed results differ.
-        OSError: A transcript or snapshot artifact is missing or unreadable.
-    """
-    if context.repository_digest is None:
-        if expected_digest is not None:
-            raise ValueError("Repository tool artifacts exist without a pinned snapshot")
-        return
-    if expected_digest is None:
-        raise ValueError("Repository tool transcript digest is missing")
-    replay = repository or load_repository(context, directory / "repository")
-    if replay.index.digest != context.repository_digest:
-        raise ValueError("Repository tool replay uses a different captured snapshot")
-    for round_ in range(attempts):
-        path = attempt_directory(directory, assignment, role, round_) / "repository-tools.jsonl"
-        rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-        session = RepositoryTools(replay.index, replay.blob_dir, entries=replay.entries)
-        for sequence, row in enumerate(rows):
-            if row.get("sequence") != sequence or row.get("snapshot_digest") != replay.index.digest:
-                raise ValueError("Repository tool transcript identity or order is invalid")
-            result_text = session.invoke(row["name"], row["arguments"], row.get("call_id", ""))
-            result_bytes = len(result_text.encode())
-            if (
-                result_text != encode(row.get("result"))
-                or digest(result_text) != row.get("result_sha256")
-                or result_bytes != row.get("result_bytes")
-            ):
-                raise ValueError(
-                    "Repository tool result does not replay from the captured snapshot"
-                )
-    if (
-        tool_events_digest(directory, assignment, role, attempts, repository_enabled=True)
-        != expected_digest
-    ):
-        raise ValueError("Repository tool transcript digest does not match the manifest")
-
-
 def advance(
     context: ReviewContext,
     assignment: Assignment,
@@ -735,10 +654,7 @@ def run_assignment(
         print(
             f"Review attempt: assignment={assignment.id} role={role} attempt={round_}", flush=True
         )
-        if repository is None:
-            call_model(role, payload, target, kind=assignment.kind)
-        else:
-            call_model(role, payload, target, kind=assignment.kind, repository=repository)
+        call_model(role, payload, target, kind=assignment.kind, repository=repository)
         report, rejected = filter_report(
             anchors, ChunkReview.model_validate_json((target / f"{role}.json").read_text())
         )
@@ -957,23 +873,14 @@ def preflight(
     # Count each review format with the same repository tool schema used during generation.
     for assignment in local_assignments(context, planned):
         for role in providers:
-            if repository is None:
-                call_model(
-                    role,
-                    assignment.payload,
-                    directory / "preflight" / assignment.id,
-                    kind=assignment.kind,
-                    preflight=True,
-                )
-            else:
-                call_model(
-                    role,
-                    assignment.payload,
-                    directory / "preflight" / assignment.id,
-                    kind=assignment.kind,
-                    preflight=True,
-                    repository=repository,
-                )
+            call_model(
+                role,
+                assignment.payload,
+                directory / "preflight" / assignment.id,
+                kind=assignment.kind,
+                preflight=True,
+                repository=repository,
+            )
 
 
 def review_chunks(
