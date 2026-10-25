@@ -5,9 +5,9 @@ reasoning effort. One GitHub account publishes the validated result.
 
 | Configured keys | Independent reviewers | Consolidation |
 | --- | --- | --- |
-| OpenAI only | GPT-6.1 Sol | GPT-6 Luna |
-| Anthropic only | Claude Opus 5.5 | Claude Haiku 5.5 |
-| Both | Opus 5.5 and GPT-6.1 Sol | Haiku 5.5 |
+| OpenAI only | GPT-6.1 Sol | GPT-6.1 Sol |
+| Anthropic only | Claude Opus 5.5 | Claude Sonnet 5.5 |
+| Both | Opus 5.5 and GPT-6.1 Sol | Sonnet 5.5 |
 | Neither | Configuration error before provider calls | None |
 
 Missing, empty and whitespace-only keys are unconfigured. A nonblank invalid key
@@ -19,19 +19,20 @@ publication use that set, never current credentials or the artifacts that happen
 exist. Every enabled reviewer must finish every required assignment and follow-up.
 Older manifests without this selection are rejected; run artifacts are not migrated.
 
-Model IDs and settings verified on **2026-10-24**:
-[`gpt-6.1-sol`](https://developers.openai.com/api/docs/models/gpt-6.1-sol) and
-[`gpt-6-luna`](https://developers.openai.com/api/docs/models/gpt-6-luna) use
+Model IDs and settings verified on **2026-10-25**:
+[`gpt-6.1-sol`](https://developers.openai.com/api/docs/models/gpt-6.1-sol) serves
+both OpenAI review and consolidation. Both roles use
 `reasoning={"effort": "medium"}` through Responses.
 [`claude-opus-5-5`](https://platform.claude.com/docs/en/models/overview) and
-[`claude-haiku-5-5`](https://platform.claude.com/docs/en/models/haiku-5-5/overview)
+[`claude-sonnet-5-5`](https://platform.claude.com/docs/en/models/sonnet-5-5/overview)
 use `thinking={"type": "adaptive"}` and `output_config={"effort": "medium"}`.
 `models.py` owns the role-to-provider/model/pricing table. The canonical coverage
 loader carries the validated provider set into `consolidation.py`; consolidation
 does not reread the manifest.
 
-Both consolidation stages use the selected cheaper model and the same validated
-finding-partition contract. Lower prices do not establish equivalent summary quality.
+Both consolidation stages use the selected consolidation model and the same validated
+finding-partition contract. Every source finding must survive exactly once, including
+unique findings as singleton groups. Model choice never decides approval.
 
 ## Install in a repository
 
@@ -43,8 +44,8 @@ finding-partition contract. Lower prices do not establish equivalent summary qua
 
    | Secret | Value |
    | --- | --- |
-   | `ANTHROPIC_API_KEY` | Optional; access to Opus 5.5 and Haiku 5.5 |
-   | `OPENAI_API_KEY` | Optional; access to GPT-6.1 Sol and GPT-6 Luna |
+   | `ANTHROPIC_API_KEY` | Optional; access to Opus 5.5 and Sonnet 5.5 |
+   | `OPENAI_API_KEY` | Optional; access to GPT-6.1 Sol |
    | `AI_REVIEWER_TOKEN` | Reviewer's GitHub personal access token |
    | `LINEAR_API_KEY` (optional) | Linear personal API key with read access to relevant issues |
 
@@ -347,21 +348,22 @@ secrets. The CLI deliberately suppresses provider exception bodies.
 ## Cost reporting
 
 The final **Report API costs** step reads every nested attempt artifact and prints
-Opus, Sol, Haiku and Luna estimates, Claude/OpenAI
+Opus, Sonnet and separate Sol review/consolidation estimates, Claude/OpenAI
 subtotals and a combined total. It runs after success or failure. An attempted
 call with unavailable usage is **unknown**, never silently counted as free. A
 stage never attempted is reported as **not run ($0)**. Review comments contain
 no cost accounting.
 
 Estimates use provider-reported input, output and cache token counts. Rates are
-recorded in [models.py](src/ai_reviewer/models.py), checked on **2026-10-24** against
+recorded in [models.py](src/ai_reviewer/models.py), checked on **2026-10-25** against
 [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) and
 [OpenAI pricing](https://developers.openai.com/api/docs/pricing). They exclude tax,
 credits and GitHub Actions charges. Update rates when provider pricing changes;
-provider billing remains authoritative. Haiku uses its 5x long-prompt rates when
-fresh + cached + cache-write input exceeds 100,000 tokens. The shared 250,000-token
+provider billing remains authoritative. Sonnet 5.5 and GPT-6.1 Sol consolidation use
+$2 input, $10 output, $0.10 cache-read and $2.50 cache-write per million tokens.
+The shared 250,000-token
 input ceiling stays below the OpenAI long-prompt threshold. Per-attempt artifacts
-use `haiku` or `luna` names so costs follow the actual provider and model. Configure spending limits in each API
+use `sonnet` or `sol` names so costs follow the actual provider and model. Configure spending limits in each API
 project independently.
 
 ## Development

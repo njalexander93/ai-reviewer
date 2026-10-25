@@ -11,7 +11,7 @@ from ai_reviewer.contracts import Consolidation, Review
 from ai_reviewer.models import Usage, call_model, print_costs
 
 
-@pytest.mark.parametrize("role", ["claude", "openai", "haiku", "luna"])
+@pytest.mark.parametrize("role", ["claude", "openai", "sonnet", "sol"])
 @pytest.mark.parametrize("complete", [True, False])
 def test_model_completion_and_usage_artifacts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str, complete: bool
@@ -21,7 +21,7 @@ def test_model_completion_and_usage_artifacts(
     calls: list[dict] = []
     report = (
         Consolidation(summary="Clean", groups=[])
-        if role in ("haiku", "luna")
+        if role in ("sonnet", "sol")
         else Review(complete=True, summary="Clean", findings=[])
     )
 
@@ -68,7 +68,7 @@ def test_model_completion_and_usage_artifacts(
         """Reject construction of the provider absent from this request's route."""
         raise AssertionError("Unused provider client constructed")
 
-    if role in ("openai", "luna"):
+    if role in ("openai", "sol"):
         monkeypatch.setattr(models.anthropic, "Anthropic", absent_client)
     else:
         monkeypatch.setattr(models.openai, "OpenAI", absent_client)
@@ -84,9 +84,9 @@ def test_model_completion_and_usage_artifacts(
     usage = json.loads((tmp_path / f"{role}.usage.json").read_text())
     # Exercise completion or truncation, then inspect saved output and usage.
     assert usage["output"] == 200
-    assert usage["input"] == (900 if role in ("openai", "luna") else 1000)
+    assert usage["input"] == (900 if role in ("openai", "sol") else 1000)
     assert "tools" not in calls[0]
-    if role in ("openai", "luna"):
+    if role in ("openai", "sol"):
         assert calls[0]["reasoning"] == {"effort": "medium"}
         assert calls[0]["truncation"] == "disabled"
         assert calls[0]["store"] is False
@@ -101,8 +101,8 @@ def test_model_completion_and_usage_artifacts(
         == {
             "claude": "claude-opus-5-5",
             "openai": "gpt-6.1-sol",
-            "haiku": "claude-haiku-5-5",
-            "luna": "gpt-6-luna",
+            "sonnet": "claude-sonnet-5-5",
+            "sol": "gpt-6.1-sol",
         }[role]
     )
 
@@ -138,12 +138,12 @@ def test_failed_call_records_unknown_cost(monkeypatch: pytest.MonkeyPatch, tmp_p
 def test_cost_example_matches_hand_calculation(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    """100k/20k reviewer tokens plus 30k/5k Haiku tokens cost $1.2055 at stated rates."""
+    """100k/20k reviewer tokens plus 30k/5k Sonnet tokens cost $1.3100 at stated rates."""
     # Write fixed token counts with independently calculated expected costs.
     for role, count in [
         ("claude", (100000, 20000)),
         ("openai", (100000, 20000)),
-        ("haiku", (30000, 5000)),
+        ("sonnet", (30000, 5000)),
     ]:
         (tmp_path / f"{role}.usage.json").write_text(
             Usage(input=count[0], output=count[1], cached=0, cache_write=0).model_dump_json()
@@ -152,9 +152,9 @@ def test_cost_example_matches_hand_calculation(
     print_costs(tmp_path)
     output = capsys.readouterr().out
     # Compare logged subtotals and the total against the hand calculation.
-    assert "Claude subtotal: $0.8055" in output
+    assert "Claude subtotal: $0.9100" in output
     assert "OpenAI subtotal: $0.4000" in output
-    assert "Estimated API total: $1.2055" in output
+    assert "Estimated API total: $1.3100" in output
 
 
 def test_unknown_usage_is_not_zero(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
@@ -178,7 +178,7 @@ def test_unattempted_calls_cost_zero(tmp_path: Path, capsys: pytest.CaptureFixtu
     """A stage never attempted in the job does not make its cost unknown."""
     print_costs(tmp_path)
     output = capsys.readouterr().out
-    assert "haiku: not run ($0)" in output
+    assert "sonnet: not run ($0)" in output
     assert "Estimated API total: $0.0000\n" in output
     assert "unknown" not in output
 
@@ -329,7 +329,7 @@ def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
     monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
     call_model(role, "unchanged payload", tmp_path, kind=kind, preflight=True)
     call = calls[0]
-    instructions = call["instructions"] if role in ("openai", "luna") else call["system"]
+    instructions = call["instructions"] if role in ("openai", "sol") else call["system"]
     assert framing in instructions
     assert "Request missing evidence" in instructions
     assert "Markdown files also have sections by LEFT/RIGHT" in instructions
@@ -339,43 +339,30 @@ def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
         assert "within a larger PR" not in instructions
     schema = (
         call["text"]["format"]["schema"]
-        if role in ("openai", "luna")
+        if role in ("openai", "sol")
         else call["output_format"].model_json_schema()
     )
     assert schema == ChunkReview.model_json_schema()
 
 
-@pytest.mark.parametrize(
-    "fresh,cached,writes,expected",
-    [
-        (100_000, 0, 0, 0.0105),
-        (100_001, 0, 0, 0.0525005),
-        (99_000, 1_001, 0, 0.05205005),
-        (99_000, 0, 1_001, 0.052625625),
-    ],
-)
-def test_haiku_prices_entire_request_at_prompt_threshold(
-    fresh: int,
-    cached: int,
-    writes: int,
-    expected: float,
-) -> None:
-    """Published Haiku prices apply 5x above 100k total input, including cached tokens.
+@pytest.mark.parametrize("role", ["sonnet", "sol"])
+def test_consolidator_prices_follow_published_standard_rates(role: str) -> None:
+    """Published $2/$10/$0.10/$2.50 rates price fresh/output/read/write tokens.
 
-    Prices are cited in README: $0.10/$0.50/$0.01/$0.125 per million
-    fresh/output/cache-read/cache-write tokens, with 1,000 output tokens here.
+    Sources: Sonnet 5.5 overview and GPT-6.1 Sol model pages linked in README.
+    The example costs $0.20 + $0.01 + $0.0001 + $0.0025 = $0.2126.
     """
-    usage = Usage(input=fresh, output=1_000, cached=cached, cache_write=writes)
-    assert usage.cost("haiku") == pytest.approx(expected)
+    usage = Usage(input=100_000, output=1_000, cached=1_000, cache_write=1_000)
+    assert usage.cost(role) == pytest.approx(0.2126)
 
 
-def test_luna_usage_is_attributed_to_openai(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
-    """30k fresh and 5k output Luna tokens cost $0.0055 under documented standard rates."""
-    (tmp_path / "luna.usage.json").write_text(
+def test_sol_usage_is_attributed_to_openai(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """30k fresh and 5k output Sol tokens cost $0.1100 under documented standard rates."""
+    (tmp_path / "sol.usage.json").write_text(
         Usage(input=30_000, output=5_000, cached=0, cache_write=0).model_dump_json()
     )
     print_costs(tmp_path)
     output = capsys.readouterr().out
-    assert "gpt-6-luna" in output
-    assert "OpenAI subtotal: $0.0055" in output
+    assert "gpt-6.1-sol" in output
+    assert "OpenAI subtotal: $0.1100" in output
     assert "Claude subtotal: $0.0000" in output

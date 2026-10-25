@@ -61,7 +61,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      - name: Consolidate with Haiku or Luna
+      - name: Consolidate with Sonnet or Sol
         run: poetry run python -m ai_reviewer.cli consolidate
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

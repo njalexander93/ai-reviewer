@@ -78,7 +78,7 @@ def fake_model(
             summary="Assessments agree.",
             groups=[Group(source_ids=[key]) for key in data.get("sources", {})],
         )
-        if role in ("haiku", "luna")
+        if role in ("sonnet", "sol")
         else ChunkReview(
             complete=True, summary="Reviewed actual supplied source.", findings=[], requests=[]
         )
@@ -645,7 +645,7 @@ def test_capacity_fallback_bounds_integration_and_followup_payloads(
 def test_small_review_consolidates_once_with_original_assessments(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A small complete review includes both independent summaries in its one Haiku call."""
+    """A small complete review includes both independent summaries in its one Sonnet call."""
     context, _, _ = bundle(Server())
     calls = []
 
@@ -655,7 +655,7 @@ def test_small_review_consolidates_once_with_original_assessments(
         Role/payload/directory and kwargs follow fake_model's contract. The calls list
         changes only for consolidation; artifact creation and preflight behavior remain shared.
         """
-        if role in ("haiku", "luna"):
+        if role in ("sonnet", "sol"):
             calls.append(json.loads(payload))
         fake_model(role, payload, directory, **kwargs)
 
