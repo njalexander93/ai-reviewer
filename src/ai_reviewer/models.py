@@ -696,12 +696,15 @@ def call_model(
         raise
 
 
-def print_costs(directory: Path) -> None:
-    """Print per-role costs and provider totals to standard output.
+def format_costs(directory: Path) -> str:
+    """Format per-role costs and provider totals for logs and review feedback.
 
     Args:
         directory: Job artifact directory containing optional role.usage.json files.
             Missing files mean not attempted; JSON null marks attempted usage unknown.
+
+    Returns:
+        Plain-text estimates, usage details and rate caveat, separated by newlines.
 
     Raises:
         OSError: An existing usage artifact cannot be read.
@@ -710,31 +713,42 @@ def print_costs(directory: Path) -> None:
     # Track unknown providers separately so partial totals remain visibly incomplete.
     totals = {"Claude": 0.0, "OpenAI": 0.0}
     unknown: set[str] = set()
+    lines: list[str] = []
     # Each attempt owns a directory; include failures and integration/follow-up calls.
     for role, spec in ROLES.items():
         provider = PROVIDER_NAMES[spec.provider]
         paths = sorted(directory.rglob(f"{role}.usage.json"))
         if not paths:
-            print(f"{role}: not run ($0)")
+            lines.append(f"{role}: not run ($0)")
         for path in paths:
             data = json.loads(path.read_text())
             label = str(path.relative_to(directory))
             if data is None:
                 unknown.add(provider)
-                print(f"{label}: usage unavailable (not $0)")
+                lines.append(f"{label}: usage unavailable (not $0)")
             else:
                 usage = Usage.model_validate(data)
                 cost = usage.cost(role)
                 totals[provider] += cost
-                print(
+                lines.append(
                     f"{label} ({spec.model}): estimated ${cost:.4f}; "
                     f"input={usage.input}, output={usage.output}, cached={usage.cached}"
                 )
-    # Emit subtotals and the combined estimate without writing PR feedback.
+    # Keep subtotals, the combined estimate and rate caveat identical across outputs.
     for provider, cost in totals.items():
-        print(f"{provider} subtotal: ${cost:.4f}" + (" + unknown" if provider in unknown else ""))
-    print(f"Estimated API total: ${sum(totals.values()):.4f}" + (" + unknown" if unknown else ""))
-    print("Standard rates as of 2026-10-25; excludes tax, credits and Actions charges.")
+        lines.append(
+            f"{provider} subtotal: ${cost:.4f}" + (" + unknown" if provider in unknown else "")
+        )
+    lines.append(
+        f"Estimated API total: ${sum(totals.values()):.4f}" + (" + unknown" if unknown else "")
+    )
+    lines.append("Standard rates as of 2026-10-25; excludes tax, credits and Actions charges.")
+    return "\n".join(lines)
+
+
+def print_costs(directory: Path) -> None:
+    """Print the shared cost report for directory; propagate usage read/validation errors."""
+    print(format_costs(directory))
 
 
 def check_capacity(

@@ -254,6 +254,8 @@ def publish(
     context: ReviewContext,
     covered: CoveredReviews,
     result: Consolidation,
+    *,
+    cost_report: str = "",
 ) -> bool:
     """Submit a consolidated review after checking evidence and current PR state.
 
@@ -266,6 +268,7 @@ def publish(
         context: Packet from prepare, including repository, PR and revision IDs.
         covered: Reports and coverage summary from the canonical artifact loader.
         result: Consolidated summary and an exact partition of source findings.
+        cost_report: Optional trusted plain-text accounting to append beneath coverage.
 
     Returns:
         False if this revision was already published; True after a new submission.
@@ -326,6 +329,11 @@ def publish(
         label = {"claude": "Claude Opus", "openai": "OpenAI"}[assessment.provider]
         body += f"<details><summary>{label}</summary>\n\n{assessment.summary}\n\n</details>\n"
     body += covered.summary
+    if cost_report:
+        body += (
+            "\n\n<details><summary>API costs</summary>\n\n"
+            f"```text\n{cost_report}\n```\n\n</details>"
+        )
     # Reject oversized publication atomically; never publish a partial approval.
     if (
         len(body.encode()) > GITHUB_BODY_BYTES

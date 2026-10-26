@@ -400,8 +400,8 @@ The final **Report API costs** step reads every nested attempt artifact and prin
 Opus, Sonnet and separate Sol review/consolidation estimates, Claude/OpenAI
 subtotals and a combined total. It runs after success or failure. An attempted
 call with unavailable usage is **unknown**, never silently counted as free. A
-stage never attempted is reported as **not run ($0)**. Review comments contain
-no cost accounting.
+stage never attempted is reported as **not run ($0)**. Published reviews end with
+the same report in a collapsible **API costs** section.
 
 Estimates use provider-reported input, output and cache token counts. Rates are
 recorded in [models.py](src/ai_reviewer/models.py), checked on **2026-10-25** against
