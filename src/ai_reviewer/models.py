@@ -348,6 +348,14 @@ def _sdk_dict(item: Any) -> dict[str, Any]:
     """Convert one SDK output item to the JSON shape required for a provider continuation."""
     if isinstance(item, dict):
         return item
+    if isinstance(item, openai.BaseModel):
+        # Parsed SDK fields are local conveniences, not Responses input fields.
+        return item.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={"parsed_arguments": True, "content": {"__all__": {"parsed"}}},
+        )
     return cast(dict[str, Any], item.model_dump(mode="json", exclude_none=True))
 
 
@@ -505,7 +513,7 @@ def call_model(
                 timeout=PROVIDER_TIMEOUT_SECONDS,
             )
             adapter = ProviderAdapter(
-                initial=payload,
+                initial=[{"role": "user", "content": payload}],
                 count=lambda current: (
                     openai_client.responses.input_tokens.count(
                         model=spec.model,
@@ -554,7 +562,7 @@ def call_model(
                     if getattr(item, "type", None) == "function_call"
                 ],
                 continue_turn=lambda current, response, results: _append_openai_turn(
-                    [{"role": "user", "content": current}] if isinstance(current, str) else current,
+                    current,
                     response,
                     results,
                 ),
