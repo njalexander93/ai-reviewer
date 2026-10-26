@@ -301,7 +301,7 @@ def test_provider_validation_failure_saves_redacted_diagnostics(
     [
         ("whole", "complete captured PR"),
         ("local", "bounded local assignment"),
-        ("integration", "Assess PR-wide compatibility"),
+        ("integration", "Assess compatibility of every owned scope.units section"),
     ],
 )
 def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
