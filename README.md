@@ -226,8 +226,15 @@ replace the old 80-file and 150 KB per-version rejection.
    Indivisible oversized lines or required metadata fail explicitly; nothing is
    silently removed to fit.
 4. Run each enabled reviewer at medium effort on every chunk with **two concurrent
-   workers** in the same Actions job. Each provider gets the same list, literal-search
-   and inclusive line-range tools over those snapshots. Tool results are bounded and
+   workers** in the same Actions job. Each provider gets the same list, literal-search, inclusive line-range
+   and `read_pr_diff` tools over those snapshots. The global inventory lists all
+   changed files. Initial packets are starting context, not access boundaries.
+   `read_pr_diff` takes the current inventory path, a decimal patch-record cursor
+   (initially `"0"`), and a limit of 1–200 records. It returns whole original patch
+   records with LEFT/RIGHT anchors, rename/mode metadata, pinned revision identities
+   and a patch digest. Follow `next_cursor` until empty; oversized individual records
+   return a diagnostic rather than clipped evidence. LEFT always means the captured
+   merge-base comparison, not the target branch tip. Tool results are bounded and
    recorded beside each attempt, then replayed against the captured Git blobs before
    coverage is accepted. If a tool budget is exhausted, the required assignment fails.
 5. Enabled providers perform integration passes with actual source and reports.
@@ -237,7 +244,16 @@ replace the old 80-file and 150 KB per-version rejection.
    even outside changed hunks. Accumulated reports are paged into additional required
    integration assignments. This
    is a bounded heuristic, **not a complete dependency graph**. Models can search
-   the complete captured tracked snapshots for dependencies outside these heuristics.
+   the complete captured tracked snapshots and retrieve omitted changed-file patches
+   for dependencies outside these heuristics. Each integration worker assesses its
+   owned sections' compatibility with callers and dependencies; edge workers assess
+   the supplied cross-chunk endpoints together. A compact provider/count attestation
+   confirms all local changed sections completed; exact ownership stays in the manifest.
+   This attestation does not establish that compatibility passed.
+   A worker's `complete` covers its own responsibility and necessary outside evidence.
+   It does not certify the whole PR or require repeating every other local review.
+   Not executing tests is a static-review limitation, not an automatic evidence blocker.
+   Genuinely necessary unavailable evidence still requires an incomplete report.
 6. Recompute the plan and validate the coverage manifest once before consolidation
    and once before publication. The manifest stores assignment and plan hashes;
    full payloads stay in attempt artifacts. Reports are keyed by assignment and

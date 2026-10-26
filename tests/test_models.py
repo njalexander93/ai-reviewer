@@ -87,6 +87,7 @@ def test_model_completion_and_usage_artifacts(
     assert usage["input"] == (900 if role in ("openai", "sol") else 1000)
     assert "tools" not in calls[0]
     if role in ("openai", "sol"):
+        assert calls[0]["input"] == [{"role": "user", "content": "untrusted context"}]
         assert calls[0]["reasoning"] == {"effort": "medium"}
         assert calls[0]["truncation"] == "disabled"
         assert calls[0]["store"] is False
@@ -300,7 +301,7 @@ def test_provider_validation_failure_saves_redacted_diagnostics(
     [
         ("whole", "complete captured PR"),
         ("local", "bounded local assignment"),
-        ("integration", "Assess PR-wide compatibility"),
+        ("integration", "Assess compatibility of every owned scope.units section"),
     ],
 )
 def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
@@ -329,6 +330,8 @@ def test_reviewer_prompt_names_scope_and_always_allows_source_requests(
     monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
     call_model(role, "unchanged payload", tmp_path, kind=kind, preflight=True)
     call = calls[0]
+    if role == "openai":
+        assert call["input"] == [{"role": "user", "content": "unchanged payload"}]
     instructions = call["instructions"] if role in ("openai", "sol") else call["system"]
     assert framing in instructions
     assert "Request missing evidence" in instructions

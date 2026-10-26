@@ -1,7 +1,7 @@
 """Capture immutable tracked source and expose bounded read-only reviewer tools.
 
 GitHub commit trees and blobs become content-addressed artifacts during preparation.
-Provider calls receive only indexed text through list, search and line-range reads;
+Provider calls receive indexed source and bounded original PR patch records;
 model arguments never become local paths or shell commands.
 """
 
@@ -9,6 +9,7 @@ import base64
 import hashlib
 import re
 import time
+from itertools import islice
 from pathlib import Path
 from typing import Any, Literal
 
@@ -33,7 +34,7 @@ from ai_reviewer.limits import (
     REPOSITORY_TOOL_TOTAL_BYTES,
     REPOSITORY_TOOL_VISIBLE_RESULT_BYTES,
 )
-from ai_reviewer.patch import lines
+from ai_reviewer.patch import lines, walk_patch
 from ai_reviewer.serialization import digest, encode
 
 Revision = Literal["head", "comparison", "base"]
@@ -285,7 +286,7 @@ def load_repository(context: ReviewContext, directory: Path) -> "RepositoryTools
         }
         if digest(encode(identity)) != snapshot.inventory_digest:
             raise RepositorySnapshotError("Repository tree inventory digest is invalid")
-    return RepositoryTools(index, directory / "blobs")
+    return RepositoryTools(index, directory / "blobs", context=context)
 
 
 def _valid_path(value: str, *, allow_empty: bool = False) -> bool:
@@ -310,6 +311,7 @@ class RepositoryTools:
         index: Immutable repository/revision identities and complete file inventories.
         blob_dir: Internal content-addressed artifact directory; model paths never enter it.
         event_path: Attempt-local append-only request/result provenance file.
+        context: Captured changed-file patches, bound to the same revisions by load_repository.
     """
 
     def __init__(
@@ -319,8 +321,14 @@ class RepositoryTools:
         event_path: Path | None = None,
         *,
         entries: dict[Revision, dict[str, SnapshotEntry]] | None = None,
+        context: ReviewContext,
     ) -> None:
-        """Bind tools to a captured index and optional worker-owned event log."""
+        """Bind verified snapshots and their captured PR context to a worker-owned event log.
+
+        Production callers use load_repository to verify context/index identity first.
+        Shared entries and context are read-only for the lifetime of all attempts.
+        """
+        self.context = context
         self.index = index
         self.blob_dir = blob_dir
         self.event_path = event_path
@@ -337,7 +345,9 @@ class RepositoryTools:
         """Create fresh accounting and an isolated event log over the same snapshots."""
         event_path.parent.mkdir(parents=True, exist_ok=True)
         event_path.touch(exist_ok=False)
-        return RepositoryTools(self.index, self.blob_dir, event_path, entries=self.entries)
+        return RepositoryTools(
+            self.index, self.blob_dir, event_path, entries=self.entries, context=self.context
+        )
 
     def account_tokens(self, count: int) -> None:
         """Charge a counted provider request against the assignment context-token ceiling."""
@@ -368,10 +378,10 @@ class RepositoryTools:
         raise RepositorySnapshotError(f"Repository tool {reason} budget exhausted")
 
     def invoke(self, name: str, arguments: dict[str, Any], call_id: str = "") -> str:
-        """Validate, execute and record one list/search/read call.
+        """Validate, execute and record one bounded source or PR-diff call.
 
         Args:
-            name: One of the three fixed repository tool names.
+            name: One of the fixed repository source/diff tool names.
             arguments: Provider-decoded argument object, validated again at this boundary.
             call_id: Provider call identity retained in the attempt transcript.
 
@@ -424,6 +434,8 @@ class RepositoryTools:
 
     def _execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Run a tool after enforcing its exact shape, revision and source boundary."""
+        if name == "read_pr_diff":
+            return self._read_pr_diff(arguments)
         revision = arguments.get("revision")
         if revision not in self.entries:
             raise ValueError("revision must be head, comparison or base")
@@ -585,6 +597,70 @@ class RepositoryTools:
                 "next_start": actual_end + 1 if clipped else None,
             }
         raise ValueError("unknown repository tool")
+
+    def _read_pr_diff(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Page exact captured patch records, retaining comparison/head inline coordinates.
+
+        Arguments require current inventory path, decimal record cursor and bounded limit.
+        Whole records must fit the visible byte ceiling; an oversized record is diagnosed,
+        never silently clipped. Missing context/path and out-of-range cursors are explicit.
+        Results carry pinned revisions and patch digest for deterministic audited replay.
+        """
+        if set(arguments) != {"path", "cursor", "limit"}:
+            raise ValueError("invalid PR diff arguments")
+        path, cursor, limit = arguments["path"], arguments["cursor"], arguments["limit"]
+        if not isinstance(path, str) or not _valid_path(path):
+            raise ValueError("invalid repository path")
+        if not isinstance(cursor, str) or not cursor.isdecimal():
+            raise ValueError("cursor must be a decimal offset")
+        if type(limit) is not int or not 1 <= limit <= REPOSITORY_RANGE_LINES:
+            raise ValueError("limit must be within the diff record bound")
+        file = next((f for f in self.context.files if f.filename == path), None)
+        if file is None:
+            return {"path": path, "diagnostic": "not a captured changed-file path"}
+        # Bind evidence to the original PR comparison, not a freshly generated base-tip diff.
+        result: dict[str, Any] = {
+            "path": file.filename,
+            "previous_filename": file.previous_filename,
+            "status": file.status,
+            "before_mode": file.before_mode,
+            "after_mode": file.after_mode,
+            "head": self.context.head,
+            "comparison": self.context.diff_base,
+            "base": self.context.base,
+            "patch_sha256": digest(file.patch),
+            "patch_start": int(cursor),
+        }
+        offset = int(cursor)
+        records = islice(walk_patch(file.patch), offset, None)
+        page: list[dict[str, Any]] = []
+        more = False
+        # Stream complete records; do not allocate the entire patch for a bounded read.
+        for record in islice(records, limit):
+            old, new = record.consumes
+            candidate = {
+                "text": record.text,
+                "LEFT": record.left if old else None,
+                "RIGHT": record.right if new else None,
+            }
+            if len(encode([*page, candidate]).encode()) > REPOSITORY_TOOL_VISIBLE_RESULT_BYTES:
+                if not page:
+                    return {**result, "diagnostic": "patch record exceeds serialized result limit"}
+                more = True
+                break
+            page.append(candidate)
+        else:
+            more = next(records, None) is not None
+        if not page and offset:
+            return {**result, "diagnostic": "patch cursor unavailable"}
+        end = offset + len(page)
+        return {
+            **result,
+            "records": page,
+            "patch_end": end,
+            "next_cursor": str(end) if more else "",
+            "truncated": more,
+        }
 
     def _read_text(self, entry: SnapshotEntry) -> str:
         """Read a captured text blob from its validated Git SHA, never from a model path."""

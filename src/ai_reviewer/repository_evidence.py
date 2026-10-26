@@ -49,7 +49,9 @@ def replay_tool_events(
     for round_ in range(attempts):
         path = attempt_directory(directory, assignment, role, round_) / "repository-tools.jsonl"
         rows = [json.loads(line) for line in path.read_text().splitlines()]
-        session = RepositoryTools(replay.index, replay.blob_dir, entries=replay.entries)
+        session = RepositoryTools(
+            replay.index, replay.blob_dir, entries=replay.entries, context=context
+        )
         for sequence, row in enumerate(rows):
             if row.get("sequence") != sequence or row.get("snapshot_digest") != replay.index.digest:
                 raise ValueError("Repository tool transcript identity or order is invalid")

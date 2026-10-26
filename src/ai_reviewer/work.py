@@ -244,6 +244,18 @@ def integration_assignments(
         for chunk in planned.chunks
         for role in providers
     }
+    # read_batch validated all local work; keep its attestation independent of unit count.
+    metadata = planned.metadata.model_copy(
+        update={
+            "overview": {
+                **planned.metadata.overview,
+                "completed_local_scopes": {
+                    "providers": list(providers),
+                    "count": len(planned.chunks),
+                },
+            }
+        }
+    )
     assignments = []
     links = {(r.left, r.right): r.evidence for r in planned.relations}
 
@@ -282,8 +294,8 @@ def integration_assignments(
 
     # Each chunk rechecks integration using actual local source and all enabled reports.
     for i, chunk in enumerate(planned.chunks):
-        payload = json.loads(chunk.payload(planned.metadata))
-        payload["phase"] = "integration: assess PR-wide compatibility; investigate missing evidence"
+        payload = json.loads(chunk.payload(metadata))
+        payload["phase"] = "integration: assess owned sections and their PR-wide compatibility"
         payload["reports"] = [atom for role in providers for atom in report_data[(chunk.id, role)]]
         payload["reference_source"] = reference_source(chunk.units)
         assignments.append(
@@ -300,7 +312,7 @@ def integration_assignments(
     paths: set[str] = set()
     phase = "integration: check cross-chunk relationships using actual source"
     sizer = PacketSizer(
-        planned.metadata,
+        metadata,
         all_units,
         {
             "reference_source": reference_data,
@@ -341,7 +353,7 @@ def integration_assignments(
         sections in the returned assignment; packet size is checked by the caller/pager.
         """
         pair = Chunk(id=f"edge-{len(assignments):04d}", units=scope)
-        payload = json.loads(pair.payload(planned.metadata))
+        payload = json.loads(pair.payload(metadata))
         payload["phase"] = phase
         payload["reference_source"] = reference_source(scope)
         owners = sorted({ownership[u.id] for u in scope})
