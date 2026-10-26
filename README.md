@@ -247,8 +247,9 @@ replace the old 80-file and 150 KB per-version rejection.
    the complete captured tracked snapshots and retrieve omitted changed-file patches
    for dependencies outside these heuristics. Each integration worker assesses its
    owned sections' compatibility with callers and dependencies; edge workers assess
-   the supplied cross-chunk endpoints together. Completed local section ownership
-   is included as coverage context, not evidence that compatibility already passed.
+   the supplied cross-chunk endpoints together. A compact provider/count attestation
+   confirms all local changed sections completed; exact ownership stays in the manifest.
+   This attestation does not establish that compatibility passed.
    A worker's `complete` covers its own responsibility and necessary outside evidence.
    It does not certify the whole PR or require repeating every other local review.
    Not executing tests is a static-review limitation, not an automatic evidence blocker.

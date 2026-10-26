@@ -321,9 +321,9 @@ class RepositoryTools:
         event_path: Path | None = None,
         *,
         entries: dict[Revision, dict[str, SnapshotEntry]] | None = None,
-        context: ReviewContext | None = None,
+        context: ReviewContext,
     ) -> None:
-        """Bind verified snapshots and optional PR context to a worker-owned event log.
+        """Bind verified snapshots and their captured PR context to a worker-owned event log.
 
         Production callers use load_repository to verify context/index identity first.
         Shared entries and context are read-only for the lifetime of all attempts.
@@ -615,8 +615,6 @@ class RepositoryTools:
             raise ValueError("cursor must be a decimal offset")
         if type(limit) is not int or not 1 <= limit <= REPOSITORY_RANGE_LINES:
             raise ValueError("limit must be within the diff record bound")
-        if self.context is None:
-            return {"path": path, "diagnostic": "captured PR diff unavailable"}
         file = next((f for f in self.context.files if f.filename == path), None)
         if file is None:
             return {"path": path, "diagnostic": "not a captured changed-file path"}

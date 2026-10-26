@@ -233,8 +233,8 @@ def integration_assignments(
 
     Raises:
         KeyError: A required local report is absent.
-        ValueError: A local report is incomplete, source evidence is unavailable, a packet
-            cannot fit, or relationship/assignment bounds are exceeded. Evidence is never dropped.
+        ValueError: Source evidence is unavailable, an indivisible packet cannot fit,
+            or relationship/assignment bounds are exceeded. Evidence is never dropped.
     """
     if planned.whole is not None:
         return []
@@ -244,16 +244,14 @@ def integration_assignments(
         for chunk in planned.chunks
         for role in providers
     }
-    if not all(local[(chunk.id, role)].complete for chunk in planned.chunks for role in providers):
-        raise ValueError("Incomplete local review; integration prohibited")
-    # Describe completed section ownership without claiming integration has already passed.
+    # read_batch validated all local work; keep its attestation independent of unit count.
     metadata = planned.metadata.model_copy(
         update={
             "overview": {
                 **planned.metadata.overview,
                 "completed_local_scopes": {
                     "providers": list(providers),
-                    "sections": {chunk.id: [u.id for u in chunk.units] for chunk in planned.chunks},
+                    "count": len(planned.chunks),
                 },
             }
         }

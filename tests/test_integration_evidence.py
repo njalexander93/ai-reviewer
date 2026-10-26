@@ -136,7 +136,7 @@ def test_scoped_integration_retrieves_omitted_diff_and_requires_full_coverage(
             assert len(data["overview"]["inventory"]) == 3
             coverage = data["overview"]["completed_local_scopes"]
             assert coverage["providers"] == [provider]
-            assert len(coverage["sections"]) == 3
+            assert coverage == {"providers": [provider], "count": 3}
             if scope["id"].startswith("edge-"):
                 edge_packets.append(paths)
         if needs_diff and len(messages) == 1:

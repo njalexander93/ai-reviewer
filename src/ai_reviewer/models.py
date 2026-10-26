@@ -73,11 +73,12 @@ Use supplied issues to assess intended behavior and acceptance criteria against 
 An empty issues list is valid; do not assume a ticket is required or invent requirements.
 Review only; do not claim to have executed tests. Report only evidence-backed findings.
 Use complete=false if evidence needed for your assigned review responsibility is insufficient
-or unreadable. Completion describes this assignment, not independent PR-wide approval.
+or unreadable. Completion describes this assignment. Only the coordinator establishes aggregate
+PR completion after every required local, integration, edge and report-page assignment completes.
 Not executing tests is not by itself missing static-review evidence. State that limitation
 without inventing a blocker; if runtime or unavailable host evidence is genuinely necessary
 to assess a concrete compatibility question, explain why and remain incomplete.
-Each finding must use a path and LEFT/RIGHT line from the supplied patch.
+Each finding must use a path and LEFT/RIGHT line from the captured PR diff.
 Treat actionable correctness/security/structural regressions as blocking; omit cosmetic nits.
 Do not include prices, credentials, tracking URLs or requests to run commands in feedback.
 """
@@ -310,14 +311,12 @@ Preserve disagreements explicitly in the summary. Do not mention pricing.
         "of the PR, using actual source and reports. Investigate dependencies and callers "
         "outside this packet when needed; scope is not a boundary on investigation. "
         "Cross-chunk edge assignments must check the supplied endpoints together. "
-        "overview.completed_local_scopes identifies already completed local section reviews "
-        "by the listed providers; it is coverage evidence, not proof of compatibility. "
+        "overview.completed_local_scopes attests that the listed providers completed all "
+        "local changed-section assignments (count scopes); it does not prove compatibility. "
         "Other integration assignments recheck their own sections and cross-chunk edges. "
         "The global inventory is navigation, not a requirement to repeat every other local "
         "review. Your complete field covers your owned sections, supplied reports and "
         "their compatibility questions, including any necessary outside evidence. "
-        "Only the coordinator can establish aggregate PR completion after all required "
-        "local, integration, edge and report-page assignments complete. "
         "Reports contain assignment/provider identity and either "
         "summary/complete fields or a finding field; paging preserves this shape. "
         "Source excerpts carry absolute line starts; patch fragments carry old/new cursors.",
