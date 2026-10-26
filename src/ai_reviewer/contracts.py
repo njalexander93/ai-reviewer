@@ -62,7 +62,8 @@ class Review(Contract):
     """Record an independent assessment of the supplied context.
 
     Attributes:
-        complete: Whether the reviewer could assess all supplied changes.
+        complete: Whether the reviewer assessed its assigned sections and required compatibility
+            evidence; aggregate completion additionally requires exact assignment coverage.
         summary: Overall assessment, including context limitations when incomplete.
         findings: At most 40 actionable observations; an empty list means none found.
     """
