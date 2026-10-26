@@ -20,10 +20,14 @@ def configured_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
 
 
+@pytest.mark.parametrize("unknown_usage", [False, True])
 def test_pipeline_posts_one_clean_review_and_logs_costs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    unknown_usage: bool,
 ) -> None:
-    """Independent reports reach publication through files, without prices in feedback."""
+    """Published reviews end with the pipeline's costs, including unknown usage."""
     # Bind the CLI to a synthetic repository and isolated artifact directory.
     server = Server()
     server.valid_repository_tree = True
@@ -82,14 +86,21 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
         )
         # Match the artifact interface consumed by the next real CLI stage.
         (directory / f"{role}.json").write_text(report.model_dump_json())
+        (directory / f"{role}.usage.json").write_text(
+            "null"
+            if unknown_usage
+            else json.dumps({"input": 100000, "output": 20000, "cached": 0, "cache_write": 0})
+        )
 
     # Run the real stage dispatcher with only external boundaries replaced.
     monkeypatch.setattr(work, "call_model", model)
     monkeypatch.setattr(consolidation, "call_model", model)
     for stage in ["prepare", "review", "consolidate", "publish", "costs"]:
+        if stage == "costs":
+            capsys.readouterr()
         monkeypatch.setattr(sys, "argv", ["review", stage, "--directory", str(tmp_path)])
         cli.main()
-    # Verify identical reviewer input, the published verdict and log-only accounting.
+    # Verify identical reviewer input, the published verdict and matching accounting.
     assert payloads["claude"] == payloads["openai"]
     assert payloads["claude"]["head"] == "a" * 40
     assert payloads["claude"]["repository_digest"]
@@ -103,8 +114,13 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     posted = server.writes[1][1]
     assert posted["event"] == "APPROVE"
     assert posted["comments"] == []
-    assert "$" not in posted["body"]
-    assert "Estimated API total:" in capsys.readouterr().out
+    costs = capsys.readouterr().out.strip()
+    # At configured rates: Opus $0.80 + OpenAI $0.40 + Sonnet $0.40 = $1.60.
+    expected_total = "$0.0000 + unknown" if unknown_usage else "$1.6000"
+    assert f"Estimated API total: {expected_total}" in costs
+    assert posted["body"].endswith(
+        f"\n\n<details><summary>API costs</summary>\n\n```text\n{costs}\n```\n\n</details>"
+    )
 
 
 @pytest.mark.parametrize("stage", ["consolidate", "publish"])

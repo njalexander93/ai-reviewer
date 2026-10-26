@@ -12,7 +12,7 @@ from ai_reviewer.contracts import (
 )
 from ai_reviewer.diagnostics import report_failure
 from ai_reviewer.github import GitHub, publish
-from ai_reviewer.models import ConfigurationError, print_costs
+from ai_reviewer.models import ConfigurationError, format_costs, print_costs
 from ai_reviewer.work import load_reviews, review_chunks
 
 
@@ -74,6 +74,7 @@ def main() -> None:
                     FinalConsolidation.model_validate_json(
                         (directory / "consolidate.json").read_text()
                     ),
+                    cost_report=format_costs(directory),
                 )
     except Exception as error:
         # Keep stage failures diagnosable without printing arbitrary exception text.
