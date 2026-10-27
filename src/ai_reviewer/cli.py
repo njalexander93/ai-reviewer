@@ -57,6 +57,9 @@ def main() -> None:
                 identity,
                 linear_token=os.environ.get("LINEAR_API_KEY"),
                 repository_directory=directory / "repository",
+                # Empty workflow inputs mean the caller supplied no expectation.
+                expected_head=os.environ.get("EXPECTED_HEAD_SHA") or None,
+                expected_base=os.environ.get("EXPECTED_BASE_SHA") or None,
             )
             # Persist the collected packet for the enabled independent reviewers.
             context_path.write_text(context.model_dump_json())

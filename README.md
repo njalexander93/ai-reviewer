@@ -71,6 +71,10 @@ For a fork of this reviewer, update the caller's `uses:` repository and supply
 `implementation-repository: your-account/your-reviewer` under `with:`. Replace both
 commit pins and supply your own secrets. Never put credentials in workflow YAML.
 
+A caller that admitted a specific revision can also pass `expected-head-sha` and
+`expected-base-sha` (full SHAs) under `with:`. Preparation then stops before reading
+further context or requesting a reviewer if the PR head or base differs.
+
 See GitHub's documentation for [reusable workflows and explicit secrets](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows),
 [token scopes](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps),
 and [stale approval dismissal](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).
