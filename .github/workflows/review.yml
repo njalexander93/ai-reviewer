@@ -12,6 +12,14 @@ on:
       implementation-repository:
         type: string
         default: njalexander93/ai-reviewer
+      expected-head-sha:
+        description: Optional full PR head SHA the caller admitted; review stops if it differs
+        type: string
+        default: ''
+      expected-base-sha:
+        description: Optional full PR base SHA the caller admitted; review stops if it differs
+        type: string
+        default: ''
     secrets:
       ANTHROPIC_API_KEY:
         required: false
@@ -56,6 +64,8 @@ jobs:
           AI_REVIEWER_TOKEN: ${{ secrets.AI_REVIEWER_TOKEN }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           PR_NUMBER: ${{ inputs.pr-number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+          EXPECTED_BASE_SHA: ${{ inputs.expected-base-sha }}
       - name: Review with configured providers
         run: poetry run python -m ai_reviewer.cli review
         env:

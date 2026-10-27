@@ -123,6 +123,48 @@ def test_pipeline_posts_one_clean_review_and_logs_costs(
     )
 
 
+@pytest.mark.parametrize(
+    "env,expected",
+    [
+        ({}, (None, None)),
+        ({"EXPECTED_HEAD_SHA": "", "EXPECTED_BASE_SHA": ""}, (None, None)),
+        ({"EXPECTED_HEAD_SHA": "a" * 40, "EXPECTED_BASE_SHA": "b" * 40}, ("a" * 40, "b" * 40)),
+    ],
+)
+def test_prepare_stage_passes_admitted_revision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    env: dict[str, str],
+    expected: tuple[str | None, str | None],
+) -> None:
+    """Workflow expectations reach preparation; empty inputs mean none was supplied."""
+    # Replace collection with a fixture packet; context tests cover the checks themselves.
+    server = Server()
+    context = cli.prepare(server.gh, "owner/repo", 1, "reviewer")
+    calls = []
+
+    def recording_prepare(*args: object, **kwargs: object) -> object:
+        calls.append((kwargs["expected_head"], kwargs["expected_base"]))
+        return context
+
+    monkeypatch.setattr(cli, "prepare", recording_prepare)
+    monkeypatch.setattr(cli, "GitHub", lambda token: server.gh)
+    for key in ("EXPECTED_HEAD_SHA", "EXPECTED_BASE_SHA", "LINEAR_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in {
+        "GH_TOKEN": "test",
+        "AI_REVIEWER_TOKEN": "test",
+        "GITHUB_REPOSITORY": "owner/repo",
+        "PR_NUMBER": "1",
+        **env,
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(sys, "argv", ["review", "prepare", "--directory", str(tmp_path)])
+    cli.main()
+    assert calls == [expected]
+    assert (tmp_path / "context.json").exists()
+
+
 @pytest.mark.parametrize("stage", ["consolidate", "publish"])
 def test_incomplete_report_blocks_later_stages(
     monkeypatch: pytest.MonkeyPatch,

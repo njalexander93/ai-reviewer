@@ -4,6 +4,7 @@ Preparation owns eligibility, collection, packet limits and the final revision
 check. It requests a reviewer only after all provider context is validated.
 """
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,9 @@ def prepare(
     reviewer: str,
     linear_token: str | None = None,
     repository_directory: Path | None = None,
+    *,
+    expected_head: str | None = None,
+    expected_base: str | None = None,
 ) -> ReviewContext:
     """Capture changed files, review discussion and optional issue requirements.
 
@@ -36,13 +40,17 @@ def prepare(
         linear_token: Optional Linear personal API key for issue requirements.
         repository_directory: Optional artifact directory for the complete immutable
             comparison/head/base tracked-source index and content-addressed text blobs.
+        expected_head: Optional full head SHA the caller admitted; a different PR head
+            stops preparation before any further provider request.
+        expected_base: Optional full base SHA the caller admitted, checked likewise.
 
     Returns:
         Validated context containing revisions, PR metadata, discussion, changed
         files and issue evidence. Serialize with model_dump_json for job handoff.
 
     Raises:
-        ValueError: Identifiers or PR state are invalid, context is incomplete or
+        ValueError: Identifiers, expected revisions or PR state are invalid, the PR
+            differs from a supplied expected revision, context is incomplete or
             oversized, or head/base changes during collection. Invalid text
             decoding also fails rather than returning partial context.
         RuntimeError: Either issue provider rejects a query, a referenced issue is
@@ -50,7 +58,15 @@ def prepare(
     """
     # Establish eligibility before collecting potentially expensive context.
     path = pr_path(repo, number)
+    for expected in (expected_head, expected_base):
+        if expected is not None and not re.fullmatch(r"[0-9a-f]{40}", expected):
+            raise ValueError("Expected revision must be a full lowercase commit SHA")
     pr = gh.request("GET", path)
+    # Bind the review to the revision the caller admitted, before any further reads.
+    if (expected_head is not None and pr["head"]["sha"] != expected_head) or (
+        expected_base is not None and pr["base"]["sha"] != expected_base
+    ):
+        raise ValueError("PR head or base differs from the admitted revision; not reviewing")
     if pr["state"] != "open" or pr["draft"] or pr["user"]["login"] == reviewer:
         raise ValueError("PR is closed, draft, or authored by the reviewer account")
     # Require a complete, bounded file list and resolve the diff's merge base.

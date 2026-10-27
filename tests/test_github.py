@@ -355,6 +355,49 @@ def test_prepare_refuses_incomplete_context(invalid: str) -> None:
     assert server.writes == []
 
 
+def test_prepare_proceeds_when_admitted_revision_matches() -> None:
+    """Matching expected head and base collect the same packet as no expectation."""
+    server = Server()
+    context = prepare(
+        server.gh, "owner/repo", 1, "reviewer", expected_head="a" * 40, expected_base="b" * 40
+    )
+    assert context.head == "a" * 40
+    assert server.writes[0][0] == "/repos/owner/repo/pulls/1/requested_reviewers"
+
+
+@pytest.mark.parametrize(
+    "head,base",
+    [("d" * 40, None), (None, "d" * 40), ("A" * 40, None), (None, "b" * 39), ("main", None)],
+)
+def test_prepare_refuses_unadmitted_revision_before_collection(
+    head: str | None, base: str | None
+) -> None:
+    """A mismatched or malformed expectation stops after at most the PR metadata read."""
+    # Record every request so later reads, Linear calls or reviewer requests are visible.
+    server = Server()
+    seen: list[tuple[str, str]] = []
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        return server.handle(request)
+
+    server.gh.client = httpx.Client(
+        base_url="https://api.github.com", transport=httpx.MockTransport(recording)
+    )
+    with pytest.raises(ValueError):
+        prepare(
+            server.gh,
+            "owner/repo",
+            1,
+            "reviewer",
+            linear_token="linear",
+            expected_head=head,
+            expected_base=base,
+        )
+    assert seen in ([], [("GET", "/repos/owner/repo/pulls/1")])
+    assert server.writes == []
+
+
 @pytest.mark.parametrize("status,empty", [("added", "before"), ("removed", "after")])
 def test_added_and_removed_files_have_one_empty_version(status: str, empty: str) -> None:
     """Nonexistent file versions are not fetched from GitHub."""
