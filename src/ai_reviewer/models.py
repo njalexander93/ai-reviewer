@@ -78,6 +78,9 @@ PR completion after every required local, integration, edge and report-page assi
 Not executing tests is not by itself missing static-review evidence. State that limitation
 without inventing a blocker; if runtime or unavailable host evidence is genuinely necessary
 to assess a concrete compatibility question, explain why and remain incomplete.
+Code outside the PR's repository, such as a reusable workflow, action or package referenced
+by name, is out of scope. Never request it or remain incomplete for it; review this
+repository's side and state the limitation in the summary.
 Each finding must use a path and LEFT/RIGHT line from the captured PR diff.
 Treat actionable correctness/security/structural regressions as blocking; omit cosmetic nits.
 Do not include prices, credentials, tracking URLs or requests to run commands in feedback.
@@ -368,7 +371,8 @@ evidence, keep complete=false; exhaustion fails the assignment.
 Request missing evidence using requests (path, LEFT/RIGHT, inclusive start/end, reason).
 Use the current inventory filename for either side, including renamed files. Requests can
 read changed files from the captured snapshot. No tools execute code.
-If context is required, set complete=false and request it. Never infer unseen compatibility.
+If context is required, set complete=false and request it. Never infer unseen in-repository
+compatibility.
 At most two follow-up rounds are available. If unresolved, remain incomplete.
 """
     instructions += """

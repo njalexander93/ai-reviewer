@@ -355,6 +355,8 @@ def test_repository_contract_excludes_legacy_requests(role: str) -> None:
     assert "Read-only repository tools are available" in instructions
     assert "requests" not in schema.model_json_schema()["properties"]
     assert "Request missing evidence using requests" not in instructions
+    assert "outside the PR's repository" in instructions
+    assert "state the limitation in the summary" in instructions
 
 
 @pytest.mark.parametrize("role", ["sonnet", "sol"])
