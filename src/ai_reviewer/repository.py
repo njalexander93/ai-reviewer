@@ -28,7 +28,6 @@ from ai_reviewer.limits import (
     REPOSITORY_SEARCH_LINE_CHARS,
     REPOSITORY_SEARCH_MATCHES,
     REPOSITORY_SEARCH_QUERY_CHARS,
-    REPOSITORY_TOOL_CALLS,
     REPOSITORY_TOOL_RESULT_BYTES,
     REPOSITORY_TOOL_SECONDS,
     REPOSITORY_TOOL_TOTAL_BYTES,
@@ -389,12 +388,10 @@ class RepositoryTools:
             Compact bounded JSON evidence or a safe recoverable argument diagnostic.
 
         Raises:
-            RepositorySnapshotError: Call, result-byte or wall-clock budget is exhausted;
+            RepositorySnapshotError: Result-byte or wall-clock budget is exhausted;
                 artifact content is missing or fails its Git SHA verification.
         """
         self.check_time()
-        if self.calls >= REPOSITORY_TOOL_CALLS:
-            self.exhaust("calls", REPOSITORY_TOOL_CALLS)
         self.calls += 1
         if not isinstance(arguments, dict):
             return self._record(name, {}, {"error": "arguments must be an object"}, call_id)
