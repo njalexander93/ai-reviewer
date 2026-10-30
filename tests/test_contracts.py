@@ -92,3 +92,16 @@ def test_context_rejects_opaque_or_missing_fields() -> None:
     ]:
         with pytest.raises(ValueError):
             ReviewContext.model_validate(invalid)
+
+
+@pytest.mark.parametrize("request_id", [None, "", "x" * 32, "1" * 31, "1" * 33, "-->\ntext"])
+def test_context_requires_valid_saved_request_id(request_id: str | None) -> None:
+    """Missing or malformed request IDs cannot bypass publication retry protection."""
+    # Old artifacts must fail rather than silently acquiring a fresh publication identity.
+    context, _, _ = bundle(Server())
+    packet = context.model_dump()
+    packet.pop("request_id")
+    if request_id is not None:
+        packet["request_id"] = request_id
+    with pytest.raises(ValueError, match="request_id"):
+        ReviewContext.model_validate(packet)

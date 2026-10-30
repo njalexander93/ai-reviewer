@@ -192,9 +192,10 @@ class IssueContext(Contract):
 
 
 class ReviewContext(Contract):
-    """Bind minimal review evidence to an immutable PR revision pair.
+    """Bind one review request's evidence to an immutable PR revision pair.
 
     Attributes:
+        request_id: Unique preparation ID, persisted for publication retries.
         repo: Owner/repository pair validated by the GitHub adapter.
         number: Positive PR number.
         head: Reviewed head commit SHA.
@@ -210,6 +211,7 @@ class ReviewContext(Contract):
         issues: Linked or explicitly referenced issue requirements from both providers.
     """
 
+    request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     repo: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
     number: int = Field(ge=1)
     head: str = Field(pattern=r"^[0-9a-f]{40}$")

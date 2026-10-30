@@ -106,8 +106,12 @@ insufficient.
   blockers mean **APPROVE**. Nonblocking observations may accompany approval.
 - Missing, invalid or incomplete results fail the run. They never become a clean
   verdict. Both head and base commits are rechecked immediately before posting.
-- Re-running the same head/base pair does not duplicate a published review.
-  Model calls still incur charges on reruns.
+- Each preparation creates a new review request, even for the same head/base pair.
+  Fresh requests can reconsider findings after discussion and post a new verdict.
+  Retrying publication with the same saved `context.json` does not duplicate that
+  request's review. Preparing again creates a new request and incurs model charges
+  when reviewed. Publication must remain serialized per PR, as in the reusable workflow.
+  Context artifacts created before request IDs were introduced must be prepared again.
 
 ## Issue context
 

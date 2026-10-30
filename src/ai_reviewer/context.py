@@ -7,6 +7,7 @@ check. It requests a reviewer only after all provider context is validated.
 import re
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ai_reviewer.chunking import plan, validate_patch
 from ai_reviewer.contracts import ChangedFile, PriorComment, ReviewContext
@@ -31,6 +32,7 @@ def prepare(
 
     Reads GitHub content and requests the reviewer only after collection succeeds.
     It never executes repository code; optional snapshots include unchanged tracked files.
+    Each call creates a new request ID; publication retries must reuse the saved context.
 
     Args:
         gh: Client authorized to read the repository and request reviewers.
@@ -138,6 +140,7 @@ def prepare(
         )
     )
     context = ReviewContext(
+        request_id=uuid4().hex,
         repo=repo,
         number=number,
         head=head,
