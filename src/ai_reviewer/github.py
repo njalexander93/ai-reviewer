@@ -262,6 +262,7 @@ def publish(
     The final state check and submission are separate API calls. A concurrent
     push can still leave the review attached to an old commit; callers should
     enable stale approval dismissal in repository branch rules.
+    Callers must serialize publication per PR to prevent concurrent duplicate writes.
 
     Args:
         gh: Client authenticated as the reviewer recorded in context.
@@ -271,7 +272,7 @@ def publish(
         cost_report: Optional trusted plain-text accounting to append beneath coverage.
 
     Returns:
-        False if this revision was already published; True after a new submission.
+        False if this request was already published; True after a new submission.
 
     Raises:
         ValueError: Results, identity, diff anchors or current PR state are invalid,
@@ -288,8 +289,8 @@ def publish(
     login = gh.request("GET", "/user")["login"]
     if login != context.reviewer:
         raise ValueError("Publishing identity differs from requested reviewer")
-    # Avoid another submission when this account already reviewed the revision pair.
-    marker = f"<!-- ai-reviewer:{context.head}:{context.base} -->"
+    # Retrying one request must not suppress a fresh review of the same commits.
+    marker = f"<!-- ai-reviewer:{context.head}:{context.base}:{context.request_id} -->"
     existing = gh.pages(f"{path}/reviews")
     if any(r["user"]["login"] == login and marker in (r.get("body") or "") for r in existing):
         return False

@@ -200,6 +200,7 @@ def bundle(
     # Fix the reviewed revisions independently of later server mutations.
     context = ReviewContext(
         **{
+            "request_id": "1" * 32,
             "repo": "owner/repo",
             "number": 1,
             "head": "a" * 40,
@@ -287,16 +288,34 @@ def test_invalid_publication_never_writes(change: str) -> None:
     assert server.writes == []
 
 
-def test_rerun_does_not_duplicate_review() -> None:
-    """A completed review marker from the actual reviewer makes retries idempotent."""
-    # Seed a matching revision marker owned by the real reviewer.
+def test_fresh_request_can_approve_previously_blocked_commits() -> None:
+    """A new request may revise the verdict without requiring a new commit."""
+    # Publish the original blocking review and expose it through GitHub's read endpoint.
     server = Server()
-    server.reviews = [
-        {"user": {"login": "reviewer"}, "body": f"<!-- ai-reviewer:{'a' * 40}:{'b' * 40} -->"}
-    ]
-    # Require the rerun to skip publication and leave the write log empty.
-    assert publish(server.gh, *bundle(server)) is False
-    assert server.writes == []
+    first = prepare(server.gh, "owner/repo", 1, "reviewer")
+    _, reports, result = bundle(server, blocking=True)
+    assert publish(server.gh, first, reports, result) is True
+    server.reviews = [{"user": {"login": "reviewer"}, "body": server.writes[-1][1]["body"]}]
+    # Fresh preparation on unchanged commits represents the user's reconsideration request.
+    second = prepare(server.gh, "owner/repo", 1, "reviewer")
+    clean = [Review(complete=True, summary="Clarification accepted", findings=[])]
+    assert publish(server.gh, second, clean, Consolidation(summary="Approved", groups=[])) is True
+    posted = [payload for path, payload in server.writes if path.endswith("/reviews")]
+    assert [payload["event"] for payload in posted] == ["REQUEST_CHANGES", "APPROVE"]
+    assert [payload["commit_id"] for payload in posted] == ["a" * 40, "a" * 40]
+
+
+def test_saved_request_does_not_publish_twice() -> None:
+    """Reloading the saved request cannot duplicate a completed publication."""
+    # Publish once, then simulate a retry loading the persisted context artifact.
+    server = Server()
+    context, reports, result = bundle(server)
+    saved = context.model_dump_json()
+    assert publish(server.gh, context, reports, result) is True
+    server.reviews = [{"user": {"login": "reviewer"}, "body": server.writes[0][1]["body"]}]
+    # The same request survives serialization and suppresses the second external write.
+    assert publish(server.gh, ReviewContext.model_validate_json(saved), reports, result) is False
+    assert len(server.writes) == 1
 
 
 def test_other_user_cannot_spoof_completed_review() -> None:
@@ -304,10 +323,25 @@ def test_other_user_cannot_spoof_completed_review() -> None:
     # Seed the correct marker under an unrelated account.
     server = Server()
     server.reviews = [
-        {"user": {"login": "attacker"}, "body": f"<!-- ai-reviewer:{'a' * 40}:{'b' * 40} -->"}
+        {
+            "user": {"login": "attacker"},
+            "body": f"<!-- ai-reviewer:{'a' * 40}:{'b' * 40}:{'1' * 32} -->",
+        }
     ]
     # Require publication despite the forged completion marker.
     assert publish(server.gh, *bundle(server)) is True
+
+
+def test_legacy_revision_marker_does_not_block_fresh_request() -> None:
+    """Reviews posted before request IDs must not suppress reconsideration."""
+    # Keep an older review on exactly the same commits under the real reviewer.
+    server = Server()
+    server.reviews = [
+        {"user": {"login": "reviewer"}, "body": f"<!-- ai-reviewer:{'a' * 40}:{'b' * 40} -->"}
+    ]
+    # A fresh request still publishes despite the legacy commit-only marker.
+    assert publish(server.gh, *bundle(server)) is True
+    assert len(server.writes) == 1
 
 
 def test_prepare_requests_reviewer_and_collects_context() -> None:
