@@ -465,7 +465,6 @@ def test_insufficient_github_budget_fails_repository_capture(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     "budget,limit",
     [
-        ("calls", 0),
         ("result_bytes", 1),
         ("context_tokens", 1),
         ("seconds", 0),
@@ -491,10 +490,7 @@ def test_repository_budget_exhaustion_writes_a_diagnostic(
         )
 
     operation: Callable[[], object]
-    if budget == "calls":
-        monkeypatch.setattr(repository_module, "REPOSITORY_TOOL_CALLS", limit)
-        operation = invoke_list
-    elif budget == "result_bytes":
+    if budget == "result_bytes":
         monkeypatch.setattr(repository_module, "REPOSITORY_TOOL_TOTAL_BYTES", limit)
         operation = invoke_list
     elif budget == "context_tokens":
@@ -644,35 +640,57 @@ def test_provider_tool_round_trip_is_offline_and_records_cost_and_evidence(
         assert generations[1]["messages"][-1]["content"][0]["type"] == "tool_result"
 
 
-def test_provider_tool_turn_exhaustion_fails_without_a_report(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("role", ["openai", "claude"])
+def test_provider_completes_after_more_than_32_tool_turns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str
 ) -> None:
-    """Exhaustion preserves its reason and never accepts a partial review."""
+    """A review can gather evidence beyond both former count limits and publish its report."""
     _, repository = make_repository(tmp_path)
-    monkeypatch.setattr(models, "REPOSITORY_TOOL_TURNS", 1)
-    call = SDKItem(type="function_call", name="search_repository", arguments="{}", call_id="call-1")
-    response = SimpleNamespace(
-        output=[call],
-        output_parsed=None,
-        status="completed",
-        usage=SimpleNamespace(
-            input_tokens=10,
-            output_tokens=1,
-            input_tokens_details=SimpleNamespace(cached_tokens=0),
-        ),
-    )
+    report = Review(complete=True, summary="Finished gathering evidence.", findings=[])
+    responses = 0
+
+    def generate(**kwargs: object) -> SimpleNamespace:
+        """Issue forty tool requests with unique IDs, then return a complete report."""
+        nonlocal responses
+        responses += 1
+        arguments = {"revision": "head", "path_prefix": "", "cursor": "0", "limit": 1}
+        call = SDKItem(
+            type="function_call" if role == "openai" else "tool_use",
+            name="list_repository_files",
+            arguments=json.dumps(arguments),
+            input=arguments,
+            call_id=f"call-{responses}",
+            id=f"call-{responses}",
+        )
+        calls = [call] if responses <= 40 else []
+        return SimpleNamespace(
+            output=calls,
+            content=calls,
+            usage=None,
+            status="completed",
+            stop_reason="tool_use" if calls else "end_turn",
+            output_parsed=None if calls else report,
+            parsed_output=None if calls else report,
+        )
+
     client = SimpleNamespace(
         responses=SimpleNamespace(
-            input_tokens=SimpleNamespace(count=lambda **kwargs: SimpleNamespace(input_tokens=10)),
-            parse=lambda **kwargs: response,
-        )
+            input_tokens=SimpleNamespace(count=lambda **kwargs: SimpleNamespace(input_tokens=100)),
+            parse=generate,
+        ),
+        messages=SimpleNamespace(
+            count_tokens=lambda **kwargs: SimpleNamespace(input_tokens=100), parse=generate
+        ),
     )
     monkeypatch.setattr(models.openai, "OpenAI", lambda **kwargs: client)
-    target = tmp_path / "exhausted"
-    with pytest.raises(RepositorySnapshotError, match="turns budget"):
-        models.call_model("openai", "review", target, repository=repository)
-    assert json.loads((target / "exhaustion.json").read_text())["reason"] == "turns"
-    assert not (target / "openai.json").exists()
+    monkeypatch.setattr(models.anthropic, "Anthropic", lambda **kwargs: client)
+    target = tmp_path / "extended-review"
+    models.call_model(role, "review", target, repository=repository)
+    assert ChunkReview.model_validate_json((target / f"{role}.json").read_text()).complete
+    rows = [json.loads(row) for row in (target / "repository-tools.jsonl").read_text().splitlines()]
+    assert len(rows) == 40
+    assert all(row["result"]["files"] for row in rows)
+    assert not (target / "exhaustion.json").exists()
 
 
 @pytest.mark.parametrize(
